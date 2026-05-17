@@ -257,6 +257,19 @@ layer.
 stdin/stdout reserved for the JSON-RPC stream; logs + banner go to
 stderr.
 
+### `kbounce version-check`
+
+One-shot, opt-in check against the GitHub Releases API. Prints
+`kbounce vX.Y.Z is up to date.` or `kbounce vX.Y.Z is OUT OF DATE.
+Latest: vA.B.C. Upgrade: brew upgrade kbounce  or  https://github.com/trsreagan3/kbouncer/releases/latest`.
+Exits 0 in every success path AND on network / parse failure
+(informational, not a CI gate). Disable entirely with
+`export KBOUNCE_NO_VERSION_CHECK=1` — the env-var path performs no
+HTTP call. No telemetry: a single `GET` to GitHub's public releases
+endpoint with `User-Agent: kbounce/<version>` (no instance id, no
+machine fingerprint). Mirrors the `ibounce version-check` Python
+sibling.
+
 ### `kbounce --version`
 
 Prints `kbounce <version> (commit X, built Y)`. Set at build time via
