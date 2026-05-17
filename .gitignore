@@ -1,5 +1,8 @@
 # Go build artifacts
-kbouncer
+# Anchor to the repo root so the pattern matches the built binary at
+# ./kbouncer WITHOUT also filtering cmd/kbouncer/ (the source-tree dir
+# whose Go files MUST be tracked).
+/kbouncer
 *.test
 *.out
 *.exe
