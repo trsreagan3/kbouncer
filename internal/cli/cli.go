@@ -164,6 +164,9 @@ func newRunCmd() *cobra.Command {
 		profilesPath       string
 		cluster            string
 		promptOnDeny       bool
+		syncPromptOnDeny   bool
+		syncPromptTimeout  time.Duration
+		syncPromptDefault  string
 		upstreamURL        string
 		kubeconfigPath     string
 		insecureSkipVerify bool
@@ -193,6 +196,35 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			defaultPol, err := proxy.ParseDefaultPolicy(defaultPolStr)
 			if err != nil {
 				return err
+			}
+
+			// #203 — sync deny-prompt flag validation. Mutually
+			// exclusive with --prompt-on-deny so the operator picks
+			// one UX explicitly. In cooperative mode the deny is
+			// advisory, so the sync flag is silently ignored with a
+			// banner-level warning printed later — but we still
+			// validate the value range here so a bad --sync-prompt-
+			// timeout is surfaced eagerly.
+			if promptOnDeny && syncPromptOnDeny {
+				return fmt.Errorf(
+					"kbounce: --prompt-on-deny and --sync-prompt-on-deny are mutually exclusive; " +
+						"pick one (async = caller is denied + operator answers later; " +
+						"sync = caller is blocked until operator answers or timeout fires)")
+			}
+			var syncPromptDefaultPol proxy.DefaultPolicy
+			if syncPromptOnDeny {
+				if syncPromptTimeout < proxy.MinSyncPromptTimeout ||
+					syncPromptTimeout > proxy.MaxSyncPromptTimeout {
+					return fmt.Errorf(
+						"kbounce: --sync-prompt-timeout must be between %s and %s (got %s)",
+						proxy.MinSyncPromptTimeout, proxy.MaxSyncPromptTimeout, syncPromptTimeout)
+				}
+				syncPromptDefaultPol, err = proxy.ParseDefaultPolicy(syncPromptDefault)
+				if err != nil {
+					return fmt.Errorf(
+						"kbounce: --sync-prompt-default must be 'allow' or 'deny' (got %q)",
+						syncPromptDefault)
+				}
 			}
 
 			// CRIT-32-02 (mirrored from iam-jit-bouncer): refuse to bind
@@ -304,11 +336,26 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				ActiveProfile:           activeProfile,
 				Cluster:                 cluster,
 				PromptOnDeny:            promptOnDeny,
+				SyncPromptOnDeny:        syncPromptOnDeny,
+				SyncPromptTimeout:       syncPromptTimeout,
+				SyncPromptDefault:       syncPromptDefaultPol,
 				Upstream:                up,
 				TLSCertPath:             tlsCertPath,
 				TLSKeyPath:              tlsKeyPath,
 				RequireClientCertCAPath: requireClientCert,
 			}.Normalize()
+
+			// Cooperative mode + --sync-prompt-on-deny: per spec the
+			// flag is silently ignored (cooperative DENYs are advisory
+			// so there's nothing to block on) with a one-line warning
+			// so the operator notices they probably wanted transparent
+			// mode.
+			if syncPromptOnDeny && cfg.Mode != proxy.ModeTransparent {
+				fmt.Fprintln(os.Stderr,
+					"kbounce: --sync-prompt-on-deny has no effect in cooperative mode "+
+						"(cooperative DENYs are advisory; there is no 403 to block). "+
+						"Re-run with --mode transparent to enable the sync deny-prompt UX.")
+			}
 
 			s := proxy.NewServer(cfg, st)
 
@@ -435,7 +482,32 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"later answer (always-allow / add-to-profile / ignore) via "+
 			"`kbounce prompts answer`. The agent is still denied "+
 			"immediately; the answer takes effect on the NEXT call of "+
-			"the same shape. Defaults off — opt-in to avoid noisy queues.")
+			"the same shape. Defaults off — opt-in to avoid noisy queues. "+
+			"Mutually exclusive with --sync-prompt-on-deny.")
+
+	// #203 — synchronous deny-prompt v1.1 flags.
+	cmd.Flags().BoolVar(&syncPromptOnDeny, "sync-prompt-on-deny", false,
+		"Synchronous deny-prompt UX (v1.1): when set in transparent "+
+			"mode, every DENY enqueues a pending_prompts row AND blocks "+
+			"the request goroutine for up to --sync-prompt-timeout "+
+			"waiting for the operator's answer via `kbounce prompts "+
+			"answer`. Answer always/profile → forward + return upstream's "+
+			"response. Answer ignore or timeout → return the original "+
+			"403 (per --sync-prompt-default). Mutually exclusive with "+
+			"--prompt-on-deny. Silently ignored in cooperative mode "+
+			"(cooperative DENYs are advisory; nothing to block on).")
+	cmd.Flags().DurationVar(&syncPromptTimeout, "sync-prompt-timeout", proxy.DefaultSyncPromptTimeout,
+		"Maximum wall-clock the request goroutine waits for an operator "+
+			"answer when --sync-prompt-on-deny fires. Must be between 5s "+
+			"and 300s. Shorter is faster for the agent; longer gives the "+
+			"operator more room to context-switch + answer. Ignored when "+
+			"--sync-prompt-on-deny is off.")
+	cmd.Flags().StringVar(&syncPromptDefault, "sync-prompt-default", string(proxy.DefaultPolicyDeny),
+		"Verdict applied when --sync-prompt-on-deny times out without an "+
+			"operator answer: 'allow' = forward to upstream as if the "+
+			"answer had been always/profile; 'deny' = return the original "+
+			"403. Default 'deny' matches the secure-default convention "+
+			"throughout kbounce.")
 
 	// K-Slice 2 forwarding flags.
 	cmd.Flags().StringVar(&upstreamURL, "upstream", "",

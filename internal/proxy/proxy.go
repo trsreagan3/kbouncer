@@ -147,6 +147,37 @@ type Config struct {
 	// nothing is enqueued by default.
 	PromptOnDeny bool
 
+	// SyncPromptOnDeny is the #203 synchronous variant of PromptOnDeny.
+	// When true (transparent mode + no pause + DENY verdict), the proxy
+	// request goroutine BLOCKS for up to SyncPromptTimeout waiting for
+	// the operator to answer via `kbounce prompts answer`. An allow
+	// answer (always / profile) → the request is forwarded to upstream
+	// and the upstream response is returned to the agent. A deny answer
+	// (ignore) or a timeout → the original 403 is returned (per
+	// SyncPromptDefault when the channel never fires).
+	//
+	// Mutually exclusive with PromptOnDeny in the CLI: the run command
+	// rejects both flags on the same invocation so the operator picks
+	// one UX explicitly. In COOPERATIVE mode this flag is silently
+	// ignored (the deny is advisory; nothing to block on).
+	//
+	// Defaults false so the existing async + no-prompt paths are
+	// unchanged for callers that don't opt in.
+	SyncPromptOnDeny bool
+
+	// SyncPromptTimeout caps how long the proxy goroutine waits for the
+	// operator's answer. Zero defaults to 30s when SyncPromptOnDeny is
+	// true. Bounded to [5s, 300s] by the CLI; values outside that range
+	// are surfaced as a configuration error rather than silently
+	// clamped.
+	SyncPromptTimeout time.Duration
+
+	// SyncPromptDefault picks the verdict applied on timeout / context
+	// cancel (the operator never answered). Either DefaultPolicyAllow
+	// or DefaultPolicyDeny. The cautious default is "deny" — same shape
+	// as DefaultPolicy.
+	SyncPromptDefault DefaultPolicy
+
 	// Upstream is the resolved kube-apiserver target the proxy forwards
 	// ALLOW verdicts to (K-Slice 2). Nil disables forwarding and the
 	// proxy keeps the K-Slice 1 observation-only JSON-body behavior —
@@ -193,12 +224,29 @@ type Config struct {
 // flags / construction omit them.
 func DefaultConfig() Config {
 	return Config{
-		Host:          "127.0.0.1",
-		Port:          8766,
-		Mode:          ModeCooperative,
-		DefaultPolicy: DefaultPolicyDeny,
+		Host:              "127.0.0.1",
+		Port:              8766,
+		Mode:              ModeCooperative,
+		DefaultPolicy:     DefaultPolicyDeny,
+		SyncPromptTimeout: DefaultSyncPromptTimeout,
+		SyncPromptDefault: DefaultPolicyDeny,
 	}
 }
+
+// DefaultSyncPromptTimeout is the wait the sync deny-prompt flow uses
+// when SyncPromptOnDeny is on but SyncPromptTimeout is unset. 30s is
+// long enough for an operator to switch windows + read the prompt
+// without making an automation pipeline visibly stall.
+const DefaultSyncPromptTimeout = 30 * time.Second
+
+// MinSyncPromptTimeout / MaxSyncPromptTimeout bound what the CLI will
+// accept. <5s is shorter than realistic human reaction; >300s is long
+// enough that the agent client's own request timeout fires first and
+// confuses the audit trail.
+const (
+	MinSyncPromptTimeout = 5 * time.Second
+	MaxSyncPromptTimeout = 300 * time.Second
+)
 
 // Normalize fills in any zero-valued fields on c with DefaultConfig()
 // values and returns the resulting Config. Callers (Serve, tests,
@@ -217,6 +265,12 @@ func (c Config) Normalize() Config {
 	}
 	if c.DefaultPolicy == "" {
 		c.DefaultPolicy = d.DefaultPolicy
+	}
+	if c.SyncPromptTimeout == 0 {
+		c.SyncPromptTimeout = d.SyncPromptTimeout
+	}
+	if c.SyncPromptDefault == "" {
+		c.SyncPromptDefault = d.SyncPromptDefault
 	}
 	return c
 }
@@ -263,6 +317,16 @@ type RequestObservation struct {
 	// into the audit row so post-hoc review can filter to "show me
 	// only the exec sessions" without re-parsing URL shapes.
 	StreamKind string `json:"stream_kind,omitempty"`
+
+	// DecisionID is the audit-row id assigned to this decision (the
+	// SQLite AUTOINCREMENT pk on decisions). Zero when no store was
+	// configured (pure-evaluation unit tests) or the write failed.
+	// Surfaced into the observation so the handle() sync-prompt path
+	// can pass it through to AddSyncPendingPrompt without re-querying.
+	// Not JSON-serialized into the observation-only response body —
+	// the audit row id is an internal handle, not part of the agent-
+	// facing contract.
+	DecisionID int64 `json:"-"`
 }
 
 // Verdict values used in observations + the audit log.
@@ -322,6 +386,13 @@ type EvalOptions struct {
 	// PromptOnDeny mirrors Config.PromptOnDeny — when true, every
 	// transparent-mode DENY writes a pending_prompts row.
 	PromptOnDeny bool
+
+	// SyncPromptOnDeny mirrors Config.SyncPromptOnDeny. When true, the
+	// evaluator SKIPS the async PromptOnDeny enqueue (the handle()
+	// path will run AddSyncPendingPrompt itself with a sync_wait_id —
+	// we don't want both an async row AND a sync row for the same
+	// decision; the sync flow's row IS the answer surface).
+	SyncPromptOnDeny bool
 
 	// TaskOwner names the owner slot whose active task scope (if any)
 	// is consulted by K-Slice 3's task-aware decision flow. Empty
@@ -651,6 +722,11 @@ func EvaluateRequestFull(
 // shouldn't enqueue for cooperative-mode requests just because they
 // were demoted to cooperative for unrelated reasons. The pause guard
 // below makes that distinction safe.
+//
+// #203 — SyncPromptOnDeny SUPERSEDES PromptOnDeny: when sync mode is
+// on, this function is a no-op. The handle() path runs
+// AddSyncPendingPrompt itself with a fresh sync_wait_id so the row
+// + the in-memory waiter are created atomically.
 func maybeEnqueuePrompt(
 	st *store.Store,
 	opts EvalOptions,
@@ -661,6 +737,13 @@ func maybeEnqueuePrompt(
 	parsed *parser.ParsedRequest,
 ) {
 	if st == nil || decisionID <= 0 {
+		return
+	}
+	if opts.SyncPromptOnDeny {
+		// Sync flow takes ownership of the enqueue; don't write an async
+		// row too — the audit story would be confusing (two prompts for
+		// one decision) + the operator could end up answering the wrong
+		// one.
 		return
 	}
 	if !opts.PromptOnDeny {
@@ -714,6 +797,10 @@ func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.
 // writeDecisionForTask is the task-id-aware variant of writeDecision.
 // Threads the active task_id onto the audit row so post-hoc per-task
 // review (TaskReviewSummary) can join cleanly.
+//
+// Side effect: also stores the assigned id back onto obs.DecisionID
+// so the handle() sync-prompt path can read it without round-tripping
+// through the return value.
 func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, taskID string) int64 {
 	if st == nil {
 		return 0
@@ -750,6 +837,7 @@ func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause 
 		recordLookupError(err, "kbounce: audit-write failed")
 		return 0
 	}
+	obs.DecisionID = id
 	return id
 }
 
@@ -966,13 +1054,22 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// pure read of the inbound headers + query — no I/O.
 	streamKind := classifyStream(r)
 
+	// #203 — sync-prompt is only meaningful in transparent mode. The
+	// CLI rejects --sync-prompt-on-deny in cooperative mode with a
+	// warning, but be defensive here too: a config-built-in-process
+	// (tests, library users) that sets the flag in cooperative mode
+	// must not trigger the sync path. Compute the effective flag once
+	// so EvalOptions + the post-eval guard both see the same value.
+	syncPromptActive := s.cfg.SyncPromptOnDeny && s.cfg.Mode == ModeTransparent
+
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
 		s.cfg.ActiveProfile, s.cfg.Cluster,
 		EvalOptions{
-			PromptOnDeny: s.cfg.PromptOnDeny,
-			TaskOwner:    s.cfg.TaskOwner,
-			StreamKind:   string(streamKind),
+			PromptOnDeny:     s.cfg.PromptOnDeny,
+			SyncPromptOnDeny: syncPromptActive,
+			TaskOwner:        s.cfg.TaskOwner,
+			StreamKind:       string(streamKind),
 		},
 	)
 
@@ -989,6 +1086,20 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// row is already written by EvaluateRequestFull (tagged with the
 	// stream kind so reviewers see which exec the agent tried).
 	if obs.Enforced {
+		// #203 sync-prompt flow: if --sync-prompt-on-deny is set and
+		// we have a store + a real audit row, block waiting for the
+		// operator's answer instead of immediately 403'ing. An allow
+		// answer is acted on by re-running the request through the
+		// forwarding layer; a deny answer / timeout keeps the original
+		// 403 behavior.
+		if syncPromptActive && s.store != nil && obs.DecisionID > 0 {
+			if s.handleSyncPromptDeny(w, r, obs) {
+				return
+			}
+			// handleSyncPromptDeny returned false → it deferred back to
+			// the default 403 path (operator answered "ignore" or
+			// timeout chose deny). Fall through.
+		}
 		writeK8sForbidden(w, obs)
 		return
 	}

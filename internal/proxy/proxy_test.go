@@ -57,7 +57,17 @@ func TestConfigNormalize_FillsZeroFields(t *testing.T) {
 
 func TestConfigNormalize_PreservesExplicitValues(t *testing.T) {
 	c := Config{Host: "0.0.0.0", Port: 9999, Mode: ModeTransparent, DefaultPolicy: DefaultPolicyAllow}
-	assert.Equal(t, c, c.Normalize())
+	got := c.Normalize()
+	// Explicit fields preserved verbatim.
+	assert.Equal(t, "0.0.0.0", got.Host)
+	assert.Equal(t, 9999, got.Port)
+	assert.Equal(t, ModeTransparent, got.Mode)
+	assert.Equal(t, DefaultPolicyAllow, got.DefaultPolicy)
+	// #203 sync-prompt fields default-fill (callers that don't opt into
+	// the sync UX still get a sensible timeout / default if they later
+	// flip SyncPromptOnDeny on at runtime).
+	assert.Equal(t, DefaultSyncPromptTimeout, got.SyncPromptTimeout)
+	assert.Equal(t, DefaultPolicyDeny, got.SyncPromptDefault)
 }
 
 func TestEvaluateRequest_ClassifiesCanonicalGet(t *testing.T) {

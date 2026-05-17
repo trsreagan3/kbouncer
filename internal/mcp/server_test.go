@@ -110,6 +110,7 @@ func TestServer_ToolsListReturnsAllTools(t *testing.T) {
 		"kbounce_remove_rule",
 		"kbounce_decide",
 		"kbounce_tail_decisions",
+		"kbounce_pending_sync_prompts",
 	}
 	for _, n := range wantNames {
 		assert.True(t, gotNames[n], "tools/list missing %q", n)

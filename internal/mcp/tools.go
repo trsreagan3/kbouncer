@@ -304,5 +304,30 @@ func ToolDescriptors() []map[string]any {
 				},
 			},
 		},
+		{
+			"name": "kbounce_pending_sync_prompts",
+			"description": "List the pending_prompts rows that the " +
+				"running proxy is CURRENTLY blocked on waiting for an " +
+				"operator answer (the #203 --sync-prompt-on-deny UX). " +
+				"DETERMINISTIC: SQL query against pending_prompts.sync_" +
+				"wait_id IS NOT NULL AND status='pending', filtered to " +
+				"rows whose in-process waiter is still registered " +
+				"(rows from a crashed proxy are NOT returned — the " +
+				"request goroutine is dead and cannot resume). Newest " +
+				"first. Use this to surface 'there is a blocked request " +
+				"waiting on your answer' to an operator's agent client. " +
+				"Read-only. Default limit 50.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"limit": map[string]any{
+						"type":    "integer",
+						"default": 50,
+						"minimum": 1,
+						"maximum": 1000,
+					},
+				},
+			},
+		},
 	}
 }

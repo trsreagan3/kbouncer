@@ -27,11 +27,14 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -48,7 +51,8 @@ import (
 //	3 — add pause_events + decisions.pause_id (#6a timed escape hatch)
 //	4 — add pending_prompts (#5 async deny-prompt UX, v1.0 subset)
 //	5 — add decisions.is_stream + decisions.stream_kind (K-Slice 5)
-const SchemaVersion = 5
+//	6 — add pending_prompts.sync_wait_id (#203 synchronous deny-prompt v1.1)
+const SchemaVersion = 6
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
@@ -66,9 +70,19 @@ func DefaultDBPath() (string, error) {
 
 // Store wraps a sql.DB plus the migration state. Safe for concurrent
 // use from multiple goroutines (sql.DB handles its own pooling).
+//
+// The store also owns the in-memory waiter map used by #203's
+// synchronous deny-prompt flow (sync_wait_id -> chan PromptDecision).
+// The map lives ONLY in memory: on proxy restart, any in-flight sync
+// prompts are lost (the request goroutine is dead too). This is the
+// expected behavior — sync prompts are RUNTIME state, not persisted
+// state.
 type Store struct {
 	db   *sql.DB
 	path string
+
+	syncMu      sync.Mutex
+	syncWaiters map[string]chan PromptDecision
 }
 
 // Open initializes (creating if needed) the SQLite database at path.
@@ -99,7 +113,11 @@ func Open(path string) (*Store, error) {
 	// single-process proxy shape.
 	db.SetMaxOpenConns(4)
 
-	s := &Store{db: db, path: path}
+	s := &Store{
+		db:          db,
+		path:        path,
+		syncWaiters: make(map[string]chan PromptDecision),
+	}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -278,6 +296,23 @@ func (s *Store) migrate() error {
 	}
 	if err := s.addColumnIfMissing("decisions", "stream_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
+	}
+
+	// v6 additive migration (#203 synchronous deny-prompt v1.1):
+	// sync_wait_id tags a pending_prompts row that has an active
+	// in-process waiter — i.e. a proxy request goroutine is blocked
+	// waiting for the operator's answer before returning to the agent.
+	// NULL/empty when the prompt is purely async (the v1.0 flow).
+	//
+	// Column is TEXT (UUID-shaped); no NOT NULL because the legacy
+	// async path inserts NULL. SQLite UNIQUE allows multiple NULL
+	// rows, which is exactly what we want.
+	if err := s.addColumnIfMissing("pending_prompts", "sync_wait_id", "TEXT"); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_prompts_sync_wait_id
+		ON pending_prompts(sync_wait_id) WHERE sync_wait_id IS NOT NULL`); err != nil {
+		return fmt.Errorf("kbounce: create idx_pending_prompts_sync_wait_id: %w", err)
 	}
 
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it
@@ -723,6 +758,32 @@ type PromptRow struct {
 	AnswerTarget string
 	AnsweredBy   string
 	AnsweredAt   string
+	// SyncWaitID is the UUID-shaped key for the in-memory waiter
+	// channel that the proxy goroutine is blocked on. Empty for
+	// purely-async (v1.0) prompts. When non-empty, AnswerPendingPrompt
+	// wakes the in-process waiter so the request goroutine can return
+	// the right response to the agent.
+	SyncWaitID string
+}
+
+// PromptDecision is what AnswerPendingPrompt sends to a waiting proxy
+// goroutine through the sync-wait channel. Distinct from the on-disk
+// answer_kind because the proxy only cares about the binary
+// allow/deny outcome — "always" + "profile" both mean ALLOW; "ignore"
+// means DENY. Mirrors the "answer integration" section of the #203
+// shared UX spec.
+type PromptDecision struct {
+	// Allow is true when the operator's answer resolves to "let this
+	// request through" (kind in {always, profile}); false when it
+	// resolves to "keep denying" (kind=ignore) or on timeout.
+	Allow bool
+	// Kind echoes the operator's answer kind so the audit row + the
+	// proxy's debug logs can record exactly which path was taken.
+	// Empty when the decision came from a timeout / context cancel.
+	Kind string
+	// AnsweredBy carries the actor recorded on the answer row, when
+	// available; empty for timeout decisions.
+	AnsweredBy string
 }
 
 // PromptInput is the input to AddPendingPrompt. Keeping a struct
@@ -801,7 +862,8 @@ func (s *Store) ListPendingPrompts(status string, limit int) ([]PromptRow, error
 		`SELECT id, created_at, decision_id, verb, group_name, version,
 		        resource, namespace, name, deny_reason, status,
 		        COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
-		        COALESCE(answered_by, ''), COALESCE(answered_at, '')
+		        COALESCE(answered_by, ''), COALESCE(answered_at, ''),
+		        COALESCE(sync_wait_id, '')
 		 FROM pending_prompts WHERE status = ?
 		 ORDER BY id DESC LIMIT ?`, status, limit,
 	)
@@ -816,6 +878,7 @@ func (s *Store) ListPendingPrompts(status string, limit int) ([]PromptRow, error
 			&p.ID, &p.CreatedAt, &p.DecisionID, &p.Verb, &p.Group, &p.Version,
 			&p.Resource, &p.Namespace, &p.Name, &p.DenyReason, &p.Status,
 			&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
+			&p.SyncWaitID,
 		); err != nil {
 			return nil, fmt.Errorf("kbounce: list pending prompts scan: %w", err)
 		}
@@ -834,7 +897,8 @@ func (s *Store) GetPendingPrompt(id int64) (*PromptRow, error) {
 		`SELECT id, created_at, decision_id, verb, group_name, version,
 		        resource, namespace, name, deny_reason, status,
 		        COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
-		        COALESCE(answered_by, ''), COALESCE(answered_at, '')
+		        COALESCE(answered_by, ''), COALESCE(answered_at, ''),
+		        COALESCE(sync_wait_id, '')
 		 FROM pending_prompts WHERE id = ?`, id,
 	)
 	var p PromptRow
@@ -842,6 +906,7 @@ func (s *Store) GetPendingPrompt(id int64) (*PromptRow, error) {
 		&p.ID, &p.CreatedAt, &p.DecisionID, &p.Verb, &p.Group, &p.Version,
 		&p.Resource, &p.Namespace, &p.Name, &p.DenyReason, &p.Status,
 		&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
+		&p.SyncWaitID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -870,6 +935,12 @@ const (
 //
 // Side-effects (rule add / profile edit) are the CLI's responsibility
 // — store just records intent.
+//
+// #203 sync flow: if the prompt has a sync_wait_id, the in-memory
+// waiter channel is looked up + sent the resolved PromptDecision so
+// the proxy request goroutine can return the right response to the
+// agent. The wake is best-effort — a missing waiter (proxy restarted
+// after the row was written) is a no-op, NOT an error.
 func (s *Store) AnswerPendingPrompt(id int64, kind, target, answeredBy string) (bool, error) {
 	switch kind {
 	case PromptAnswerKindAlways, PromptAnswerKindProfile, PromptAnswerKindIgnore:
@@ -878,6 +949,15 @@ func (s *Store) AnswerPendingPrompt(id int64, kind, target, answeredBy string) (
 		return false, fmt.Errorf(
 			"kbounce: answer_kind must be one of: always, profile, ignore (got %q)",
 			kind)
+	}
+	// Read the prompt FIRST so we can fish out the sync_wait_id (if any)
+	// before flipping its status. Reading after the UPDATE would race
+	// with another goroutine that calls GetPendingPrompt at the same
+	// instant — not a correctness problem (the wake is best-effort)
+	// but cleaner to read first.
+	prior, err := s.GetPendingPrompt(id)
+	if err != nil {
+		return false, err
 	}
 	res, err := s.db.Exec(
 		`UPDATE pending_prompts SET status = 'answered',
@@ -894,5 +974,202 @@ func (s *Store) AnswerPendingPrompt(id int64, kind, target, answeredBy string) (
 	if err != nil {
 		return false, fmt.Errorf("kbounce: answer pending prompt rows affected: %w", err)
 	}
-	return n > 0, nil
+	ok := n > 0
+	if ok && prior != nil && prior.SyncWaitID != "" {
+		decision := PromptDecision{
+			Allow:      kind == PromptAnswerKindAlways || kind == PromptAnswerKindProfile,
+			Kind:       kind,
+			AnsweredBy: answeredBy,
+		}
+		s.wakeSyncWaiter(prior.SyncWaitID, decision)
+	}
+	return ok, nil
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous pending prompts (#203 — synchronous deny-prompt v1.1)
+// ---------------------------------------------------------------------------
+
+// newSyncWaitID returns a URL-safe random 16-byte hex string used as
+// the in-memory waiter key (the column is TEXT; the column is unique
+// when populated). Collision probability is negligible (128 bits).
+func newSyncWaitID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("kbounce: read random sync_wait_id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// AddSyncPendingPrompt is the #203 sync-flow variant of
+// AddPendingPrompt. It inserts a pending_prompts row tagged with a
+// fresh sync_wait_id, registers an in-memory waiter channel keyed by
+// that id, and returns the channel for the caller (a proxy request
+// goroutine) to select on.
+//
+// The returned channel is BUFFERED (cap 1) so AnswerPendingPrompt
+// never blocks even if the waiter has already given up + moved on
+// (timeout / context cancel paths drain the channel via the store's
+// wakeSyncWaiter / forgetSyncWaiter pair).
+//
+// Idempotency: NOT idempotent on decision_id like AddPendingPrompt is.
+// Each sync call gets its own row + its own waiter — the proxy
+// request goroutine is single-shot, and re-using a row from an earlier
+// async enqueue would let an old answer wake a NEW request, which is
+// the wrong audit story.
+//
+// Caller MUST call ForgetSyncWaiter(sync_wait_id) when it's done
+// waiting (on any outcome — answer received, timeout, ctx cancel) so
+// the in-memory map doesn't leak.
+func (s *Store) AddSyncPendingPrompt(p PromptInput) (string, <-chan PromptDecision, error) {
+	syncID, err := newSyncWaitID()
+	if err != nil {
+		return "", nil, err
+	}
+	ch := make(chan PromptDecision, 1)
+
+	// Register the waiter BEFORE the INSERT so an unlikely race where
+	// the operator answers in the gap can't be lost (Answer looks up
+	// the in-memory waiter; if it's not there, the answer is purely
+	// async and the agent will see it on the next call of the same
+	// shape — same behavior as the v1.0 path).
+	s.syncMu.Lock()
+	s.syncWaiters[syncID] = ch
+	s.syncMu.Unlock()
+
+	res, err := s.db.Exec(
+		`INSERT INTO pending_prompts(
+			created_at, decision_id, verb, group_name, version, resource,
+			namespace, name, deny_reason, sync_wait_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		p.DecisionID, p.Verb, p.Group, p.Version, p.Resource,
+		p.Namespace, p.Name, p.DenyReason, syncID,
+	)
+	if err != nil {
+		// Roll back the waiter registration so we don't leak.
+		s.ForgetSyncWaiter(syncID)
+		return "", nil, fmt.Errorf("kbounce: add sync pending prompt: %w", err)
+	}
+	if _, err := res.LastInsertId(); err != nil {
+		s.ForgetSyncWaiter(syncID)
+		return "", nil, fmt.Errorf("kbounce: add sync pending prompt last insert id: %w", err)
+	}
+	return syncID, ch, nil
+}
+
+// wakeSyncWaiter sends decision on the channel registered for syncID
+// (if any) without blocking. The channel is buffered cap-1 so a single
+// send always succeeds; subsequent sends are dropped (a waiter only
+// reads one decision). Safe to call when no waiter is registered
+// (crash-restart-after-row-written; the answer falls through to the
+// purely-async semantic).
+func (s *Store) wakeSyncWaiter(syncID string, decision PromptDecision) {
+	s.syncMu.Lock()
+	ch, ok := s.syncWaiters[syncID]
+	if ok {
+		// Remove from the map under the same lock so a second wake
+		// (e.g. operator re-answers via another path) is a no-op.
+		delete(s.syncWaiters, syncID)
+	}
+	s.syncMu.Unlock()
+	if !ok {
+		return
+	}
+	// Non-blocking send: the channel is buffered cap-1; if the waiter
+	// already drained it (timeout path) we drop the value. close() is
+	// deliberately NOT used so a stale call to wakeSyncWaiter (test
+	// shutdown ordering) can't panic with "send on closed channel."
+	select {
+	case ch <- decision:
+	default:
+	}
+}
+
+// WakeSyncPendingPrompt is the exported wrapper around wakeSyncWaiter,
+// used by tests that want to simulate an operator answer without
+// going through AnswerPendingPrompt's DB write.
+func (s *Store) WakeSyncPendingPrompt(syncID string, decision PromptDecision) {
+	s.wakeSyncWaiter(syncID, decision)
+}
+
+// ForgetSyncWaiter removes the in-memory waiter entry for syncID.
+// MUST be called by the waiting goroutine when it returns (timeout /
+// ctx cancel / received decision) so the map doesn't leak. A duplicate
+// call is a no-op.
+func (s *Store) ForgetSyncWaiter(syncID string) {
+	s.syncMu.Lock()
+	delete(s.syncWaiters, syncID)
+	s.syncMu.Unlock()
+}
+
+// ListWaitingSyncPrompts returns the pending_prompts rows that
+// currently have an in-process waiter registered — i.e. the subset of
+// pending sync prompts the running proxy is actively blocked on.
+//
+// Determinism: SQL query against pending_prompts.sync_wait_id IS NOT
+// NULL AND status = 'pending', INNER JOIN-style filtered against the
+// in-memory waiter map. A row whose proxy has died (waiter map empty)
+// is NOT returned by this function — that row is purely a leftover
+// audit record at that point and won't ever resolve through the sync
+// path.
+//
+// Surfaced by the kbounce_pending_sync_prompts MCP tool. Newest first.
+// Default limit when <=0: 50; capped at 1000.
+func (s *Store) ListWaitingSyncPrompts(limit int) ([]PromptRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.db.Query(
+		`SELECT id, created_at, decision_id, verb, group_name, version,
+		        resource, namespace, name, deny_reason, status,
+		        COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
+		        COALESCE(answered_by, ''), COALESCE(answered_at, ''),
+		        COALESCE(sync_wait_id, '')
+		 FROM pending_prompts
+		 WHERE sync_wait_id IS NOT NULL AND status = 'pending'
+		 ORDER BY id DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("kbounce: list waiting sync prompts: %w", err)
+	}
+	defer rows.Close()
+	candidates := make([]PromptRow, 0, limit)
+	for rows.Next() {
+		var p PromptRow
+		if err := rows.Scan(
+			&p.ID, &p.CreatedAt, &p.DecisionID, &p.Verb, &p.Group, &p.Version,
+			&p.Resource, &p.Namespace, &p.Name, &p.DenyReason, &p.Status,
+			&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
+			&p.SyncWaitID,
+		); err != nil {
+			return nil, fmt.Errorf("kbounce: list waiting sync prompts scan: %w", err)
+		}
+		candidates = append(candidates, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("kbounce: list waiting sync prompts iterate: %w", err)
+	}
+	// Filter to rows whose waiter is still registered. Lock once + read
+	// many — the map mutations elsewhere take the same mutex.
+	s.syncMu.Lock()
+	out := make([]PromptRow, 0, len(candidates))
+	for _, p := range candidates {
+		if _, ok := s.syncWaiters[p.SyncWaitID]; ok {
+			out = append(out, p)
+		}
+	}
+	s.syncMu.Unlock()
+	return out, nil
+}
+
+// SyncWaiterCount returns the number of in-memory waiters currently
+// registered. Test-only helper for leak detection + healthz future use.
+func (s *Store) SyncWaiterCount() int {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	return len(s.syncWaiters)
 }

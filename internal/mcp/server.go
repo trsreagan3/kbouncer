@@ -241,6 +241,8 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolDecide(args)
 	case "kbounce_tail_decisions":
 		return s.toolTailDecisions(args)
+	case "kbounce_pending_sync_prompts":
+		return s.toolPendingSyncPrompts(args)
 	case "kbounce_recommend_rules":
 		return s.toolRecommendRules(args)
 	case "kbounce_apply_preset":
@@ -665,6 +667,45 @@ func (s *Server) toolTailDecisions(args map[string]any) (map[string]any, error) 
 	return map[string]any{
 		"decisions": out,
 		"count":     len(out),
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// kbounce_pending_sync_prompts — #203 sync deny-prompt v1.1 introspect.
+// Returns the rows the running proxy is BLOCKED on (waiter still
+// registered in-process). Excludes purely-async rows + excludes rows
+// from a crashed proxy (those waiters are gone + the request goroutine
+// is dead, so surfacing them would be misleading).
+// ---------------------------------------------------------------------
+
+func (s *Server) toolPendingSyncPrompts(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	limit := intArg(args, "limit", 50)
+	rows, err := s.cfg.Store.ListWaitingSyncPrompts(limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, map[string]any{
+			"id":           r.ID,
+			"created_at":   r.CreatedAt,
+			"decision_id":  r.DecisionID,
+			"verb":         r.Verb,
+			"group":        r.Group,
+			"version":      r.Version,
+			"resource":     r.Resource,
+			"namespace":    r.Namespace,
+			"name":         r.Name,
+			"deny_reason":  r.DenyReason,
+			"sync_wait_id": r.SyncWaitID,
+		})
+	}
+	return map[string]any{
+		"waiting_prompts": out,
+		"count":           len(out),
 	}, nil
 }
 
