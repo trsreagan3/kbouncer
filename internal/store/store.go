@@ -300,6 +300,75 @@ func (s *Store) CountDecisions() (int64, error) {
 	return n, nil
 }
 
+// RecentDecisions returns the N most recently recorded decisions,
+// newest first. Used by `kbouncer audit tail`. Bounded query — pass
+// 0 or a negative limit to get the implicit default of 50; capped
+// at 1000 so a runaway --limit doesn't OOM on a long-lived DB.
+func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.db.Query(`SELECT
+		at, method, path,
+		parsed_verb, parsed_group, parsed_version, parsed_resource,
+		parsed_namespace, parsed_name, parsed_subresource,
+		is_watch, is_dry_run,
+		decision_verdict, decision_reason, mode_at_decision, enforced,
+		matched_rule_id, task_id,
+		COALESCE(decision_source, ''), COALESCE(profile_name, '')
+		FROM decisions
+		ORDER BY id DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: recent decisions query: %w", err)
+	}
+	defer rows.Close()
+	out := make([]DecisionRow, 0, limit)
+	for rows.Next() {
+		var (
+			d        DecisionRow
+			atStr    string
+			isWatch  int
+			isDryRun int
+			enforced int
+			ruleID   sql.NullInt64
+			taskID   sql.NullString
+		)
+		if err := rows.Scan(
+			&atStr, &d.Method, &d.Path,
+			&d.ParsedVerb, &d.ParsedGroup, &d.ParsedVersion, &d.ParsedResource,
+			&d.ParsedNamespace, &d.ParsedName, &d.ParsedSubresource,
+			&isWatch, &isDryRun,
+			&d.DecisionVerdict, &d.DecisionReason, &d.ModeAtDecision, &enforced,
+			&ruleID, &taskID,
+			&d.DecisionSource, &d.ProfileName,
+		); err != nil {
+			return nil, fmt.Errorf("kbouncer: recent decisions scan: %w", err)
+		}
+		if t, perr := time.Parse("2006-01-02T15:04:05Z", atStr); perr == nil {
+			d.At = t
+		}
+		d.IsWatch = isWatch != 0
+		d.IsDryRun = isDryRun != 0
+		d.Enforced = enforced != 0
+		if ruleID.Valid {
+			rid := ruleID.Int64
+			d.MatchedRuleID = &rid
+		}
+		if taskID.Valid {
+			d.TaskID = taskID.String
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("kbouncer: recent decisions iterate: %w", err)
+	}
+	return out, nil
+}
+
 // addColumnIfMissing is an idempotent ALTER TABLE ADD COLUMN. SQLite
 // errors on a duplicate ADD; we check PRAGMA table_info first so a
 // reopen of an already-migrated DB is a no-op.

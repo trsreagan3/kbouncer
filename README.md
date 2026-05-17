@@ -88,6 +88,26 @@ so the two products can coexist on the same machine without colliding).
 The audit DB lives at `~/.kbouncer/state.db` by default; override with
 `--db` or the `KBOUNCER_DB` env var.
 
+### Inspect the audit log
+
+After the proxy has been running, see what just happened:
+
+```sh
+kbouncer audit tail            # 50 newest decisions
+kbouncer audit tail --limit 10 # 10 newest
+```
+
+Each row shows timestamp, mode, verdict, decision-source (profile /
+global / default / unclassifiable) and the parsed request. Useful
+for "what is my agent actually asking the cluster to do?" debugging.
+
+### Liveness probe
+
+`GET /healthz` returns 200 + a small JSON status payload
+(`{status, mode, default_policy, active_profile, decisions_count}`)
+without writing to the audit log — safe to poll from monit, k8s
+liveness probes, or systemd watchdogs.
+
 ## Test
 
 ```sh

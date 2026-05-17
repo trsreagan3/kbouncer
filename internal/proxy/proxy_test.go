@@ -458,3 +458,96 @@ func TestServer_EndToEnd_NoProfileMatchesKSlice1(t *testing.T) {
 		"with no profile loaded, decision_source must be 'default'")
 	assert.Empty(t, resp.Header.Get("x-kbouncer-profile"))
 }
+
+// Healthz must serve on the dedicated route, return 200 + JSON, NOT
+// write an audit-decision row, and report the server's current mode +
+// active profile so monitoring can fail fast if it observes drift.
+func TestServer_Healthz_RespondsOK_NoAuditWrite(t *testing.T) {
+	st := freshStore(t)
+	cfg := Config{
+		Mode:          ModeTransparent,
+		DefaultPolicy: DefaultPolicyDeny,
+	}
+	s := NewServer(cfg, st)
+
+	// Use the full mux (NewServer wires it) by binding the real Server.
+	// httptest takes a ListenAndServe equivalent via httptest.NewServer
+	// with the underlying handler from s.http.Handler.
+	ts := httptest.NewServer(s.http.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	var payload struct {
+		Status         string `json:"status"`
+		Mode           string `json:"mode"`
+		DefaultPolicy  string `json:"default_policy"`
+		ActiveProfile  string `json:"active_profile"`
+		DecisionsCount int64  `json:"decisions_count"`
+	}
+	require.NoError(t, json.Unmarshal(body, &payload))
+	assert.Equal(t, "ok", payload.Status)
+	assert.Equal(t, string(ModeTransparent), payload.Mode)
+	assert.Equal(t, string(DefaultPolicyDeny), payload.DefaultPolicy)
+	assert.Empty(t, payload.ActiveProfile, "no profile configured → empty string")
+
+	// Critical: /healthz must NOT have written an audit row. The
+	// audit log is reserved for proxy decisions, not liveness probes.
+	n, err := st.CountDecisions()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n,
+		"/healthz must not generate audit rows")
+}
+
+func TestServer_Healthz_ReportsActiveProfileName(t *testing.T) {
+	st := freshStore(t)
+	prof := &profile.Profile{Name: "staging-work"}
+	cfg := Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		ActiveProfile: prof,
+	}
+	s := NewServer(cfg, st)
+	ts := httptest.NewServer(s.http.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var payload struct {
+		ActiveProfile string `json:"active_profile"`
+	}
+	require.NoError(t, json.Unmarshal(body, &payload))
+	assert.Equal(t, "staging-work", payload.ActiveProfile)
+}
+
+func TestServer_Healthz_DoesNotShadowProxyEvaluation(t *testing.T) {
+	// Regression guard: an arbitrary URL that happens to start with
+	// /healthz... must still hit the catch-all proxy handler, not the
+	// healthz handler. ServeMux's exact-vs-prefix rules mean "/healthz"
+	// (no trailing slash) only matches the exact path.
+	st := freshStore(t)
+	s := NewServer(Config{Mode: ModeCooperative, DefaultPolicy: DefaultPolicyAllow}, st)
+	ts := httptest.NewServer(s.http.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthzzz/api/v1/pods")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	// Should fall through to proxy handler — Content-Type still
+	// application/json but body contains a proxy_observation envelope.
+	body, _ := io.ReadAll(resp.Body)
+	var probe map[string]any
+	require.NoError(t, json.Unmarshal(body, &probe))
+	_, hasObservation := probe["proxy_observation"]
+	assert.True(t, hasObservation,
+		"/healthzzz/... must route to proxy handler, not /healthz")
+}

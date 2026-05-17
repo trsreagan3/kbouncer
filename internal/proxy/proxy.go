@@ -424,6 +424,13 @@ func NewServer(cfg Config, st *store.Store) *Server {
 	cfg = cfg.Normalize()
 	s := &Server{cfg: cfg, store: st}
 	mux := http.NewServeMux()
+	// /healthz is a liveness probe — never goes through proxy
+	// evaluation (so it doesn't pollute the audit log), never
+	// touches upstream. Returns 200 + a small JSON body that
+	// callers (monit, k8s liveness probe, supervisor scripts) can
+	// regex against. Registering BEFORE the catch-all "/" so the
+	// exact-match path wins ServeMux precedence.
+	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/", s.handle)
 	s.http = &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
@@ -497,6 +504,45 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		// Encoding into an in-memory buffer should never fail; log and
 		// move on so a test failure surfaces.
 		log.Warn().Err(err).Msg("kbouncer: encode response failed")
+	}
+}
+
+// healthz responds 200 with a small JSON liveness payload. Bypasses
+// proxy evaluation entirely — never writes to the audit log, never
+// touches upstream — so monitoring probes don't show up as
+// "decisions" in the operator's audit tail. Counts decisions as a
+// liveness signal: if the underlying SQLite store can serve a
+// COUNT(*), we're alive enough for traffic.
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	payload := struct {
+		Status         string `json:"status"`
+		Mode           string `json:"mode"`
+		DefaultPolicy  string `json:"default_policy"`
+		ActiveProfile  string `json:"active_profile"`
+		DecisionsCount int64  `json:"decisions_count"`
+	}{
+		Status:        "ok",
+		Mode:          string(s.cfg.Mode),
+		DefaultPolicy: string(s.cfg.DefaultPolicy),
+	}
+	if s.cfg.ActiveProfile != nil {
+		payload.ActiveProfile = s.cfg.ActiveProfile.Name
+	}
+	if s.store != nil {
+		if n, err := s.store.CountDecisions(); err == nil {
+			payload.DecisionsCount = n
+		} else {
+			// Store unreachable — flip to degraded so liveness probes
+			// can pick it up. Still 200 because the proxy process
+			// itself is alive; readiness probes should use a
+			// separate signal in a later slice if needed.
+			payload.Status = "degraded"
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Warn().Err(err).Msg("kbouncer: encode /healthz response failed")
 	}
 }
 

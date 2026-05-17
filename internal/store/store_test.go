@@ -92,3 +92,80 @@ func TestDefaultDBPath_HonorsEnvOverride(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/kbouncer-override.db", p)
 }
+
+func TestRecentDecisions_EmptyDBReturnsEmpty(t *testing.T) {
+	s := freshDB(t)
+	rows, err := s.RecentDecisions(0)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+}
+
+func TestRecentDecisions_NewestFirstWithCapAndDefault(t *testing.T) {
+	s := freshDB(t)
+	// Insert 5 rows
+	for i := 0; i < 5; i++ {
+		_, err := s.RecordDecision(DecisionRow{
+			At:              time.Date(2026, 5, 17, 12, i, 0, 0, time.UTC),
+			Method:          "GET",
+			Path:            "/api/v1/namespaces/default/pods/p",
+			ParsedVerb:      "get",
+			ParsedResource:  "pods",
+			DecisionVerdict: "allow",
+			DecisionReason:  "n",
+			ModeAtDecision:  "cooperative",
+			DecisionSource:  "global",
+		})
+		require.NoError(t, err)
+	}
+	// limit=0 → default 50; only 5 exist → returns 5
+	rows, err := s.RecentDecisions(0)
+	require.NoError(t, err)
+	require.Len(t, rows, 5)
+	// Newest first → first row should be the LAST inserted
+	assert.Equal(t, "12:04:00", rows[0].At.Format("15:04:05"))
+	assert.Equal(t, "12:00:00", rows[4].At.Format("15:04:05"))
+	// Decision-source round-trip preserved
+	assert.Equal(t, "global", rows[0].DecisionSource)
+
+	// limit=2 honored
+	rows, err = s.RecentDecisions(2)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+
+	// limit=99999 → clamped to 1000
+	rows, err = s.RecentDecisions(99999)
+	require.NoError(t, err)
+	require.Len(t, rows, 5)  // only 5 exist, but no error from clamp
+}
+
+func TestRecentDecisions_PreservesProfileNameAndRuleID(t *testing.T) {
+	s := freshDB(t)
+	ruleID := int64(17)
+	_, err := s.RecordDecision(DecisionRow{
+		Method:          "DELETE",
+		Path:            "/api/v1/namespaces/prod/pods/p",
+		ParsedVerb:      "delete",
+		ParsedResource:  "pods",
+		ParsedNamespace: "prod",
+		DecisionVerdict: "deny",
+		DecisionReason:  "profile staging-work matched keyword prod",
+		ModeAtDecision:  "transparent",
+		Enforced:        true,
+		MatchedRuleID:   &ruleID,
+		TaskID:          "task-7",
+		DecisionSource:  "profile",
+		ProfileName:     "staging-work",
+	})
+	require.NoError(t, err)
+
+	rows, err := s.RecentDecisions(10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	r := rows[0]
+	assert.Equal(t, "profile", r.DecisionSource)
+	assert.Equal(t, "staging-work", r.ProfileName)
+	assert.Equal(t, "task-7", r.TaskID)
+	require.NotNil(t, r.MatchedRuleID)
+	assert.Equal(t, int64(17), *r.MatchedRuleID)
+	assert.True(t, r.Enforced)
+}

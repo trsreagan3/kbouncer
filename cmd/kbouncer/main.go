@@ -60,6 +60,7 @@ func newRootCmd() *cobra.Command {
 	}
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newProfileCmd())
+	root.AddCommand(newAuditCmd())
 	return root
 }
 
@@ -328,5 +329,77 @@ func newProfileListCmd() *cobra.Command {
 		"Profile to mark as active in the listing. Falls back to "+envProfileVar+".")
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
 		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
+	return cmd
+}
+
+// newAuditCmd implements `kbouncer audit ...`. K-Slice 1 ships `tail`
+// only — the highest-leverage operator workflow ("show me what just
+// happened on the proxy"). Later slices may add `search`, `export`,
+// and `diff` against a prior known-good baseline.
+func newAuditCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "audit",
+		Short: "Inspect the kbouncer decision audit log",
+		Long: `kbouncer records every evaluated request in a local SQLite
+audit log at ~/.kbouncer/state.db. ` + "`kbouncer audit tail`" + ` is the
+fastest way to see what kubectl / Helm / an agent just sent through
+the proxy and what verdict each call got.`,
+	}
+	cmd.AddCommand(newAuditTailCmd())
+	return cmd
+}
+
+func newAuditTailCmd() *cobra.Command {
+	var (
+		limit  int
+		dbPath string
+	)
+	cmd := &cobra.Command{
+		Use:   "tail",
+		Short: "Show the most recent N decisions (newest first)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st, err := store.Open(dbPath)
+			if err != nil {
+				return fmt.Errorf("open store: %w", err)
+			}
+			defer st.Close()
+			rows, err := st.RecentDecisions(limit)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "(no decisions recorded yet)")
+				return nil
+			}
+			w := cmd.OutOrStdout()
+			fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-9s  %s\n",
+				"AT (UTC)", "MODE", "VERDICT", "SOURCE", "REQUEST")
+			for _, r := range rows {
+				at := r.At.UTC().Format("2006-01-02 15:04:05")
+				src := r.DecisionSource
+				if src == "" {
+					src = "-"
+				}
+				req := r.Method + " " + r.Path
+				if len(req) > 60 {
+					req = req[:57] + "..."
+				}
+				fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-9s  %s\n",
+					at, r.ModeAtDecision, r.DecisionVerdict, src, req)
+				if r.DecisionReason != "" {
+					reason := r.DecisionReason
+					if len(reason) > 80 {
+						reason = reason[:77] + "..."
+					}
+					fmt.Fprintf(w, "%48s  %s\n", "↳", reason)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&limit, "limit", 50,
+		"Max rows to return (1-1000). Default 50.")
+	cmd.Flags().StringVar(&dbPath, "db", "",
+		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
 	return cmd
 }
