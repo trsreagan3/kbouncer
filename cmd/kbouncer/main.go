@@ -61,6 +61,8 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newProfileCmd())
 	root.AddCommand(newAuditCmd())
+	root.AddCommand(newPauseCmd())
+	root.AddCommand(newPromptsCmd())
 	return root
 }
 
@@ -88,6 +90,7 @@ func newRunCmd() *cobra.Command {
 		profileName   string
 		profilesPath  string
 		cluster       string
+		promptOnDeny  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -165,6 +168,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				DefaultPolicy: defaultPol,
 				ActiveProfile: activeProfile,
 				Cluster:       cluster,
+				PromptOnDeny:  promptOnDeny,
 			}.Normalize()
 
 			s := proxy.NewServer(cfg, st)
@@ -241,6 +245,13 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"only_clusters and the 'cluster' keyword target. K-Slice 7 "+
 			"requires explicit pass-through; auto-detection from kubeconfig "+
 			"ships in K-Slice 8.")
+	cmd.Flags().BoolVar(&promptOnDeny, "prompt-on-deny", false,
+		"#5 async deny-prompt UX: when set, every transparent-mode "+
+			"DENY also writes a pending_prompts row so the operator can "+
+			"later answer (always-allow / add-to-profile / ignore) via "+
+			"`kbouncer prompts answer`. The agent is still denied "+
+			"immediately; the answer takes effect on the NEXT call of "+
+			"the same shape. Defaults off — opt-in to avoid noisy queues.")
 	return cmd
 }
 

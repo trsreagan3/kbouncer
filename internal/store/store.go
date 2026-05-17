@@ -45,7 +45,9 @@ import (
 //
 //	1 — initial: decisions + rules + tasks tables (K-Slice 1)
 //	2 — add decisions.decision_source + decisions.profile_name (K-Slice 7)
-const SchemaVersion = 2
+//	3 — add pause_events + decisions.pause_id (#6a timed escape hatch)
+//	4 — add pending_prompts (#5 async deny-prompt UX, v1.0 subset)
+const SchemaVersion = 4
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
@@ -183,6 +185,56 @@ func (s *Store) migrate() error {
 			owner TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`,
+		// pause_events: #6a timed escape hatch. Each pause is its own
+		// audit row (intentionally a separate table from decisions/
+		// config_events so reviewers can find "what windows did the
+		// operator open" with a single query). Per [[safety-mode-lean-
+		// permissive]]: the audit trail does the work; the bypass is
+		// acceptable precisely because every call during it is logged
+		// with pause_id linkage + the pause itself is its own row.
+		`CREATE TABLE IF NOT EXISTS pause_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			started_at TEXT NOT NULL,
+			ends_at TEXT NOT NULL,
+			reason TEXT NOT NULL DEFAULT '',
+			started_by TEXT NOT NULL,
+			ended_at_actual TEXT,
+			end_kind TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pause_events_ends_at ON pause_events(ends_at)`,
+		// pending_prompts: #5 async deny-prompt UX (v1.0 subset).
+		// When transparent-mode DENY fires AND the operator opted into
+		// prompt_on_deny, the deny is also written here so the operator
+		// can later answer (always-allow / add-to-profile / ignore).
+		// Async v1.0 flow: agent gets denied immediately; operator
+		// answers via `kbouncer prompts answer`; future calls use the
+		// new rule. The sync v1.1 flow will REUSE this table by having
+		// the proxy poll status briefly before returning.
+		//
+		// K8s column naming: verb/group/version/resource/namespace/name
+		// mirrors the parser shape (vs the Python bouncer's
+		// service/action). decision_id JOINs cleanly back to decisions.id
+		// so post-hoc review can pull the full request URL by joining
+		// the two tables.
+		`CREATE TABLE IF NOT EXISTS pending_prompts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			decision_id INTEGER NOT NULL,
+			verb TEXT NOT NULL DEFAULT '',
+			group_name TEXT NOT NULL DEFAULT '',
+			version TEXT NOT NULL DEFAULT '',
+			resource TEXT NOT NULL DEFAULT '',
+			namespace TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
+			deny_reason TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			answer_kind TEXT,
+			answer_target TEXT,
+			answered_by TEXT,
+			answered_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_prompts_status ON pending_prompts(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_prompts_created_at ON pending_prompts(created_at)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
@@ -199,6 +251,17 @@ func (s *Store) migrate() error {
 	}
 	if err := s.addColumnIfMissing("decisions", "profile_name", "TEXT"); err != nil {
 		return err
+	}
+
+	// v3 additive migration: link each decision to the pause event that
+	// was active at decision time (if any). Lets post-hoc review answer
+	// "which decisions happened inside pause N?" with a single JOIN.
+	// NULL when no pause active.
+	if err := s.addColumnIfMissing("decisions", "pause_id", "INTEGER"); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_decisions_pause_id ON decisions(pause_id)`); err != nil {
+		return fmt.Errorf("kbouncer: create idx_decisions_pause_id: %w", err)
 	}
 
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it
@@ -251,6 +314,10 @@ type DecisionRow struct {
 	// ProfileName added in K-Slice 7. The active profile at decision
 	// time, or "" when no profile was active.
 	ProfileName string
+	// PauseID added by #6a. Set when an operator-initiated pause window
+	// was active at decision time so reviewers can ask "what calls
+	// happened inside pause N?" with a single JOIN. NULL otherwise.
+	PauseID *int64
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -270,15 +337,15 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			is_watch, is_dry_run,
 			decision_verdict, decision_reason, mode_at_decision, enforced,
 			matched_rule_id, task_id,
-			decision_source, profile_name
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			decision_source, profile_name, pause_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Method, d.Path,
 		d.ParsedVerb, d.ParsedGroup, d.ParsedVersion, d.ParsedResource,
 		d.ParsedNamespace, d.ParsedName, d.ParsedSubresource,
 		boolToInt(d.IsWatch), boolToInt(d.IsDryRun),
 		d.DecisionVerdict, d.DecisionReason, d.ModeAtDecision, boolToInt(d.Enforced),
 		nullableInt(d.MatchedRuleID), nullableString(d.TaskID),
-		d.DecisionSource, nullableString(d.ProfileName),
+		d.DecisionSource, nullableString(d.ProfileName), nullableInt(d.PauseID),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("kbouncer: record decision: %w", err)
@@ -318,7 +385,8 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		is_watch, is_dry_run,
 		decision_verdict, decision_reason, mode_at_decision, enforced,
 		matched_rule_id, task_id,
-		COALESCE(decision_source, ''), COALESCE(profile_name, '')
+		COALESCE(decision_source, ''), COALESCE(profile_name, ''),
+		pause_id
 		FROM decisions
 		ORDER BY id DESC
 		LIMIT ?`, limit)
@@ -336,6 +404,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			enforced int
 			ruleID   sql.NullInt64
 			taskID   sql.NullString
+			pauseID  sql.NullInt64
 		)
 		if err := rows.Scan(
 			&atStr, &d.Method, &d.Path,
@@ -344,7 +413,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&isWatch, &isDryRun,
 			&d.DecisionVerdict, &d.DecisionReason, &d.ModeAtDecision, &enforced,
 			&ruleID, &taskID,
-			&d.DecisionSource, &d.ProfileName,
+			&d.DecisionSource, &d.ProfileName, &pauseID,
 		); err != nil {
 			return nil, fmt.Errorf("kbouncer: recent decisions scan: %w", err)
 		}
@@ -360,6 +429,10 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		}
 		if taskID.Valid {
 			d.TaskID = taskID.String
+		}
+		if pauseID.Valid {
+			pid := pauseID.Int64
+			d.PauseID = &pid
 		}
 		out = append(out, d)
 	}
@@ -423,4 +496,372 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// Pauses (#6a — timed bypass / escape hatch)
+// ---------------------------------------------------------------------------
+
+// PauseRow is one row from pause_events. Returned by GetActivePause and
+// ListRecentPauses. Optional fields use sql.NullString so callers can
+// distinguish "not set" from "empty string."
+type PauseRow struct {
+	ID            int64
+	StartedAt     string
+	EndsAt        string
+	Reason        string
+	StartedBy     string
+	EndedAtActual string // empty when pause is still active
+	EndKind       string // "" while live; "expired" or "resumed_early" after end
+}
+
+// MaxPauseDurationSeconds caps how long a single pause may run. Per
+// [[safety-mode-lean-permissive]]: short windows + audit trail does the
+// work. A multi-day pause is an "I don't want the proxy" signal — the
+// operator should stop the daemon instead.
+const MaxPauseDurationSeconds int64 = 24 * 3600
+
+// StartPause opens a new pause window. Returns the new pause id.
+//
+// Refuses (returns error) if another pause is already active — nested
+// pauses are deliberately rejected so the audit trail always has a
+// clean "started at X, ended at Y" pairing. To extend, resume + start
+// a new one (each extension is its own row).
+//
+// Also refuses durationSeconds <= 0 (nonsense) and > 24h (cap; see
+// MaxPauseDurationSeconds).
+func (s *Store) StartPause(durationSeconds int64, reason, startedBy string) (int64, error) {
+	if durationSeconds <= 0 {
+		return 0, fmt.Errorf("kbouncer: pause duration must be > 0 seconds")
+	}
+	if durationSeconds > MaxPauseDurationSeconds {
+		return 0, fmt.Errorf(
+			"kbouncer: pause duration cannot exceed 24h; for longer windows " +
+				"stop the proxy and restart later")
+	}
+	now := time.Now().UTC()
+	ends := now.Add(time.Duration(durationSeconds) * time.Second)
+	// Lazy-GC + active-check under the same connection so a racing
+	// caller can't slip past. The active-pause query inside
+	// GetActivePause writes back expired rows so this read sees the
+	// current truth.
+	active, err := s.GetActivePause()
+	if err != nil {
+		return 0, err
+	}
+	if active != nil {
+		return 0, fmt.Errorf(
+			"kbouncer: a pause is already active (id=%d, ends_at=%s); "+
+				"resume first to start a new one",
+			active.ID, active.EndsAt)
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO pause_events(started_at, ends_at, reason, started_by) VALUES (?, ?, ?, ?)`,
+		now.Format("2006-01-02T15:04:05Z"),
+		ends.Format("2006-01-02T15:04:05Z"),
+		reason,
+		startedBy,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("kbouncer: start pause: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("kbouncer: start pause last insert id: %w", err)
+	}
+	return id, nil
+}
+
+// EndPause closes the currently-active pause. Returns the ended pause
+// id, or nil if no pause was active. Sets end_kind = "resumed_early"
+// so post-hoc review can distinguish operator-initiated ends from
+// auto-expiry.
+//
+// endedBy names the actor for the audit trail (typically "cli" or a
+// username).
+func (s *Store) EndPause(endedBy string) (*int64, error) {
+	active, err := s.GetActivePause()
+	if err != nil {
+		return nil, err
+	}
+	if active == nil {
+		return nil, nil
+	}
+	_, err = s.db.Exec(
+		`UPDATE pause_events SET ended_at_actual = ?, end_kind = ? WHERE id = ? AND ended_at_actual IS NULL`,
+		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		"resumed_early",
+		active.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: end pause: %w", err)
+	}
+	// Note: endedBy is recorded by the CLI layer in a future audit-
+	// event table; the pause_events row itself tracks lifecycle, not
+	// the actor who ended it. (Mirrors the Python store.)
+	_ = endedBy
+	return &active.ID, nil
+}
+
+// GetActivePause returns the currently-active pause (started, not yet
+// expired, not yet ended). Returns nil when no pause is active.
+//
+// Lazy garbage-collect: marks any pause whose ends_at is past as
+// 'expired' before reading. This is the auto-revert mechanism — no
+// background timer required; works in tests, in serverless,
+// anywhere. The first read past ends_at flips the pause to expired.
+func (s *Store) GetActivePause() (*PauseRow, error) {
+	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	if _, err := s.db.Exec(
+		`UPDATE pause_events SET ended_at_actual = ends_at, end_kind = 'expired'
+		 WHERE ended_at_actual IS NULL AND ends_at <= ?`,
+		nowStr,
+	); err != nil {
+		return nil, fmt.Errorf("kbouncer: gc expired pauses: %w", err)
+	}
+	row := s.db.QueryRow(
+		`SELECT id, started_at, ends_at, reason, started_by,
+		       COALESCE(ended_at_actual, ''), COALESCE(end_kind, '')
+		 FROM pause_events
+		 WHERE ended_at_actual IS NULL
+		 ORDER BY id DESC LIMIT 1`,
+	)
+	var p PauseRow
+	err := row.Scan(&p.ID, &p.StartedAt, &p.EndsAt, &p.Reason, &p.StartedBy, &p.EndedAtActual, &p.EndKind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: get active pause: %w", err)
+	}
+	return &p, nil
+}
+
+// ListRecentPauses returns the N most recent pause rows for
+// `kbouncer pause history`. Default limit when <=0: 20.
+func (s *Store) ListRecentPauses(limit int) ([]PauseRow, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.db.Query(
+		`SELECT id, started_at, ends_at, reason, started_by,
+		        COALESCE(ended_at_actual, ''), COALESCE(end_kind, '')
+		 FROM pause_events ORDER BY id DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: list pauses: %w", err)
+	}
+	defer rows.Close()
+	out := make([]PauseRow, 0, limit)
+	for rows.Next() {
+		var p PauseRow
+		if err := rows.Scan(&p.ID, &p.StartedAt, &p.EndsAt, &p.Reason, &p.StartedBy, &p.EndedAtActual, &p.EndKind); err != nil {
+			return nil, fmt.Errorf("kbouncer: list pauses scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("kbouncer: list pauses iterate: %w", err)
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Pending prompts (#5 — async deny-prompt UX, v1.0 subset)
+// ---------------------------------------------------------------------------
+
+// PromptRow is one row from pending_prompts. K8s column shape: the
+// parsed verb/group/version/resource/namespace/name from the proxy
+// (mirrors the iam-jit-bouncer service+action equivalents).
+type PromptRow struct {
+	ID           int64
+	CreatedAt    string
+	DecisionID   int64
+	Verb         string
+	Group        string
+	Version      string
+	Resource     string
+	Namespace    string
+	Name         string
+	DenyReason   string
+	Status       string
+	AnswerKind   string
+	AnswerTarget string
+	AnsweredBy   string
+	AnsweredAt   string
+}
+
+// PromptInput is the input to AddPendingPrompt. Keeping a struct
+// (rather than a long positional arg list) so the call site stays
+// readable + future fields are additive.
+type PromptInput struct {
+	DecisionID int64
+	Verb       string
+	Group      string
+	Version    string
+	Resource   string
+	Namespace  string
+	Name       string
+	DenyReason string
+}
+
+// AddPendingPrompt inserts a pending-prompt row for a transparent-mode
+// DENY the operator has opted in to be notified about. Returns the
+// new prompt id.
+//
+// Idempotent on (decision_id) — re-calling with the same decision_id
+// is a no-op + returns the existing id. This makes the proxy's
+// enqueue path safe to retry on transient failures.
+func (s *Store) AddPendingPrompt(p PromptInput) (int64, error) {
+	// Idempotency: if a prompt already exists for this decision_id,
+	// return its id without inserting again. The proxy's audit-log
+	// invariant is "one decision -> at-most-one prompt".
+	var prior int64
+	row := s.db.QueryRow(`SELECT id FROM pending_prompts WHERE decision_id = ?`, p.DecisionID)
+	if err := row.Scan(&prior); err == nil {
+		return prior, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("kbouncer: lookup pending prompt: %w", err)
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO pending_prompts(
+			created_at, decision_id, verb, group_name, version, resource,
+			namespace, name, deny_reason
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		p.DecisionID, p.Verb, p.Group, p.Version, p.Resource,
+		p.Namespace, p.Name, p.DenyReason,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("kbouncer: add pending prompt: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("kbouncer: add pending prompt last insert id: %w", err)
+	}
+	return id, nil
+}
+
+// PromptStatusPending / PromptStatusAnswered / PromptStatusIgnored are
+// the canonical status values surfaced by ListPendingPrompts +
+// AnswerPendingPrompt.
+const (
+	PromptStatusPending  = "pending"
+	PromptStatusAnswered = "answered"
+	PromptStatusIgnored  = "ignored"
+)
+
+// ListPendingPrompts returns prompts with the given status, newest
+// first. Default limit when <=0: 50.
+func (s *Store) ListPendingPrompts(status string, limit int) ([]PromptRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if status == "" {
+		status = PromptStatusPending
+	}
+	rows, err := s.db.Query(
+		`SELECT id, created_at, decision_id, verb, group_name, version,
+		        resource, namespace, name, deny_reason, status,
+		        COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
+		        COALESCE(answered_by, ''), COALESCE(answered_at, '')
+		 FROM pending_prompts WHERE status = ?
+		 ORDER BY id DESC LIMIT ?`, status, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: list pending prompts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]PromptRow, 0, limit)
+	for rows.Next() {
+		var p PromptRow
+		if err := rows.Scan(
+			&p.ID, &p.CreatedAt, &p.DecisionID, &p.Verb, &p.Group, &p.Version,
+			&p.Resource, &p.Namespace, &p.Name, &p.DenyReason, &p.Status,
+			&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
+		); err != nil {
+			return nil, fmt.Errorf("kbouncer: list pending prompts scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("kbouncer: list pending prompts iterate: %w", err)
+	}
+	return out, nil
+}
+
+// GetPendingPrompt returns the prompt with the given id, or nil if it
+// doesn't exist.
+func (s *Store) GetPendingPrompt(id int64) (*PromptRow, error) {
+	row := s.db.QueryRow(
+		`SELECT id, created_at, decision_id, verb, group_name, version,
+		        resource, namespace, name, deny_reason, status,
+		        COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
+		        COALESCE(answered_by, ''), COALESCE(answered_at, '')
+		 FROM pending_prompts WHERE id = ?`, id,
+	)
+	var p PromptRow
+	err := row.Scan(
+		&p.ID, &p.CreatedAt, &p.DecisionID, &p.Verb, &p.Group, &p.Version,
+		&p.Resource, &p.Namespace, &p.Name, &p.DenyReason, &p.Status,
+		&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: get pending prompt: %w", err)
+	}
+	return &p, nil
+}
+
+// PromptAnswerKindAlways / Profile / Ignore are the canonical answer
+// kinds accepted by AnswerPendingPrompt.
+const (
+	PromptAnswerKindAlways  = "always"
+	PromptAnswerKindProfile = "profile"
+	PromptAnswerKindIgnore  = "ignore"
+)
+
+// AnswerPendingPrompt records an answer on a pending prompt. Returns
+// true if the prompt was found + pending; false if it was already
+// answered or doesn't exist.
+//
+// Validates kind ∈ {always, profile, ignore} — unknown kinds return
+// an error (NOT false) so callers can distinguish a bad request from
+// an already-answered prompt.
+//
+// Side-effects (rule add / profile edit) are the CLI's responsibility
+// — store just records intent.
+func (s *Store) AnswerPendingPrompt(id int64, kind, target, answeredBy string) (bool, error) {
+	switch kind {
+	case PromptAnswerKindAlways, PromptAnswerKindProfile, PromptAnswerKindIgnore:
+		// ok
+	default:
+		return false, fmt.Errorf(
+			"kbouncer: answer_kind must be one of: always, profile, ignore (got %q)",
+			kind)
+	}
+	res, err := s.db.Exec(
+		`UPDATE pending_prompts SET status = 'answered',
+		        answer_kind = ?, answer_target = ?, answered_by = ?, answered_at = ?
+		 WHERE id = ? AND status = 'pending'`,
+		kind, nullableString(target), answeredBy,
+		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		id,
+	)
+	if err != nil {
+		return false, fmt.Errorf("kbouncer: answer pending prompt: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("kbouncer: answer pending prompt rows affected: %w", err)
+	}
+	return n > 0, nil
 }

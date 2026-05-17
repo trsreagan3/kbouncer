@@ -128,6 +128,17 @@ type Config struct {
 	// matching and the "cluster" keyword target. Empty when the proxy
 	// can't determine the cluster.
 	Cluster string
+
+	// PromptOnDeny gates the #5 async deny-prompt UX. When true, every
+	// transparent-mode DENY also writes a pending_prompts row so the
+	// operator can later answer (always-allow / add-to-profile /
+	// ignore) via `kbouncer prompts answer`. Async — the agent is
+	// denied immediately; the answer takes effect on the NEXT call of
+	// the same shape. The enqueue ONLY fires when ALL of:
+	// PromptOnDeny=true, Mode=Transparent, verdict=Deny, no pause
+	// active (pauses already bypass enforcement). Defaults false so
+	// nothing is enqueued by default.
+	PromptOnDeny bool
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -246,6 +257,17 @@ func EvaluateRequest(r *http.Request, st *store.Store, mode Mode, defaultPolicy 
 	return EvaluateRequestWithProfile(r, st, mode, defaultPolicy, nil, "")
 }
 
+// EvalOptions controls the optional behaviors layered onto the basic
+// evaluator (#6a pause-aware enforcement, #5 prompt-on-deny enqueue).
+// Plain struct so the call site stays readable; a nil/zero value
+// disables the optional behaviors and reproduces the K-Slice 7
+// EvaluateRequestWithProfile semantics.
+type EvalOptions struct {
+	// PromptOnDeny mirrors Config.PromptOnDeny — when true, every
+	// transparent-mode DENY writes a pending_prompts row.
+	PromptOnDeny bool
+}
+
 // EvaluateRequestWithProfile is the K-Slice 7 evaluator. It runs the
 // composition order documented on the profile package:
 //
@@ -270,9 +292,52 @@ func EvaluateRequestWithProfile(
 	activeProfile *profile.Profile,
 	cluster string,
 ) *RequestObservation {
+	return EvaluateRequestFull(r, st, mode, defaultPolicy, activeProfile, cluster, EvalOptions{})
+}
+
+// EvaluateRequestFull is the full-shape evaluator that also threads
+// EvalOptions (#6a pause-aware enforcement, #5 prompt-on-deny
+// enqueue). The earlier EvaluateRequest / EvaluateRequestWithProfile
+// shapes are kept as thin wrappers so K-Slice 1 + 7 callers keep
+// working unchanged.
+func EvaluateRequestFull(
+	r *http.Request,
+	st *store.Store,
+	mode Mode,
+	defaultPolicy DefaultPolicy,
+	activeProfile *profile.Profile,
+	cluster string,
+	opts EvalOptions,
+) *RequestObservation {
 	now := time.Now().UTC()
 	mode = normalizeMode(mode)
 	defaultPolicy = normalizeDefaultPolicy(defaultPolicy)
+
+	// #6a — timed bypass / "pause." If an operator-initiated pause is
+	// active, the proxy demotes effective behavior to COOPERATIVE for
+	// this decision: the verdict text is preserved (so audit reviewers
+	// see what WOULD have been denied) but enforcement is suspended.
+	// The pause_id is recorded on the audit row so reviewers can ask
+	// "what calls happened inside the pause window?" with a single
+	// SQL filter.
+	//
+	// Per [[safety-mode-lean-permissive]]: the audit trail does the
+	// work; the bypass is acceptable precisely because every call
+	// during it is logged with pause_id linkage + the pause itself is
+	// its own audit row.
+	var activePause *store.PauseRow
+	if st != nil {
+		ap, err := st.GetActivePause()
+		if err != nil {
+			log.Warn().Err(err).Msg("kbouncer: pause-lookup failed")
+		} else {
+			activePause = ap
+		}
+	}
+	effectiveMode := mode
+	if activePause != nil && mode == ModeTransparent {
+		effectiveMode = ModeCooperative
+	}
 
 	parsed, err := parser.Parse(r)
 	if err != nil || parsed == nil {
@@ -296,11 +361,12 @@ func EvaluateRequestWithProfile(
 			Path:            path,
 			DecisionVerdict: VerdictDeny,
 			DecisionReason:  "unclassifiable request — does not match any known kube-apiserver URL shape",
-			ModeAtDecision:  string(mode),
-			Enforced:        mode == ModeTransparent,
+			ModeAtDecision:  string(effectiveMode),
+			Enforced:        effectiveMode == ModeTransparent,
 			DecisionSource:  SourceUnclassifiable,
 		}
-		writeDecision(st, obs)
+		decisionID := writeDecision(st, obs, activePause)
+		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
 
@@ -317,7 +383,7 @@ func EvaluateRequestWithProfile(
 		ParsedSubresource: parsed.Subresource,
 		IsWatch:           parsed.IsWatch,
 		IsDryRun:          parsed.IsDryRun,
-		ModeAtDecision:    string(mode),
+		ModeAtDecision:    string(effectiveMode),
 	}
 	if activeProfile != nil {
 		obs.ProfileName = activeProfile.Name
@@ -338,8 +404,9 @@ func EvaluateRequestWithProfile(
 			obs.DecisionVerdict = VerdictDeny
 			obs.DecisionReason = pv.Reason
 			obs.DecisionSource = SourceProfile
-			obs.Enforced = mode == ModeTransparent
-			writeDecision(st, obs)
+			obs.Enforced = effectiveMode == ModeTransparent
+			decisionID := writeDecision(st, obs, activePause)
+			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
 	}
@@ -357,20 +424,85 @@ func EvaluateRequestWithProfile(
 	obs.DecisionVerdict = verdict
 	obs.DecisionReason = reason
 	obs.DecisionSource = SourceDefault
-	obs.Enforced = mode == ModeTransparent && verdict == VerdictDeny
+	obs.Enforced = effectiveMode == ModeTransparent && verdict == VerdictDeny
 
-	writeDecision(st, obs)
+	decisionID := writeDecision(st, obs, activePause)
+	maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 	return obs
 }
 
-// writeDecision persists the observation. Nil store is a no-op (test
-// path). Write failures are logged but never propagated — audit-write
-// failure is a high-signal alert but must NOT crash the proxy.
-func writeDecision(st *store.Store, obs *RequestObservation) {
-	if st == nil {
+// maybeEnqueuePrompt writes a pending_prompts row when ALL of:
+// PromptOnDeny=true, the *originally-requested* mode is transparent
+// (cooperative DENYs are advisory; no prompt to surface), the verdict
+// is DENY, and no pause is active (a pause already bypasses
+// enforcement; the agent isn't being denied).
+//
+// `mode` is the originally-requested mode, NOT effectiveMode — once a
+// pause is active we KNOW we don't want to enqueue, but we still
+// shouldn't enqueue for cooperative-mode requests just because they
+// were demoted to cooperative for unrelated reasons. The pause guard
+// below makes that distinction safe.
+func maybeEnqueuePrompt(
+	st *store.Store,
+	opts EvalOptions,
+	mode Mode,
+	activePause *store.PauseRow,
+	decisionID int64,
+	obs *RequestObservation,
+	parsed *parser.ParsedRequest,
+) {
+	if st == nil || decisionID <= 0 {
 		return
 	}
-	_, err := st.RecordDecision(store.DecisionRow{
+	if !opts.PromptOnDeny {
+		return
+	}
+	if mode != ModeTransparent {
+		// Cooperative-mode DENYs never actually block the agent; no
+		// reason to surface a prompt. Matches the Python behavior.
+		return
+	}
+	if obs.DecisionVerdict != VerdictDeny {
+		return
+	}
+	if activePause != nil {
+		// Pause already bypasses enforcement — agent isn't denied;
+		// nothing to prompt about.
+		return
+	}
+	input := store.PromptInput{
+		DecisionID: decisionID,
+		DenyReason: obs.DecisionReason,
+	}
+	if parsed != nil {
+		input.Verb = parsed.Verb
+		input.Group = parsed.Group
+		input.Version = parsed.Version
+		input.Resource = parsed.Resource
+		input.Namespace = parsed.Namespace
+		input.Name = parsed.Name
+	}
+	if _, err := st.AddPendingPrompt(input); err != nil {
+		log.Warn().Err(err).Msg("kbouncer: prompt-enqueue failed")
+	}
+}
+
+// writeDecision persists the observation + returns the assigned row
+// id (0 when no row was written; callers gate the prompt-enqueue path
+// on a positive id).
+//
+// Nil store is a no-op (test path). Write failures are logged but
+// never propagated — audit-write failure is a high-signal alert but
+// must NOT crash the proxy.
+//
+// activePause threads the pause window id (if any) so the decision
+// row links back to the pause via decisions.pause_id — single-JOIN
+// post-hoc review ("what calls happened inside pause N?").
+func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.PauseRow) int64 {
+	if st == nil {
+		return 0
+	}
+	row := store.DecisionRow{
 		At:                obs.At,
 		Method:            obs.Method,
 		Path:              obs.Path,
@@ -389,10 +521,17 @@ func writeDecision(st *store.Store, obs *RequestObservation) {
 		Enforced:          obs.Enforced,
 		DecisionSource:    obs.DecisionSource,
 		ProfileName:       obs.ProfileName,
-	})
+	}
+	if activePause != nil {
+		pid := activePause.ID
+		row.PauseID = &pid
+	}
+	id, err := st.RecordDecision(row)
 	if err != nil {
 		log.Warn().Err(err).Msg("kbouncer: audit-write failed")
+		return 0
 	}
+	return id
 }
 
 func normalizeMode(m Mode) Mode {
@@ -476,7 +615,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // produced the verdict without parsing the JSON body. K-Slice 2 will
 // replace this with real forwarding to the kube-apiserver on allow.
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
-	obs := EvaluateRequestWithProfile(r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy, s.cfg.ActiveProfile, s.cfg.Cluster)
+	obs := EvaluateRequestFull(
+		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
+		s.cfg.ActiveProfile, s.cfg.Cluster,
+		EvalOptions{PromptOnDeny: s.cfg.PromptOnDeny},
+	)
 
 	// Set the decision-source header BEFORE WriteHeader. Empty values
 	// are still set so the header is always present — easier to assert
@@ -515,12 +658,23 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 // COUNT(*), we're alive enough for traffic.
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	// HealthzPause is the small payload surfaced under "pause" when a
+	// pause window is currently open. Lets monitors flag a window
+	// that's still open (e.g. ops left it on overnight by mistake)
+	// without us having to invent a separate probe endpoint.
+	type HealthzPause struct {
+		ID        int64  `json:"id"`
+		StartedAt string `json:"started_at"`
+		EndsAt    string `json:"ends_at"`
+		Reason    string `json:"reason,omitempty"`
+	}
 	payload := struct {
-		Status         string `json:"status"`
-		Mode           string `json:"mode"`
-		DefaultPolicy  string `json:"default_policy"`
-		ActiveProfile  string `json:"active_profile"`
-		DecisionsCount int64  `json:"decisions_count"`
+		Status         string        `json:"status"`
+		Mode           string        `json:"mode"`
+		DefaultPolicy  string        `json:"default_policy"`
+		ActiveProfile  string        `json:"active_profile"`
+		DecisionsCount int64         `json:"decisions_count"`
+		Pause          *HealthzPause `json:"pause"`
 	}{
 		Status:        "ok",
 		Mode:          string(s.cfg.Mode),
@@ -538,6 +692,19 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 			// itself is alive; readiness probes should use a
 			// separate signal in a later slice if needed.
 			payload.Status = "degraded"
+		}
+		// #6a — surface active pause window so monitors can flag a
+		// window that's still open (e.g. ops left it on overnight by
+		// mistake) without us having to invent a separate probe
+		// endpoint. Pause-read failure is non-fatal: probes care
+		// about liveness; the pause field will just be null.
+		if active, err := s.store.GetActivePause(); err == nil && active != nil {
+			payload.Pause = &HealthzPause{
+				ID:        active.ID,
+				StartedAt: active.StartedAt,
+				EndsAt:    active.EndsAt,
+				Reason:    active.Reason,
+			}
 		}
 	}
 	w.WriteHeader(http.StatusOK)
