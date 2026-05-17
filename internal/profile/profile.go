@@ -129,6 +129,34 @@ type ParsedRequest struct {
 	Cluster string
 }
 
+// ProfileAllowRule is one allow rule embedded in a profile. Profile-
+// scoped allow rules are merged into the rule engine ALONGSIDE global
+// rules when the profile is active; they do NOT short-circuit profile
+// deny layers above. Shape mirrors the iam-jit-bouncer Python
+// ProfileAllowRule so YAML profiles round-trip across both products.
+//
+// kbouncer does not yet consume AllowRules in the evaluator (K-Slice 7
+// is deny-only); the field is parsed + serialized so YAML written by
+// the Python bouncer (or a future kbouncer slice) survives the round
+// trip. Adding the field now keeps the on-disk shape stable.
+type ProfileAllowRule struct {
+	// Pattern is the verb/resource pattern (kbouncer convention TBD;
+	// kept opaque for now so symmetric YAML loads cleanly).
+	Pattern string `yaml:"pattern"`
+
+	// ArnScope (Python-side) / cluster or namespace scope (K8s-side).
+	// Kept named after the AWS shape so profile YAML round-trips; a
+	// future K-Slice may rename for K8s semantics with a YAML alias.
+	ArnScope string `yaml:"arn_scope,omitempty"`
+
+	// RegionScope is the AWS-side region scope; harmless on the K8s
+	// side, preserved for round-trip.
+	RegionScope string `yaml:"region_scope,omitempty"`
+
+	// Note is an operator-readable description of why this rule exists.
+	Note string `yaml:"note,omitempty"`
+}
+
 // Profile is one named environment profile.
 type Profile struct {
 	// Name is the YAML key, set by LoadProfiles after parsing.
@@ -166,12 +194,37 @@ type Profile struct {
 	// deny is suppressed (only_clusters / deny_verbs are NOT suppressed).
 	Exceptions []string `yaml:"exceptions,omitempty"`
 
+	// AllowRules are profile-scoped allow rules. Parsed + serialized for
+	// round-trip with the Python bouncer's profile shape. Not yet
+	// consumed by the kbouncer evaluator (K-Slice 7 is deny-only).
+	AllowRules []ProfileAllowRule `yaml:"allow_rules,omitempty"`
+
+	// Source records provenance. Empty or "local" → user-edited.
+	// A URL (set by `profile install --from URL`) → org-distributed,
+	// READ-ONLY at the CLI surface (UpsertProfile refuses to overwrite
+	// a non-local source). Mirrors the iam-jit-bouncer Python field
+	// of the same name so the enterprise-profile-distribution memo's
+	// invariants hold in both products.
+	Source string `yaml:"source,omitempty"`
+
 	// compiledKeywords holds pre-compiled regexes for word_boundary mode.
 	// Built lazily on first Evaluate via compileOnce; safe for concurrent
 	// callers thereafter.
 	compiledKeywords []*regexp.Regexp
 	compileOnce      sync.Once
 	compileErr       error
+}
+
+// IsLocalSource reports whether the profile is editable at the CLI
+// surface (i.e., it was not installed from an org URL). The empty
+// string and "local" both count as local — the embedded defaults
+// don't set Source, and the Python implementation defaults to "local"
+// when the YAML omits the field.
+func (p *Profile) IsLocalSource() bool {
+	if p == nil {
+		return true
+	}
+	return p.Source == "" || p.Source == "local"
 }
 
 // Profiles is a loaded collection of named profiles plus metadata.

@@ -260,6 +260,111 @@ which one would be active given the current --profile flag /
 ` + envProfileVar + ` env var.`,
 	}
 	cmd.AddCommand(newProfileListCmd())
+	cmd.AddCommand(newProfileInstallCmd())
+	return cmd
+}
+
+// newProfileInstallCmd implements `kbouncer profile install --from URL`.
+//
+// Symmetric with iam-jit-bouncer's `profile install` command and built
+// on the package-level Install function so test coverage lives in
+// internal/profile/install_test.go rather than here.
+//
+// Exit codes (mirror Python):
+//
+//	0  success
+//	1  payload / fetch problem (malformed YAML, validation error,
+//	   fetch failed) — usually an upstream-curator issue
+//	2  operator-fixable problem (http:// URL, sha256 mismatch,
+//	   conflict without --force)
+func newProfileInstallCmd() *cobra.Command {
+	var (
+		fromURL        string
+		expectedSHA256 string
+		force          bool
+		timeoutSecs    int
+		profilesPath   string
+	)
+	cmd := &cobra.Command{
+		Use:   "install --from URL [--sha256 HEX] [--force] [--timeout 10]",
+		Short: "Fetch + install profiles from an HTTPS URL",
+		Long: `Fetch a profiles.yaml fragment from an HTTPS URL and install
+the profiles it contains. Composes with the enterprise-profile-
+distribution onboarding pattern: IT teams publish curated profiles
+at an internal URL, and engineers install them on day 1.
+
+  kbouncer profile install --from https://internal.example/profiles.yaml
+
+The fetched URL becomes the ` + "`source`" + ` of each installed profile.
+Profiles with a non-local source are READ-ONLY at the CLI surface —
+engineers cannot edit them to bypass org guardrails (the canonical
+write entry point, UpsertProfile, refuses to overwrite them).
+
+HTTPS-only: http:// URLs are refused because plaintext distribution
+is MITM-substitutable. IT teams should ALSO pin --sha256 in their
+onboarding docs to defend against a compromised distribution server.
+
+Conflict policy: if a profile of the same name already exists,
+install refuses without --force. --force overrides the conflict
+gate but still records the new source.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts := profile.InstallOptions{
+				From:           fromURL,
+				ExpectedSHA256: expectedSHA256,
+				Force:          force,
+				Timeout:        time.Duration(timeoutSecs) * time.Second,
+				ProfilesPath:   profilesPath,
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "fetching %s ...\n", fromURL)
+			result, err := profile.Install(cmd.Context(), opts)
+			if err != nil {
+				var ie *profile.InstallError
+				if errors.As(err, &ie) {
+					// Print the structured message to stderr + use the
+					// install-specific exit code. cobra would prepend
+					// "Error:" if we returned the error directly, so we
+					// print + os.Exit ourselves.
+					fmt.Fprintln(cmd.ErrOrStderr(), ie.Message)
+					os.Exit(ie.ExitCode)
+				}
+				return err
+			}
+
+			if result.SHA256Verified {
+				fmt.Fprintf(cmd.OutOrStdout(), "sha256 verified: %s\n", result.SHA256)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "sha256 (no pin given): %s\n", result.SHA256)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"installed %d profile(s) into %s:\n",
+				len(result.InstalledNames), result.ProfilesPath)
+			for _, name := range result.InstalledNames {
+				fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", name)
+			}
+			fmt.Fprintln(cmd.OutOrStdout())
+			fmt.Fprintln(cmd.OutOrStdout(), "Activate one with:")
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"  kbouncer run --profile %s\n", result.InstalledNames[0])
+			fmt.Fprintln(cmd.OutOrStdout(),
+				"These profiles are READ-ONLY (sourced from URL); "+
+					"edit the upstream YAML + re-install to update.")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fromURL, "from", "",
+		"HTTPS URL of a profiles.yaml fragment. Required. http:// is refused.")
+	_ = cmd.MarkFlagRequired("from")
+	cmd.Flags().StringVar(&expectedSHA256, "sha256", "",
+		"Optional SHA-256 (hex) of the fetched bytes. Mismatch → exit 2. "+
+			"Defends against a compromised distribution server swapping the file.")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Overwrite existing profiles of the same name. Without --force, "+
+			"install refuses on conflict.")
+	cmd.Flags().IntVar(&timeoutSecs, "timeout", 10,
+		"HTTPS fetch timeout in seconds.")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml). "+
+			"Honors KBOUNCER_PROFILES_PATH env var if unset.")
 	return cmd
 }
 
