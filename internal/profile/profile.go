@@ -526,10 +526,25 @@ func (p *Profile) matchKeywords(candidates map[KeywordTarget]string, mode Keywor
 					p.compiledKeywords = append(p.compiledKeywords, nil)
 					continue
 				}
-				// (?i) → case-insensitive. \b → word boundary. regexp.QuoteMeta
-				// escapes any user-provided regex metachars so a keyword like
-				// "a.b" matches literally, not as a regex.
-				re, err := regexp.Compile(`(?i)\b` + regexp.QuoteMeta(kw) + `\b`)
+				// HIGH-33-01 closure: cross-product semantic parity.
+				// Python's iam-jit-bouncer uses [^A-Za-z0-9] as the
+				// boundary class, which treats underscore as a
+				// separator. Go's \b uses \w which INCLUDES
+				// underscore, so the same YAML matched differently
+				// across products: `prod` would match `prod_cluster`
+				// in iam-jit but NOT in kbouncer. Operators who
+				// shared profiles across both bouncers got silent
+				// gaps in their guardrails.
+				//
+				// Aligning to Python's behavior — underscore IS a
+				// boundary — because that matches operator intent:
+				// `prod_cluster` is meant to be caught as "prod"
+				// material. Both products now use the same regex
+				// shape: (?i)(?:^|[^A-Za-z0-9])KW(?:$|[^A-Za-z0-9]).
+				pat := `(?i)(?:^|[^A-Za-z0-9])` +
+					regexp.QuoteMeta(kw) +
+					`(?:$|[^A-Za-z0-9])`
+				re, err := regexp.Compile(pat)
 				if err != nil {
 					p.compileErr = err
 					p.compiledKeywords = append(p.compiledKeywords, nil)

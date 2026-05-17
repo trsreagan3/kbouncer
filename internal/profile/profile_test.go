@@ -177,6 +177,48 @@ func TestEvaluate_WordBoundary_MatchesAndExcludesProductivity(t *testing.T) {
 	}
 }
 
+// TestEvaluate_WordBoundary_CrossProductParity_HIGH3301 closes
+// HIGH-33-01: the Python iam-jit-bouncer uses [^A-Za-z0-9] as the
+// boundary class, so underscore IS a separator. Go was using \b
+// which treats \w (including _) as a "word" character — same YAML
+// matched differently across products. This test pins the Go
+// behavior to the Python semantic: underscore is a boundary.
+func TestEvaluate_WordBoundary_CrossProductParity_HIGH3301(t *testing.T) {
+	cases := []struct {
+		ns       string
+		wantDeny bool
+		why      string
+	}{
+		// Underscore is now a boundary (matches Python).
+		// Before the fix, these all returned wantDeny=false in Go.
+		{"prod_cluster", true, "underscore is a boundary"},
+		{"cluster_prod", true, "underscore is a boundary"},
+		{"prod_app_v1", true, "underscores on both sides"},
+		// Dots are boundaries — unchanged behavior, just confirming.
+		{"prod.staging", true, "dot is a boundary"},
+		{"staging.prod", true, "dot is a boundary"},
+		// True false-positive avoid cases still hold.
+		{"productivity", false, "no separator before 'prod' word boundary"},
+		{"reproduce", false, "no separator before 'prod'"},
+		// Pure substring inside an alphanumeric run still rejected.
+		{"prodcluster", false, "no separator"},
+	}
+	p := &Profile{
+		Name:           "parity",
+		DenyKeywords:   []string{"prod"},
+		KeywordTargets: []KeywordTarget{TargetNamespace},
+		KeywordMatch:   MatchWordBoundary,
+	}
+	for _, tc := range cases {
+		t.Run(tc.ns, func(t *testing.T) {
+			v := p.Evaluate(&ParsedRequest{Verb: "get", Namespace: tc.ns})
+			assert.Equal(t, tc.wantDeny, v.Denied,
+				"namespace %q: %s — want denied=%v got denied=%v",
+				tc.ns, tc.why, tc.wantDeny, v.Denied)
+		})
+	}
+}
+
 func TestEvaluate_SubstringMode_MatchesProductivityToo(t *testing.T) {
 	p := &Profile{
 		Name:           "strict",
