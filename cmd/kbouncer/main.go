@@ -39,11 +39,11 @@ import (
 // --i-know-this-binds-externally to acknowledge they read the threat
 // model.
 var loopbackHosts = map[string]struct{}{
-	"127.0.0.1":     {},
-	"::1":           {},
-	"localhost":     {},
-	"ip6-localhost": {},
-	"ip6-loopback":  {},
+	"127.0.0.1":      {},
+	"::1":            {},
+	"localhost":      {},
+	"ip6-localhost":  {},
+	"ip6-loopback":   {},
 }
 
 // envProfileVar is the env-var name used to select the active profile
@@ -78,6 +78,8 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newAuditCmd())
 	root.AddCommand(newPauseCmd())
 	root.AddCommand(newPromptsCmd())
+	root.AddCommand(newRulesCmd())
+	root.AddCommand(newTasksCmd())
 	return root
 }
 

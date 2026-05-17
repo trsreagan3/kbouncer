@@ -1,0 +1,547 @@
+// Rules + tasks persistence layer for K-Slice 3.
+//
+// Kept in a separate file from store.go so the K-Slice 1/2 file stays
+// focused on the foundation + so a parallel K-Slice 2 agent touching
+// store.go for forwarding stats doesn't merge-conflict with this work.
+//
+// The rules + tasks tables themselves were scaffolded in K-Slice 1's
+// migrate(); this file adds the Go-API around them.
+package store
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/trsreagan3/kbouncer/internal/rules"
+	"github.com/trsreagan3/kbouncer/internal/tasks"
+)
+
+// ---------------------------------------------------------------------------
+// Rules
+// ---------------------------------------------------------------------------
+
+// ErrInvalidRule is returned by AddRule when the rule's pattern fails
+// validation. Mirrors the Python InvalidRuleError so a typo'd pattern
+// surfaces at insert time, NOT at decision time (where a never-matching
+// rule would silently confuse the operator).
+var ErrInvalidRule = errors.New("kbouncer: invalid rule")
+
+// AddRule persists a rule + returns its row id. Rejects malformed
+// patterns / effects via ErrInvalidRule wrapping.
+func (s *Store) AddRule(r rules.ProxyRule) (rules.ID, error) {
+	if _, _, err := rules.ParsePattern(r.Pattern); err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrInvalidRule, err)
+	}
+	if r.Effect == "" {
+		r.Effect = rules.EffectAllow
+	}
+	if !r.Effect.IsValid() {
+		return 0, fmt.Errorf("%w: effect must be allow or deny (got %q)",
+			ErrInvalidRule, r.Effect)
+	}
+	if r.Origin == "" {
+		r.Origin = rules.OriginUser
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO rules(pattern, effect, namespace_scope, resource_scope,
+		                   verb_scope, note, origin, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.Pattern, string(r.Effect),
+		nullableString(r.NamespaceScope), nullableString(r.ResourceScope),
+		nullableString(r.VerbScope), nullableString(r.Note),
+		r.Origin,
+		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("kbouncer: add rule: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("kbouncer: add rule last insert id: %w", err)
+	}
+	return rules.ID(id), nil
+}
+
+// ListRules returns every rule in insertion order. Rules with a
+// malformed effect column (e.g. corrupted via direct DB edit) are
+// skipped with a logged warning rather than crashing the listing —
+// same fix the Python store applied in WB23 MED-23-01.
+func (s *Store) ListRules() ([]rules.StoredRule, error) {
+	rs, err := s.db.Query(
+		`SELECT id, pattern, effect,
+		        COALESCE(namespace_scope, ''), COALESCE(resource_scope, ''),
+		        COALESCE(verb_scope, ''), COALESCE(note, ''), COALESCE(origin, 'user')
+		 FROM rules ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: list rules: %w", err)
+	}
+	defer rs.Close()
+	out := make([]rules.StoredRule, 0, 16)
+	for rs.Next() {
+		var (
+			id     int64
+			effect string
+			r      rules.ProxyRule
+		)
+		if err := rs.Scan(&id, &r.Pattern, &effect, &r.NamespaceScope,
+			&r.ResourceScope, &r.VerbScope, &r.Note, &r.Origin); err != nil {
+			return nil, fmt.Errorf("kbouncer: list rules scan: %w", err)
+		}
+		eff := rules.Effect(effect)
+		if !eff.IsValid() {
+			// Skip malformed rows rather than crash the listing — same
+			// behavior as the Python store. Logged via the proxy when
+			// the engine runs against the corrupted row.
+			continue
+		}
+		r.Effect = eff
+		out = append(out, rules.StoredRule{ID: rules.ID(id), Rule: r})
+	}
+	if err := rs.Err(); err != nil {
+		return nil, fmt.Errorf("kbouncer: list rules iterate: %w", err)
+	}
+	return out, nil
+}
+
+// GetRule fetches one rule by id; returns (nil, nil) when missing.
+func (s *Store) GetRule(id rules.ID) (*rules.ProxyRule, error) {
+	var (
+		effect string
+		r      rules.ProxyRule
+	)
+	row := s.db.QueryRow(
+		`SELECT pattern, effect,
+		        COALESCE(namespace_scope, ''), COALESCE(resource_scope, ''),
+		        COALESCE(verb_scope, ''), COALESCE(note, ''), COALESCE(origin, 'user')
+		 FROM rules WHERE id = ?`, int64(id))
+	err := row.Scan(&r.Pattern, &effect, &r.NamespaceScope, &r.ResourceScope,
+		&r.VerbScope, &r.Note, &r.Origin)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: get rule: %w", err)
+	}
+	r.Effect = rules.Effect(effect)
+	return &r, nil
+}
+
+// RemoveRule deletes a rule by id. Returns true when a row was
+// removed, false when no such rule existed.
+func (s *Store) RemoveRule(id rules.ID) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM rules WHERE id = ?`, int64(id))
+	if err != nil {
+		return false, fmt.Errorf("kbouncer: remove rule: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("kbouncer: remove rule rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// LoadRuleSet snapshots the full rules table into a *rules.RuleSet for
+// the proxy's evaluator. Called once per decision in K-Slice 3 — the
+// table is small (a few hundred rules in realistic deployments) so
+// reading on every request keeps the implementation simple. If the
+// table grows we'll add an in-memory cache invalidated via a config
+// event hook.
+func (s *Store) LoadRuleSet() (*rules.RuleSet, error) {
+	stored, err := s.ListRules()
+	if err != nil {
+		return nil, err
+	}
+	flat := make([]rules.ProxyRule, 0, len(stored))
+	for _, sr := range stored {
+		flat = append(flat, sr.Rule)
+	}
+	return rules.NewRuleSet(flat), nil
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+// ErrActiveTaskExists is returned by AddTask when another task is
+// already active for the same owner. Caller decides whether to end the
+// existing task first or surface the conflict to the agent. Mirrors
+// the Python ActiveTaskExistsError.
+var ErrActiveTaskExists = errors.New("kbouncer: another task is already active")
+
+// AddTask persists a new task scope as ACTIVE. Enforces the single-
+// active-per-owner invariant: a same-owner active task causes
+// ErrActiveTaskExists. owner="" means the default-owner slot
+// (single-active for the laptop / single-session case).
+//
+// Note: the active-conflict check + INSERT happen under the same
+// connection but NOT in an explicit transaction; SQLite's per-DB write
+// serialization makes a racing AddTask either succeed-then-fail or
+// fail-then-succeed cleanly. If we ever move to a multi-process
+// daemon, wrap both in BEGIN IMMEDIATE.
+func (s *Store) AddTask(sc *tasks.Scope) error {
+	if sc == nil {
+		return errors.New("kbouncer: AddTask: nil scope")
+	}
+	if sc.TaskID == "" || sc.Description == "" {
+		return errors.New("kbouncer: AddTask: scope missing required fields")
+	}
+	// Check single-active-per-owner.
+	var existing string
+	q := `SELECT task_id FROM tasks WHERE status = 'active' AND ` +
+		`(owner = ? OR (owner IS NULL AND ? = '')) LIMIT 1`
+	err := s.db.QueryRow(q, sc.Owner, sc.Owner).Scan(&existing)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// OK; proceed.
+	case err != nil:
+		return fmt.Errorf("kbouncer: active-task check: %w", err)
+	default:
+		return fmt.Errorf("%w: %s (owner=%q)", ErrActiveTaskExists, existing, sc.Owner)
+	}
+
+	allowJSON, err := rulesToJSON(sc.AllowRules)
+	if err != nil {
+		return fmt.Errorf("kbouncer: encode allow rules: %w", err)
+	}
+	denyJSON, err := rulesToJSON(sc.DenyRules)
+	if err != nil {
+		return fmt.Errorf("kbouncer: encode deny rules: %w", err)
+	}
+
+	_, err = s.db.Exec(
+		`INSERT INTO tasks(
+			task_id, description, allow_rules_json, deny_rules_json,
+			started_at, expires_at, started_by, status,
+			ended_at, ended_by, end_reason, owner
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sc.TaskID, sc.Description, allowJSON, denyJSON,
+		sc.StartedAt, sc.ExpiresAt, sc.StartedBy, string(sc.Status),
+		nullableString(sc.EndedAt), nullableString(sc.EndedBy),
+		nullableString(sc.EndReason), nullableString(sc.Owner),
+	)
+	if err != nil {
+		return fmt.Errorf("kbouncer: insert task: %w", err)
+	}
+	return nil
+}
+
+// GetActiveTask returns the active task for the given owner ("" =
+// default-owner slot), or (nil, nil) when none is active. Auto-
+// expires tasks whose wall-clock expiry has passed (writes back
+// status='expired' + returns nil so the caller sees "no active task"
+// rather than a stale one).
+func (s *Store) GetActiveTask(owner string) (*tasks.Scope, error) {
+	var (
+		query  string
+		params []any
+	)
+	if owner == "" {
+		query = `SELECT task_id, description, allow_rules_json, deny_rules_json,
+		                started_at, expires_at, started_by, status,
+		                COALESCE(ended_at, ''), COALESCE(ended_by, ''),
+		                COALESCE(end_reason, ''), COALESCE(owner, '')
+		         FROM tasks WHERE status = 'active' AND owner IS NULL
+		         ORDER BY started_at DESC, rowid DESC LIMIT 1`
+	} else {
+		query = `SELECT task_id, description, allow_rules_json, deny_rules_json,
+		                started_at, expires_at, started_by, status,
+		                COALESCE(ended_at, ''), COALESCE(ended_by, ''),
+		                COALESCE(end_reason, ''), COALESCE(owner, '')
+		         FROM tasks WHERE status = 'active' AND owner = ?
+		         ORDER BY started_at DESC, rowid DESC LIMIT 1`
+		params = append(params, owner)
+	}
+	row := s.db.QueryRow(query, params...)
+	sc, err := scanTaskRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: get active task: %w", err)
+	}
+	if sc.IsExpired(time.Now().UTC()) {
+		// Auto-expire + log; return nil to the caller.
+		if _, eerr := s.EndTask(sc.TaskID, "auto-expire", "timeout", tasks.StatusExpired); eerr != nil {
+			// Best-effort: log but don't surface so a transient write
+			// failure doesn't break the read path.
+			return nil, nil
+		}
+		return nil, nil
+	}
+	return sc, nil
+}
+
+// GetTask returns the named task or (nil, nil) when missing.
+func (s *Store) GetTask(taskID string) (*tasks.Scope, error) {
+	row := s.db.QueryRow(
+		`SELECT task_id, description, allow_rules_json, deny_rules_json,
+		        started_at, expires_at, started_by, status,
+		        COALESCE(ended_at, ''), COALESCE(ended_by, ''),
+		        COALESCE(end_reason, ''), COALESCE(owner, '')
+		 FROM tasks WHERE task_id = ?`, taskID)
+	sc, err := scanTaskRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: get task: %w", err)
+	}
+	return sc, nil
+}
+
+// ListTasks returns tasks newest-first with optional status filter.
+// limit <= 0 defaults to 50, capped at 1000.
+func (s *Store) ListTasks(statusFilter string, limit int) ([]*tasks.Scope, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	query := `SELECT task_id, description, allow_rules_json, deny_rules_json,
+	                 started_at, expires_at, started_by, status,
+	                 COALESCE(ended_at, ''), COALESCE(ended_by, ''),
+	                 COALESCE(end_reason, ''), COALESCE(owner, '')
+	          FROM tasks`
+	var params []any
+	if statusFilter != "" {
+		query += ` WHERE status = ?`
+		params = append(params, statusFilter)
+	}
+	// Tiebreak on rowid so two tasks started in the same second (common
+	// in tests + automation that batch-creates tasks) have a
+	// deterministic newest-first order.
+	query += ` ORDER BY started_at DESC, rowid DESC LIMIT ?`
+	params = append(params, limit)
+
+	rs, err := s.db.Query(query, params...)
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: list tasks: %w", err)
+	}
+	defer rs.Close()
+	out := make([]*tasks.Scope, 0, limit)
+	for rs.Next() {
+		sc, err := scanTaskRow(rs)
+		if err != nil {
+			return nil, fmt.Errorf("kbouncer: list tasks scan: %w", err)
+		}
+		out = append(out, sc)
+	}
+	if err := rs.Err(); err != nil {
+		return nil, fmt.Errorf("kbouncer: list tasks iterate: %w", err)
+	}
+	return out, nil
+}
+
+// EndTask marks the task ended with the given status. Returns true
+// when a row was updated, false when the task didn't exist or was
+// already non-active. Auto-expire callers pass status=StatusExpired;
+// the CLI/MCP `tasks end` path passes status=StatusCompleted.
+func (s *Store) EndTask(taskID, actor, endReason string, status tasks.Status) (bool, error) {
+	if !status.IsValid() || status == tasks.StatusActive {
+		return false, fmt.Errorf("kbouncer: EndTask: invalid status %q", status)
+	}
+	endedAt := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	res, err := s.db.Exec(
+		`UPDATE tasks SET status = ?, ended_at = ?, ended_by = ?, end_reason = ?
+		 WHERE task_id = ? AND status = 'active'`,
+		string(status), endedAt, actor, endReason, taskID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("kbouncer: end task: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("kbouncer: end task rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// TaskReview is the post-task review summary mirroring the Python
+// task_review_summary. Used by `kbouncer tasks review TASK_ID`.
+type TaskReview struct {
+	TaskID          string
+	Description     string
+	Status          string
+	StartedAt       string
+	ExpiresAt       string
+	EndedAt         string
+	EndReason       string
+	Owner           string
+	DecisionCount   int
+	AllowCount      int
+	DenyCount       int
+	FirstDecisionAt string
+	LastDecisionAt  string
+	DeniedCalls     []TaskDeniedCall
+}
+
+// TaskDeniedCall is one denied call recorded during the task window.
+type TaskDeniedCall struct {
+	At       string
+	Verb     string
+	Resource string
+	Name     string
+	Reason   string
+}
+
+// TaskReviewSummary aggregates the decisions made during a task. Returns
+// (nil, nil) when the task doesn't exist.
+func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
+	sc, err := s.GetTask(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if sc == nil {
+		return nil, nil
+	}
+	rs, err := s.db.Query(
+		`SELECT at, decision_verdict, parsed_verb, parsed_resource, parsed_name, decision_reason
+		 FROM decisions WHERE task_id = ? ORDER BY id`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("kbouncer: task review decisions: %w", err)
+	}
+	defer rs.Close()
+	out := &TaskReview{
+		TaskID:      sc.TaskID,
+		Description: sc.Description,
+		Status:      string(sc.Status),
+		StartedAt:   sc.StartedAt,
+		ExpiresAt:   sc.ExpiresAt,
+		EndedAt:     sc.EndedAt,
+		EndReason:   sc.EndReason,
+		Owner:       sc.Owner,
+	}
+	denied := make([]TaskDeniedCall, 0, 8)
+	for rs.Next() {
+		var at, verdict, verb, resource, name, reason string
+		if err := rs.Scan(&at, &verdict, &verb, &resource, &name, &reason); err != nil {
+			return nil, fmt.Errorf("kbouncer: task review scan: %w", err)
+		}
+		out.DecisionCount++
+		if out.FirstDecisionAt == "" {
+			out.FirstDecisionAt = at
+		}
+		out.LastDecisionAt = at
+		switch verdict {
+		case "allow":
+			out.AllowCount++
+		case "deny":
+			out.DenyCount++
+			denied = append(denied, TaskDeniedCall{
+				At: at, Verb: verb, Resource: resource, Name: name, Reason: reason,
+			})
+		}
+	}
+	if err := rs.Err(); err != nil {
+		return nil, fmt.Errorf("kbouncer: task review iterate: %w", err)
+	}
+	// Cap at 1000 entries per the Python WB27 MED-27-01 bound.
+	if len(denied) > 1000 {
+		denied = denied[:1000]
+	}
+	out.DeniedCalls = denied
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+// scanner abstracts *sql.Row + *sql.Rows so scanTaskRow works for both.
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTaskRow(sc scanner) (*tasks.Scope, error) {
+	var (
+		taskID, description, allowJSON, denyJSON              string
+		startedAt, expiresAt, startedBy, status               string
+		endedAt, endedBy, endReason, owner                    string
+	)
+	if err := sc.Scan(&taskID, &description, &allowJSON, &denyJSON,
+		&startedAt, &expiresAt, &startedBy, &status,
+		&endedAt, &endedBy, &endReason, &owner); err != nil {
+		return nil, err
+	}
+	allow, derr := jsonToRules(allowJSON, rules.EffectAllow)
+	if derr != nil {
+		return nil, fmt.Errorf("kbouncer: decode allow rules: %w", derr)
+	}
+	deny, derr := jsonToRules(denyJSON, rules.EffectDeny)
+	if derr != nil {
+		return nil, fmt.Errorf("kbouncer: decode deny rules: %w", derr)
+	}
+	return &tasks.Scope{
+		TaskID:      taskID,
+		Description: description,
+		AllowRules:  allow,
+		DenyRules:   deny,
+		StartedAt:   startedAt,
+		ExpiresAt:   expiresAt,
+		StartedBy:   startedBy,
+		Status:      tasks.Status(status),
+		EndedAt:     endedAt,
+		EndedBy:     endedBy,
+		EndReason:   endReason,
+		Owner:       owner,
+	}, nil
+}
+
+func rulesToJSON(rs []rules.ProxyRule) (string, error) {
+	if len(rs) == 0 {
+		return "[]", nil
+	}
+	maps := make([]map[string]any, 0, len(rs))
+	for _, r := range rs {
+		maps = append(maps, r.ToMap())
+	}
+	b, err := json.Marshal(maps)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func jsonToRules(blob string, effect rules.Effect) ([]rules.ProxyRule, error) {
+	if blob == "" || blob == "[]" {
+		return nil, nil
+	}
+	var raw []map[string]any
+	if err := json.Unmarshal([]byte(blob), &raw); err != nil {
+		// Corrupt JSON → empty list; same conservative behavior as the
+		// Python store (which logs + returns empty rather than crashing).
+		return nil, nil
+	}
+	out := make([]rules.ProxyRule, 0, len(raw))
+	for _, m := range raw {
+		r := rules.ProxyRule{
+			Pattern:        stringFrom(m, "pattern"),
+			Effect:         effect,
+			NamespaceScope: stringFrom(m, "namespace_scope"),
+			ResourceScope:  stringFrom(m, "resource_scope"),
+			VerbScope:      stringFrom(m, "verb_scope"),
+			Note:           stringFrom(m, "note"),
+			Origin:         stringFromOr(m, "origin", rules.OriginTask),
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func stringFrom(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func stringFromOr(m map[string]any, key, fallback string) string {
+	if v, ok := m[key].(string); ok && v != "" {
+		return v
+	}
+	return fallback
+}

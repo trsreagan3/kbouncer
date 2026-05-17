@@ -40,7 +40,9 @@ import (
 
 	"github.com/trsreagan3/kbouncer/internal/parser"
 	"github.com/trsreagan3/kbouncer/internal/profile"
+	"github.com/trsreagan3/kbouncer/internal/rules"
 	"github.com/trsreagan3/kbouncer/internal/store"
+	"github.com/trsreagan3/kbouncer/internal/tasks"
 	"github.com/trsreagan3/kbouncer/internal/upstream"
 )
 
@@ -148,6 +150,15 @@ type Config struct {
 	// so the proxy can boot in observation-only mode when no kubeconfig
 	// is reachable.
 	Upstream *upstream.Upstream
+
+	// TaskOwner is the owner slot the evaluator consults when looking
+	// up the active task (K-Slice 3). Empty string = the default-owner
+	// slot (single-laptop / single-session deployment shape; matches
+	// the Python iam-jit-bouncer Slice B semantics). Non-empty owners
+	// (Slice C of the Python pattern) let multiple agent sessions on
+	// the same machine each have their own task scope; ships in
+	// kbouncer K-Slice 6 once the MCP path needs it.
+	TaskOwner string
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -267,14 +278,21 @@ func EvaluateRequest(r *http.Request, st *store.Store, mode Mode, defaultPolicy 
 }
 
 // EvalOptions controls the optional behaviors layered onto the basic
-// evaluator (#6a pause-aware enforcement, #5 prompt-on-deny enqueue).
-// Plain struct so the call site stays readable; a nil/zero value
-// disables the optional behaviors and reproduces the K-Slice 7
-// EvaluateRequestWithProfile semantics.
+// evaluator (#6a pause-aware enforcement, #5 prompt-on-deny enqueue,
+// K-Slice 3 task scope owner filter). Plain struct so the call site
+// stays readable; a nil/zero value disables the optional behaviors
+// and reproduces the K-Slice 7 EvaluateRequestWithProfile semantics.
 type EvalOptions struct {
 	// PromptOnDeny mirrors Config.PromptOnDeny — when true, every
 	// transparent-mode DENY writes a pending_prompts row.
 	PromptOnDeny bool
+
+	// TaskOwner names the owner slot whose active task scope (if any)
+	// is consulted by K-Slice 3's task-aware decision flow. Empty
+	// string = the default-owner slot (single-laptop / single-session
+	// deployment; matches Python iam-jit-bouncer Slice B). Mirrors
+	// Config.TaskOwner; the proxy server populates it from there.
+	TaskOwner string
 }
 
 // EvaluateRequestWithProfile is the K-Slice 7 evaluator. It runs the
@@ -420,15 +438,146 @@ func EvaluateRequestFull(
 		}
 	}
 
-	// Composition order steps 2–3 (task + global rules) land in K-Slice 3.
-	// Until then, fall through to the default policy. The reason string
-	// makes the audit log self-explanatory so reviewers don't wonder
-	// why a request was allowed/denied without a rule match.
+	// K-Slice 3: build the request view the rule + task engines consume.
+	// Same parser output, just reshaped into the rules package's
+	// ParsedRequest (kept distinct from parser.ParsedRequest so the
+	// rule engine has no parser-package dependency — symmetric to the
+	// profile.ParsedRequest separation).
+	ruleReq := &rules.ParsedRequest{
+		Verb:        parsed.Verb,
+		Resource:    parsed.Resource,
+		Namespace:   parsed.Namespace,
+		Name:        parsed.Name,
+		Group:       parsed.Group,
+		Subresource: parsed.Subresource,
+	}
+
+	// Composition order step 2: active task scope (if any). Load via
+	// the store's owner-scoped lookup; auto-expires past-due tasks
+	// before returning. Task-explicit-deny wins over everything below
+	// (and over global allow). Task-allow narrows the agent's positive
+	// declaration but does NOT lift profile-denies (those already
+	// short-circuited above).
+	var activeTask *tasks.Scope
+	if st != nil {
+		at, terr := st.GetActiveTask(opts.TaskOwner)
+		if terr != nil {
+			// Read failure: log + fall through as "no active task" so
+			// a transient SQLite hiccup doesn't crash the proxy. Same
+			// policy as the pause lookup above.
+			log.Warn().Err(terr).Msg("kbouncer: active-task lookup failed")
+		} else {
+			activeTask = at
+		}
+	}
+	if activeTask != nil {
+		if td := activeTask.DenyRuleSet().Evaluate(ruleReq); td != nil {
+			obs.DecisionVerdict = VerdictDeny
+			obs.DecisionReason = fmt.Sprintf(
+				"task-explicit-deny rule (task %s, pattern %q)",
+				activeTask.TaskID, td.Rule.Pattern)
+			obs.DecisionSource = SourceTask
+			obs.Enforced = effectiveMode == ModeTransparent
+			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+			return obs
+		}
+	}
+
+	// Composition order step 3: global rules from the rules table.
+	// Loaded fresh per decision in K-Slice 3 (small table; if it grows
+	// we'll add an in-memory cache invalidated by a config-event hook).
+	// Global explicit-deny ALWAYS wins (the admin's baseline can't be
+	// overridden by a task-allow). Global explicit-allow stands when
+	// there's no active task; with a task active, it composes with the
+	// task-allow flow per the iam-jit-bouncer Python decisions order.
+	var ruleSet *rules.RuleSet
+	if st != nil {
+		rs, rerr := st.LoadRuleSet()
+		if rerr != nil {
+			log.Warn().Err(rerr).Msg("kbouncer: load ruleset failed")
+		} else {
+			ruleSet = rs
+		}
+	}
+	var globalMatch *rules.EvalResult
+	if ruleSet != nil {
+		globalMatch = ruleSet.Evaluate(ruleReq)
+	}
+	if globalMatch != nil && globalMatch.Effect == rules.EffectDeny {
+		// Global explicit-deny — fires regardless of any task scope.
+		obs.DecisionVerdict = VerdictDeny
+		obs.DecisionReason = fmt.Sprintf(
+			"explicit-deny rule (pattern %q)", globalMatch.Rule.Pattern)
+		obs.DecisionSource = SourceGlobal
+		obs.Enforced = effectiveMode == ModeTransparent
+		decisionID := writeDecisionForTaskMaybe(st, obs, activePause, activeTask)
+		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+		return obs
+	}
+
+	// Composition order step 4: task-allow (when a task is active).
+	// A task-allow match → ALLOW (the agent's positive declaration is
+	// what the task is for; global-deny already handled above).
+	if activeTask != nil {
+		if ta := activeTask.AllowRuleSet().Evaluate(ruleReq); ta != nil && ta.Effect == rules.EffectAllow {
+			obs.DecisionVerdict = VerdictAllow
+			obs.DecisionReason = fmt.Sprintf(
+				"task-allow rule (task %s, pattern %q)",
+				activeTask.TaskID, ta.Rule.Pattern)
+			obs.DecisionSource = SourceTask
+			obs.Enforced = false
+			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+			return obs
+		}
+		// No task-allow match. Two sub-cases (mirror Python decisions.py):
+		//   (a) Global ALLOW matched → ALLOW (the global baseline still
+		//       blessed this call; the task scope didn't narrow it but
+		//       didn't reject it either).
+		//   (b) Otherwise → DENY out-of-task-scope. With a task active,
+		//       the agent's positive declaration IS the allowlist —
+		//       unmatched-by-task = "not part of the task; deny."
+		if globalMatch != nil && globalMatch.Effect == rules.EffectAllow {
+			obs.DecisionVerdict = VerdictAllow
+			obs.DecisionReason = fmt.Sprintf(
+				"explicit-allow rule (global, pattern %q; not declared in task %s)",
+				globalMatch.Rule.Pattern, activeTask.TaskID)
+			obs.DecisionSource = SourceGlobal
+			obs.Enforced = false
+			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+			return obs
+		}
+		obs.DecisionVerdict = VerdictDeny
+		obs.DecisionReason = fmt.Sprintf(
+			"out-of-task-scope (task %s active; unmatched by task allow rules)",
+			activeTask.TaskID)
+		obs.DecisionSource = SourceTask
+		obs.Enforced = effectiveMode == ModeTransparent
+		decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+		return obs
+	}
+
+	// No active task: a global explicit-allow stands if it matched.
+	if globalMatch != nil && globalMatch.Effect == rules.EffectAllow {
+		obs.DecisionVerdict = VerdictAllow
+		obs.DecisionReason = fmt.Sprintf(
+			"explicit-allow rule (pattern %q)", globalMatch.Rule.Pattern)
+		obs.DecisionSource = SourceGlobal
+		obs.Enforced = false
+		decisionID := writeDecision(st, obs, activePause)
+		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+		return obs
+	}
+
+	// Composition order step 5: default policy fallthrough.
 	verdict := VerdictAllow
-	reason := "default policy: allow (no rules loaded; K-Slice 1)"
+	reason := "default policy: allow (no rule matched)"
 	if defaultPolicy == DefaultPolicyDeny {
 		verdict = VerdictDeny
-		reason = "default policy: deny (no rules loaded; K-Slice 1)"
+		reason = "default policy: deny (no rule matched)"
 	}
 	obs.DecisionVerdict = verdict
 	obs.DecisionReason = reason
@@ -508,6 +657,13 @@ func maybeEnqueuePrompt(
 // row links back to the pause via decisions.pause_id — single-JOIN
 // post-hoc review ("what calls happened inside pause N?").
 func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.PauseRow) int64 {
+	return writeDecisionForTask(st, obs, activePause, "")
+}
+
+// writeDecisionForTask is the task-id-aware variant of writeDecision.
+// Threads the active task_id onto the audit row so post-hoc per-task
+// review (TaskReviewSummary) can join cleanly.
+func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, taskID string) int64 {
 	if st == nil {
 		return 0
 	}
@@ -530,6 +686,7 @@ func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.
 		Enforced:          obs.Enforced,
 		DecisionSource:    obs.DecisionSource,
 		ProfileName:       obs.ProfileName,
+		TaskID:            taskID,
 	}
 	if activePause != nil {
 		pid := activePause.ID
@@ -541,6 +698,16 @@ func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.
 		return 0
 	}
 	return id
+}
+
+// writeDecisionForTaskMaybe is a convenience wrapper that passes the
+// task id when an active task exists, "" otherwise. Used by the
+// global-deny branch where a task may or may not be active.
+func writeDecisionForTaskMaybe(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, activeTask *tasks.Scope) int64 {
+	if activeTask == nil {
+		return writeDecisionForTask(st, obs, activePause, "")
+	}
+	return writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
 }
 
 func normalizeMode(m Mode) Mode {
@@ -647,7 +814,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
 		s.cfg.ActiveProfile, s.cfg.Cluster,
-		EvalOptions{PromptOnDeny: s.cfg.PromptOnDeny},
+		EvalOptions{
+			PromptOnDeny: s.cfg.PromptOnDeny,
+			TaskOwner:    s.cfg.TaskOwner,
+		},
 	)
 
 	// Set the decision-source header BEFORE WriteHeader (Go HTTP
