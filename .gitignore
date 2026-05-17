@@ -1,0 +1,19 @@
+# Go build artifacts
+kbouncer
+*.test
+*.out
+*.exe
+bin/
+dist/
+
+# SQLite state files (runtime)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

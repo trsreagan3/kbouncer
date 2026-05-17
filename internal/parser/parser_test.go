@@ -1,0 +1,349 @@
+package parser
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// Table-driven coverage of every URL shape + verb-inference rule the
+// rule engine relies on. Each case is intentionally minimal so a
+// failure points directly at the offending regex / branch.
+func TestParse_TableDriven(t *testing.T) {
+	type want struct {
+		verb        string
+		group       string
+		version     string
+		resource    string
+		namespace   string
+		name        string
+		subresource string
+		isWatch     bool
+		isDryRun    bool
+	}
+	cases := []struct {
+		name   string
+		method string
+		url    string
+		want   want
+	}{
+		{
+			name:   "core GET named pod → get",
+			method: http.MethodGet,
+			url:    "/api/v1/namespaces/default/pods/my-pod",
+			want: want{
+				verb: "get", group: "", version: "v1",
+				resource: "pods", namespace: "default", name: "my-pod",
+			},
+		},
+		{
+			name:   "core GET pod list namespaced → list",
+			method: http.MethodGet,
+			url:    "/api/v1/namespaces/default/pods",
+			want: want{
+				verb: "list", version: "v1",
+				resource: "pods", namespace: "default",
+			},
+		},
+		{
+			name:   "core GET cluster-scoped resource list → list",
+			method: http.MethodGet,
+			url:    "/api/v1/nodes",
+			want: want{
+				verb: "list", version: "v1", resource: "nodes",
+			},
+		},
+		{
+			name:   "core GET cluster-scoped resource named → get",
+			method: http.MethodGet,
+			url:    "/api/v1/nodes/node-1",
+			want: want{
+				verb: "get", version: "v1", resource: "nodes", name: "node-1",
+			},
+		},
+		{
+			name:   "watch=true → verb=watch + IsWatch",
+			method: http.MethodGet,
+			url:    "/api/v1/namespaces/default/pods?watch=true",
+			want: want{
+				verb: "watch", version: "v1",
+				resource: "pods", namespace: "default", isWatch: true,
+			},
+		},
+		{
+			name:   "watch=1 also flips IsWatch",
+			method: http.MethodGet,
+			url:    "/api/v1/pods?watch=1",
+			want: want{
+				verb: "watch", version: "v1", resource: "pods", isWatch: true,
+			},
+		},
+		{
+			name:   "POST collection → create",
+			method: http.MethodPost,
+			url:    "/api/v1/namespaces/default/pods",
+			want: want{
+				verb: "create", version: "v1",
+				resource: "pods", namespace: "default",
+			},
+		},
+		{
+			name:   "PUT named → update",
+			method: http.MethodPut,
+			url:    "/api/v1/namespaces/default/pods/my-pod",
+			want: want{
+				verb: "update", version: "v1",
+				resource: "pods", namespace: "default", name: "my-pod",
+			},
+		},
+		{
+			name:   "PATCH named → patch",
+			method: http.MethodPatch,
+			url:    "/api/v1/namespaces/default/pods/my-pod",
+			want: want{
+				verb: "patch", version: "v1",
+				resource: "pods", namespace: "default", name: "my-pod",
+			},
+		},
+		{
+			name:   "DELETE named → delete",
+			method: http.MethodDelete,
+			url:    "/api/v1/namespaces/default/pods/my-pod",
+			want: want{
+				verb: "delete", version: "v1",
+				resource: "pods", namespace: "default", name: "my-pod",
+			},
+		},
+		{
+			name:   "DELETE collection → deletecollection",
+			method: http.MethodDelete,
+			url:    "/api/v1/namespaces/default/pods",
+			want: want{
+				verb: "deletecollection", version: "v1",
+				resource: "pods", namespace: "default",
+			},
+		},
+		{
+			name:   "POST exec subresource → verb=exec",
+			method: http.MethodPost,
+			url:    "/api/v1/namespaces/default/pods/my-pod/exec",
+			want: want{
+				verb: "exec", version: "v1",
+				resource: "pods", namespace: "default",
+				name: "my-pod", subresource: "exec",
+			},
+		},
+		{
+			name:   "POST portforward subresource → verb=portforward",
+			method: http.MethodPost,
+			url:    "/api/v1/namespaces/default/pods/my-pod/portforward",
+			want: want{
+				verb: "portforward", version: "v1",
+				resource: "pods", namespace: "default",
+				name: "my-pod", subresource: "portforward",
+			},
+		},
+		{
+			name:   "POST attach subresource → verb=attach",
+			method: http.MethodPost,
+			url:    "/api/v1/namespaces/default/pods/my-pod/attach",
+			want: want{
+				verb: "attach", version: "v1",
+				resource: "pods", namespace: "default",
+				name: "my-pod", subresource: "attach",
+			},
+		},
+		{
+			name:   "GET log subresource → verb=log",
+			method: http.MethodGet,
+			url:    "/api/v1/namespaces/default/pods/my-pod/log",
+			want: want{
+				verb: "log", version: "v1",
+				resource: "pods", namespace: "default",
+				name: "my-pod", subresource: "log",
+			},
+		},
+		{
+			name:   "named-group GET deployment named → get",
+			method: http.MethodGet,
+			url:    "/apis/apps/v1/namespaces/default/deployments/my-app",
+			want: want{
+				verb: "get", group: "apps", version: "v1",
+				resource: "deployments", namespace: "default", name: "my-app",
+			},
+		},
+		{
+			name:   "named-group list deployments cluster-wide → list",
+			method: http.MethodGet,
+			url:    "/apis/apps/v1/deployments",
+			want: want{
+				verb: "list", group: "apps", version: "v1",
+				resource: "deployments",
+			},
+		},
+		{
+			name:   "named-group cluster-scoped CRD-style resource",
+			method: http.MethodGet,
+			url:    "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin",
+			want: want{
+				verb: "get", group: "rbac.authorization.k8s.io", version: "v1",
+				resource: "clusterroles", name: "admin",
+			},
+		},
+		{
+			name:   "named-group named with status subresource",
+			method: http.MethodPut,
+			url:    "/apis/apps/v1/namespaces/default/deployments/my-app/status",
+			want: want{
+				verb: "status", group: "apps", version: "v1",
+				resource: "deployments", namespace: "default",
+				name: "my-app", subresource: "status",
+			},
+		},
+		{
+			name:   "named-group named with scale subresource (HPA target)",
+			method: http.MethodPatch,
+			url:    "/apis/apps/v1/namespaces/default/deployments/my-app/scale",
+			want: want{
+				verb: "scale", group: "apps", version: "v1",
+				resource: "deployments", namespace: "default",
+				name: "my-app", subresource: "scale",
+			},
+		},
+		{
+			name:   "dryRun=All honored on create",
+			method: http.MethodPost,
+			url:    "/api/v1/namespaces/default/configmaps?dryRun=All",
+			want: want{
+				verb: "create", version: "v1",
+				resource: "configmaps", namespace: "default", isDryRun: true,
+			},
+		},
+		{
+			name:   "dryRun=other ignored",
+			method: http.MethodPost,
+			url:    "/api/v1/namespaces/default/configmaps?dryRun=None",
+			want: want{
+				verb: "create", version: "v1",
+				resource: "configmaps", namespace: "default", isDryRun: false,
+			},
+		},
+		{
+			name:   "namespaces resource itself (cluster-scoped) — named get",
+			method: http.MethodGet,
+			url:    "/api/v1/namespaces/kube-system",
+			want: want{
+				verb: "get", version: "v1",
+				resource: "namespaces", name: "kube-system",
+			},
+		},
+		{
+			name:   "namespaces list (cluster-scoped) → list",
+			method: http.MethodGet,
+			url:    "/api/v1/namespaces",
+			want: want{
+				verb: "list", version: "v1", resource: "namespaces",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := MustParseTestURL(tc.method, tc.url)
+			got, err := Parse(req)
+			require.NoError(t, err, "parse should succeed for %q", tc.url)
+			require.NotNil(t, got)
+
+			assert.Equal(t, tc.want.verb, got.Verb, "verb")
+			assert.Equal(t, tc.want.group, got.Group, "group")
+			assert.Equal(t, tc.want.version, got.Version, "version")
+			assert.Equal(t, tc.want.resource, got.Resource, "resource")
+			assert.Equal(t, tc.want.namespace, got.Namespace, "namespace")
+			assert.Equal(t, tc.want.name, got.Name, "name")
+			assert.Equal(t, tc.want.subresource, got.Subresource, "subresource")
+			assert.Equal(t, tc.want.isWatch, got.IsWatch, "isWatch")
+			assert.Equal(t, tc.want.isDryRun, got.IsDryRun, "isDryRun")
+			assert.Equal(t, tc.method, got.Method, "method preserved")
+		})
+	}
+}
+
+func TestParse_MalformedURLs(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{name: "root", url: "/"},
+		{name: "empty path", url: ""},
+		{name: "unknown prefix", url: "/healthz"},
+		{name: "metrics endpoint", url: "/metrics"},
+		{name: "api with no version", url: "/api"},
+		{name: "apis with only group", url: "/apis/apps"},
+		{name: "api version only — discovery", url: "/api/v1"},
+		{name: "namespaced prefix but no resource", url: "/api/v1/namespaces/default"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// "/api/v1/namespaces/default" is intentionally treated as a
+			// named-get on the namespaces resource (matches K8s
+			// semantics — that URL gets the "default" namespace object).
+			// Drop it from the malformed set if we adjust later.
+			req := MustParseTestURL(http.MethodGet, tc.url)
+			got, err := Parse(req)
+			if tc.url == "/api/v1/namespaces/default" {
+				// This case actually parses successfully as get-namespace.
+				require.NoError(t, err)
+				assert.Equal(t, "namespaces", got.Resource)
+				assert.Equal(t, "default", got.Name)
+				return
+			}
+			require.Error(t, err, "expected error for %q", tc.url)
+			assert.Nil(t, got)
+		})
+	}
+}
+
+func TestParse_NilRequest(t *testing.T) {
+	got, err := Parse(nil)
+	require.Error(t, err)
+	assert.Nil(t, got)
+}
+
+func TestParse_BearerTokenExtraction(t *testing.T) {
+	t.Run("bearer present", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Set("Authorization", "Bearer eyJhbGciOiJSUzI1NiIs.example")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.True(t, got.BearerTokenPresent)
+	})
+	t.Run("bearer absent", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.False(t, got.BearerTokenPresent)
+	})
+	t.Run("other auth scheme not counted as bearer", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.False(t, got.BearerTokenPresent)
+	})
+	t.Run("lowercase bearer scheme accepted", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Set("Authorization", "bearer abc")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.True(t, got.BearerTokenPresent)
+	})
+}
+
+func TestParse_RawPathPreservesQuery(t *testing.T) {
+	req := MustParseTestURL(http.MethodGet, "/api/v1/pods?watch=true&timeoutSeconds=60")
+	got, err := Parse(req)
+	require.NoError(t, err)
+	assert.Equal(t, "/api/v1/pods?watch=true&timeoutSeconds=60", got.RawPath)
+}
