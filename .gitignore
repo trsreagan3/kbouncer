@@ -20,3 +20,6 @@ dist/
 .idea/
 *.swp
 .DS_Store
+
+# Integration-test artifacts (`make test-integration`)
+.kind-kubeconfig
