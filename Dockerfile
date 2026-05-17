@@ -36,12 +36,14 @@ ARG VERSION=docker
 ARG COMMIT=none
 ARG BUILD_TIME=unknown
 
-# BuildKit auto-populates TARGETOS / TARGETARCH for multi-arch builds, but
-# only inside stages that re-declare them with ARG. Without these lines the
-# substitutions below silently resolve to the defaults, so the arm64 manifest
-# would ship an amd64 binary (caught locally with `exec format error`).
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+# Predefined by BuildKit per the --platform flag; declared here without
+# defaults so BuildKit's auto-population isn't masked. With Docker 28.x +
+# BuildKit v0.24 a default value on these specific ARGs WINS over the
+# auto-populated value, silently producing wrong-arch binaries (e.g.
+# --platform linux/arm64 emitting GOARCH=amd64). See docker/docs#5077
+# and the local reproducer + CI log noted in commit fixing #246.
+ARG TARGETOS
+ARG TARGETARCH
 
 # Static binary: CGO_ENABLED=0 + -trimpath + -s -w for size + ldflags
 # to populate the version/commit/buildTime vars in internal/cli/cli.go.
