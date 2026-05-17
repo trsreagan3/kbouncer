@@ -29,6 +29,7 @@ import (
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
 	"github.com/trsreagan3/kbouncer/internal/store"
+	"github.com/trsreagan3/kbouncer/internal/tlsmat"
 	"github.com/trsreagan3/kbouncer/internal/upstream"
 )
 
@@ -80,6 +81,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPromptsCmd())
 	root.AddCommand(newRulesCmd())
 	root.AddCommand(newTasksCmd())
+	root.AddCommand(newInitTLSCmd())
 	return root
 }
 
@@ -113,6 +115,9 @@ func newRunCmd() *cobra.Command {
 		insecureSkipVerify bool
 		forceExternalBind  bool
 		forwardTimeoutSecs int
+		tlsCertPath        string
+		tlsKeyPath         string
+		requireClientCert  string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -219,24 +224,56 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				return fmt.Errorf("select profile: %w", err)
 			}
 
+			// K-Slice 4: mTLS coherency. --tls-cert + --tls-key MUST be
+			// paired (one without the other is a configuration error,
+			// not a partial fallback). --require-client-cert without
+			// TLS at all is meaningless; refuse fast so an operator
+			// doesn't get a silently-ignored flag.
+			if (tlsCertPath != "") != (tlsKeyPath != "") {
+				return fmt.Errorf(
+					"kbouncer: --tls-cert and --tls-key must both be set or both " +
+						"omitted (got cert=%q key=%q)", tlsCertPath, tlsKeyPath)
+			}
+			if requireClientCert != "" && tlsCertPath == "" {
+				return fmt.Errorf(
+					"kbouncer: --require-client-cert requires --tls-cert + --tls-key " +
+						"(mTLS without TLS is meaningless); run `kbouncer init-tls` first")
+			}
+
 			cfg := proxy.Config{
-				Host:          host,
-				Port:          port,
-				Mode:          mode,
-				DefaultPolicy: defaultPol,
-				ActiveProfile: activeProfile,
-				Cluster:       cluster,
-				PromptOnDeny:  promptOnDeny,
-				Upstream:      up,
+				Host:                    host,
+				Port:                    port,
+				Mode:                    mode,
+				DefaultPolicy:           defaultPol,
+				ActiveProfile:           activeProfile,
+				Cluster:                 cluster,
+				PromptOnDeny:            promptOnDeny,
+				Upstream:                up,
+				TLSCertPath:             tlsCertPath,
+				TLSKeyPath:              tlsKeyPath,
+				RequireClientCertCAPath: requireClientCert,
 			}.Normalize()
 
 			s := proxy.NewServer(cfg, st)
 
 			// Print a friendly startup banner to stderr so stdout stays
 			// clean for tools that might pipe kbouncer's output.
+			scheme := "http"
+			if cfg.TLSCertPath != "" {
+				scheme = "https"
+			}
 			fmt.Fprintf(os.Stderr,
-				"kbouncer proxy starting on http://%s:%d (mode=%s, default-policy=%s, profile=%s)\n",
-				cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name)
+				"kbouncer proxy starting on %s://%s:%d (mode=%s, default-policy=%s, profile=%s)\n",
+				scheme, cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name)
+			if cfg.TLSCertPath != "" {
+				fmt.Fprintf(os.Stderr, "tls cert: %s\n", cfg.TLSCertPath)
+				fmt.Fprintf(os.Stderr, "tls key:  %s\n", cfg.TLSKeyPath)
+				if cfg.RequireClientCertCAPath != "" {
+					fmt.Fprintf(os.Stderr,
+						"mTLS:     ENFORCED (client cert must be signed by %s)\n",
+						cfg.RequireClientCertCAPath)
+				}
+			}
 			fmt.Fprintf(os.Stderr, "audit db: %s\n", st.Path())
 			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
 			if up != nil {
@@ -350,6 +387,102 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"exposes inbound client bearer tokens + the forwarding "+
 			"surface to the network. Don't pass this unless you have a "+
 			"specific reason (test VM, network-segmented dev box).")
+
+	// K-Slice 4 — inbound TLS listener.
+	cmd.Flags().StringVar(&tlsCertPath, "tls-cert", "",
+		"Path to the server certificate (PEM) for the inbound HTTPS "+
+			"listener. Pair with --tls-key. When both are set, kbouncer "+
+			"listens on HTTPS instead of plain HTTP — recommended for "+
+			"kubectl + agent clients that expect HTTPS. Generate with "+
+			"`kbouncer init-tls`.")
+	cmd.Flags().StringVar(&tlsKeyPath, "tls-key", "",
+		"Path to the server private key (PEM) for the inbound HTTPS "+
+			"listener. Pair with --tls-cert.")
+	cmd.Flags().StringVar(&requireClientCert, "require-client-cert", "",
+		"Path to a CA bundle (PEM). When set, inbound TLS clients MUST "+
+			"present a client certificate signed by this bundle. "+
+			"Locks the proxy down to 'only my kubectl context can "+
+			"connect'. Requires --tls-cert + --tls-key. Operator-supplied "+
+			"CA — kbouncer does NOT issue client certs.")
+	return cmd
+}
+
+// newInitTLSCmd implements `kbouncer init-tls`. One-time setup that
+// generates a CA + server cert into ~/.kbouncer/tls/ so the operator
+// can add the CA to their kubectl context's certificate-authority
+// field and run `kbouncer run --tls-cert ... --tls-key ...` afterward.
+func newInitTLSCmd() *cobra.Command {
+	var (
+		dir            string
+		force          bool
+		additionalSANs []string
+	)
+	cmd := &cobra.Command{
+		Use:   "init-tls",
+		Short: "Generate a local CA + server cert for the inbound HTTPS listener",
+		Long: `Generate the TLS material kbouncer's inbound listener uses to
+speak HTTPS to kubectl / Helm / a coding agent.
+
+One-time setup. Writes four files into ~/.kbouncer/tls/ (or --dir):
+
+  ca.key      local CA private key (mode 0400 — operator-only read)
+  ca.crt      local CA certificate (add to kubectl context's
+              certificate-authority field)
+  server.key  server private key (mode 0400)
+  server.crt  server cert, signed by ca.crt; SAN includes
+              127.0.0.1, ::1, localhost
+
+Then run:
+
+  kbouncer run \
+    --tls-cert ~/.kbouncer/tls/server.crt \
+    --tls-key  ~/.kbouncer/tls/server.key
+
+And in your kubeconfig, point the cluster's server at
+https://127.0.0.1:8766 and set certificate-authority to
+~/.kbouncer/tls/ca.crt.
+
+Without --force, init-tls refuses to overwrite existing files
+(surprise key rotation invalidates any kubectl context that pinned
+the prior CA).`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			res, err := tlsmat.Init(tlsmat.InitOptions{
+				Dir:            dir,
+				Force:          force,
+				AdditionalSANs: additionalSANs,
+			})
+			if err != nil {
+				return err
+			}
+			w := cmd.OutOrStdout()
+			fmt.Fprintf(w, "wrote TLS material into %s:\n", res.Dir)
+			fmt.Fprintf(w, "  %s\n", res.CAKeyPath)
+			fmt.Fprintf(w, "  %s\n", res.CACertPath)
+			fmt.Fprintf(w, "  %s\n", res.ServerKeyPath)
+			fmt.Fprintf(w, "  %s\n", res.ServerCertPath)
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "Next steps:")
+			fmt.Fprintln(w, "  1. Add the CA to your kubectl context:")
+			fmt.Fprintf(w, "       certificate-authority: %s\n", res.CACertPath)
+			fmt.Fprintln(w, "     Or pass it on the kubectl command line:")
+			fmt.Fprintf(w, "       kubectl --certificate-authority %s ...\n", res.CACertPath)
+			fmt.Fprintln(w, "  2. Start the proxy with TLS:")
+			fmt.Fprintf(w, "       kbouncer run --tls-cert %s --tls-key %s\n",
+				res.ServerCertPath, res.ServerKeyPath)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dir, "dir", "",
+		"Directory to write the four PEM files into "+
+			"(default: ~/.kbouncer/tls, or KBOUNCER_TLS_DIR env).")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Overwrite existing files. Default refuses to avoid surprise "+
+			"key rotation that would invalidate kubectl contexts.")
+	cmd.Flags().StringSliceVar(&additionalSANs, "additional-san", nil,
+		"Extra DNS name or IP to add to the server cert SAN list, on "+
+			"top of the loopback defaults (127.0.0.1, ::1, localhost). "+
+			"Repeatable. Rare; only useful when the proxy is fronted "+
+			"by a hostname-based reverse proxy on the same box.")
 	return cmd
 }
 

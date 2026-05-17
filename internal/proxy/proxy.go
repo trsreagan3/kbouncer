@@ -27,11 +27,14 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -159,6 +162,30 @@ type Config struct {
 	// the same machine each have their own task scope; ships in
 	// kbouncer K-Slice 6 once the MCP path needs it.
 	TaskOwner string
+
+	// TLSCertPath / TLSKeyPath, when both non-empty, switch the inbound
+	// listener from plain HTTP to HTTPS. K-Slice 4. The cert is loaded
+	// at Serve() time; tests can call ServeListener with a pre-built
+	// tls.Listener to bypass file I/O.
+	//
+	// Plain HTTP is preserved as the default so the "I just installed;
+	// testing" loop doesn't need cert generation. Operators who want
+	// HTTPS run `kbouncer init-tls` once + pass --tls-cert / --tls-key
+	// on subsequent runs.
+	TLSCertPath string
+	TLSKeyPath  string
+
+	// RequireClientCertCAPath, when non-empty, opts the listener into
+	// mTLS: inbound connections MUST present a client certificate
+	// signed by the CA bundle at this path. Defaults to no client-cert
+	// requirement (any TCP client that completes a TLS handshake can
+	// reach the proxy). This is the "only my kubectl context can
+	// connect" tier; the operator must supply the CA bundle (kbouncer
+	// does not issue client certs — see internal/tlsmat for why).
+	//
+	// Ignored when TLSCertPath / TLSKeyPath are unset (mTLS without
+	// TLS is meaningless).
+	RequireClientCertCAPath string
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -764,14 +791,78 @@ func (s *Server) SetAddr(addr string) { s.http.Addr = addr }
 
 // Serve starts the listener and blocks until Shutdown is called or
 // the listener errors. Returns http.ErrServerClosed on clean shutdown.
+//
+// When the Config has TLSCertPath + TLSKeyPath set, the listener
+// speaks HTTPS (K-Slice 4). Otherwise plain HTTP (the default for the
+// "I just installed; testing" loop).
 func (s *Server) Serve() error {
 	log.Info().
 		Str("host", s.cfg.Host).
 		Int("port", s.cfg.Port).
 		Str("mode", string(s.cfg.Mode)).
 		Str("default_policy", string(s.cfg.DefaultPolicy)).
+		Bool("tls", s.cfg.TLSCertPath != "" && s.cfg.TLSKeyPath != "").
+		Bool("require_client_cert", s.cfg.RequireClientCertCAPath != "").
 		Msg("kbouncer proxy starting")
+	if s.cfg.TLSCertPath != "" && s.cfg.TLSKeyPath != "" {
+		tlsCfg, err := s.buildListenerTLSConfig()
+		if err != nil {
+			return err
+		}
+		s.http.TLSConfig = tlsCfg
+		// ListenAndServeTLS with empty cert/key strings honors the
+		// pre-loaded tls.Config above. Lets us share the same code path
+		// for both --tls-cert (file path) and --require-client-cert
+		// (CA bundle file path).
+		return s.http.ListenAndServeTLS("", "")
+	}
 	return s.http.ListenAndServe()
+}
+
+// buildListenerTLSConfig loads the cert + key (and the optional client-
+// auth CA bundle) into a *tls.Config suitable for the inbound listener.
+//
+// Audit-cadence notes (per [[audit-cadence-discipline]]):
+//   - MinVersion = TLS 1.2; we never negotiate TLS 1.0/1.1 inbound.
+//   - When RequireClientCertCAPath is set, ClientAuth =
+//     RequireAndVerifyClientCert (NOT VerifyClientCertIfGiven) — half-
+//     enforced mTLS is a footgun + leaves the listener accepting
+//     anonymous connections silently.
+//   - We never set InsecureSkipVerify here — the inbound listener has
+//     no upstream to verify; this flag would be a no-op + confusing in
+//     review, so leave it absent.
+func (s *Server) buildListenerTLSConfig() (*tls.Config, error) {
+	pair, err := tls.LoadX509KeyPair(s.cfg.TLSCertPath, s.cfg.TLSKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"kbouncer: load TLS cert pair (%s / %s): %w",
+			s.cfg.TLSCertPath, s.cfg.TLSKeyPath, err)
+	}
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{pair},
+	}
+	if s.cfg.RequireClientCertCAPath != "" {
+		caBytes, err := os.ReadFile(s.cfg.RequireClientCertCAPath)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"kbouncer: read client-cert CA bundle %q: %w",
+				s.cfg.RequireClientCertCAPath, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caBytes) {
+			return nil, fmt.Errorf(
+				"kbouncer: client-cert CA bundle at %q is not valid PEM",
+				s.cfg.RequireClientCertCAPath)
+		}
+		tlsCfg.ClientCAs = pool
+		// CRIT note: RequireAndVerifyClientCert FAILS the handshake when
+		// no client cert is presented. VerifyClientCertIfGiven would
+		// permit anonymous clients silently — a footgun masquerading
+		// as mTLS. We pick the strict shape on purpose.
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return tlsCfg, nil
 }
 
 // ServeListener starts serving on a pre-bound listener. Used by tests
