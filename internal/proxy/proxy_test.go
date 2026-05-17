@@ -209,16 +209,20 @@ func TestServer_EndToEnd_TransparentDenyReturns403(t *testing.T) {
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-
+	// K-Slice 2: transparent-deny responses use the K8s Status shape so
+	// kubectl + client-go parse them as a clean "Error: ... forbidden"
+	// instead of unparseable JSON.
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	var decoded struct {
-		Observation *RequestObservation `json:"proxy_observation"`
-	}
-	require.NoError(t, json.Unmarshal(body, &decoded))
-	require.NotNil(t, decoded.Observation)
-	assert.True(t, decoded.Observation.Enforced)
-	assert.Equal(t, VerdictDeny, decoded.Observation.DecisionVerdict)
+	var status map[string]any
+	require.NoError(t, json.Unmarshal(body, &status))
+	assert.Equal(t, "Status", status["kind"])
+	assert.Equal(t, "v1", status["apiVersion"])
+	assert.Equal(t, "Failure", status["status"])
+	assert.Equal(t, "Forbidden", status["reason"])
+	assert.EqualValues(t, 403, status["code"])
+	// Decision-source header still surfaces the rule layer.
+	assert.Equal(t, SourceDefault, resp.Header.Get(DecisionSourceHeader))
 }
 
 func TestServer_ShutdownIsClean(t *testing.T) {
@@ -428,16 +432,17 @@ func TestServer_EndToEnd_ProfileDenySetsHeader(t *testing.T) {
 		"decision-source header must name the profile layer")
 	assert.Equal(t, "staging-work", resp.Header.Get("x-kbouncer-profile"))
 
+	// K-Slice 2: transparent-deny body is a K8s Status. Decision-source
+	// + profile name surface in the details map and on the headers.
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	var decoded struct {
-		Observation *RequestObservation `json:"proxy_observation"`
-	}
-	require.NoError(t, json.Unmarshal(body, &decoded))
-	require.NotNil(t, decoded.Observation)
-	assert.Equal(t, SourceProfile, decoded.Observation.DecisionSource)
-	assert.Equal(t, "staging-work", decoded.Observation.ProfileName)
-	assert.True(t, decoded.Observation.Enforced)
+	var status map[string]any
+	require.NoError(t, json.Unmarshal(body, &status))
+	assert.Equal(t, "Status", status["kind"])
+	details, ok := status["details"].(map[string]any)
+	require.True(t, ok, "details map present on K8s Status body")
+	assert.Equal(t, SourceProfile, details["kbouncer_decision_source"])
+	assert.Equal(t, "staging-work", details["kbouncer_profile"])
 }
 
 func TestServer_EndToEnd_NoProfileMatchesKSlice1(t *testing.T) {

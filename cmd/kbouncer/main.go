@@ -29,7 +29,22 @@ import (
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
 	"github.com/trsreagan3/kbouncer/internal/store"
+	"github.com/trsreagan3/kbouncer/internal/upstream"
 )
+
+// loopbackHosts mirrors iam-jit-bouncer's CRIT-32-02 closure: kbouncer
+// holds inbound client bearer tokens long enough to forward; binding
+// externally exposes that surface to anyone on the network. Refuse
+// non-loopback bindings unless the operator passed
+// --i-know-this-binds-externally to acknowledge they read the threat
+// model.
+var loopbackHosts = map[string]struct{}{
+	"127.0.0.1":     {},
+	"::1":           {},
+	"localhost":     {},
+	"ip6-localhost": {},
+	"ip6-loopback":  {},
+}
 
 // envProfileVar is the env-var name used to select the active profile
 // when --profile is not passed. Documented in the README + on the run
@@ -82,15 +97,20 @@ HTTP server, CLI. Upstream forwarding lands in K-Slice 2.`
 
 func newRunCmd() *cobra.Command {
 	var (
-		port          int
-		host          string
-		modeStr       string
-		defaultPolStr string
-		dbPath        string
-		profileName   string
-		profilesPath  string
-		cluster       string
-		promptOnDeny  bool
+		port               int
+		host               string
+		modeStr            string
+		defaultPolStr      string
+		dbPath             string
+		profileName        string
+		profilesPath       string
+		cluster            string
+		promptOnDeny       bool
+		upstreamURL        string
+		kubeconfigPath     string
+		insecureSkipVerify bool
+		forceExternalBind  bool
+		forwardTimeoutSecs int
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -117,11 +137,47 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				return err
 			}
 
+			// CRIT-32-02 (mirrored from iam-jit-bouncer): refuse to bind
+			// externally without explicit operator acknowledgement.
+			// kbouncer holds inbound client bearer tokens long enough to
+			// forward them; an externally-bound listener exposes that
+			// surface to anyone on the network.
+			if _, ok := loopbackHosts[host]; !ok && !forceExternalBind {
+				fmt.Fprintf(os.Stderr,
+					"refusing to bind to %q: this exposes kbouncer's "+
+						"credential-handling surface to the network.\n\n"+
+						"If you genuinely need to bind externally (test VM with "+
+						"no real cluster credentials, network-segmented dev box), "+
+						"re-run with --i-know-this-binds-externally AND read the "+
+						"SECURITY threat model first.\n", host)
+				os.Exit(2)
+			}
+
 			st, err := store.Open(dbPath)
 			if err != nil {
 				return fmt.Errorf("open store: %w", err)
 			}
 			defer st.Close()
+
+			// K-Slice 2: resolve the upstream kube-apiserver target.
+			// Best-effort — failure to resolve is logged + the proxy
+			// starts in K-Slice 1 observation-only mode (the JSON-body
+			// fallback). Preserves the "useful as a pure observability
+			// tool" boot path for operators with no kubeconfig + lets
+			// the proxy come up even when the apiserver is briefly
+			// unreachable. Operators who want a hard fail can grep the
+			// startup line for "observation-only".
+			upOpts := upstream.Options{
+				UpstreamURL:           upstreamURL,
+				KubeconfigPath:        kubeconfigPath,
+				InsecureSkipTLSVerify: insecureSkipVerify,
+				ForwardTimeout:        time.Duration(forwardTimeoutSecs) * time.Second,
+			}
+			up, upErr := upstream.Resolve(upOpts)
+			if upErr != nil {
+				log.Warn().Err(upErr).
+					Msg("kbouncer: no upstream resolved; running in K-Slice 1 observation-only mode (no forwarding)")
+			}
 
 			// Profile resolution. Precedence: --profile flag > KBOUNCER_PROFILE
 			// env var. The env-var fallback intentionally only fires when
@@ -169,6 +225,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				ActiveProfile: activeProfile,
 				Cluster:       cluster,
 				PromptOnDeny:  promptOnDeny,
+				Upstream:      up,
 			}.Normalize()
 
 			s := proxy.NewServer(cfg, st)
@@ -180,6 +237,18 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name)
 			fmt.Fprintf(os.Stderr, "audit db: %s\n", st.Path())
 			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
+			if up != nil {
+				insecureNote := ""
+				if up.InsecureSkipTLSVerify {
+					insecureNote = " (TLS VERIFY DISABLED)"
+				}
+				fmt.Fprintf(os.Stderr,
+					"upstream: %s (source=%s)%s\n",
+					up.URL.String(), up.Source, insecureNote)
+			} else {
+				fmt.Fprintln(os.Stderr,
+					"upstream: <none> — running in K-Slice 1 observation-only mode")
+			}
 			fmt.Fprintln(os.Stderr, "Ctrl+C to stop.")
 
 			// Run Serve in a goroutine so we can intercept signals and
@@ -252,6 +321,33 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"`kbouncer prompts answer`. The agent is still denied "+
 			"immediately; the answer takes effect on the NEXT call of "+
 			"the same shape. Defaults off — opt-in to avoid noisy queues.")
+
+	// K-Slice 2 forwarding flags.
+	cmd.Flags().StringVar(&upstreamURL, "upstream", "",
+		"Kube-apiserver URL to forward ALLOW verdicts to. When unset, "+
+			"the apiserver is resolved from the kubeconfig (see --kubeconfig). "+
+			"This URL is the OUTBOUND ALLOWLIST: kbouncer refuses to forward "+
+			"anywhere else even if a client's Host header points elsewhere.")
+	cmd.Flags().StringVar(&kubeconfigPath, "kubeconfig", "",
+		"Path to a kubeconfig file. Defaults to KUBECONFIG env var, then "+
+			"~/.kube/config. The current-context's cluster.server is the "+
+			"apiserver URL; cluster.certificate-authority-data is the CA "+
+			"bundle used to verify the apiserver's TLS cert.")
+	cmd.Flags().BoolVar(&insecureSkipVerify, "insecure-skip-tls-verify", false,
+		"Skip TLS verification on the OUTBOUND connection to the "+
+			"kube-apiserver. Mirrors the kubeconfig flag of the same "+
+			"name. NEVER inferred — always explicit. Use ONLY for local "+
+			"clusters with self-signed certs that aren't in the kubeconfig.")
+	cmd.Flags().IntVar(&forwardTimeoutSecs, "forward-timeout", 30,
+		"Per-request timeout (seconds) on outbound forwards to the "+
+			"apiserver. Watch / long-poll requests bypass this in K-Slice 5; "+
+			"short-lived REST calls use it.")
+	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false,
+		"Required acknowledgement when --host is anything other than "+
+			"127.0.0.1 / ::1 / localhost. Binding the proxy externally "+
+			"exposes inbound client bearer tokens + the forwarding "+
+			"surface to the network. Don't pass this unless you have a "+
+			"specific reason (test VM, network-segmented dev box).")
 	return cmd
 }
 

@@ -41,6 +41,7 @@ import (
 	"github.com/trsreagan3/kbouncer/internal/parser"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/store"
+	"github.com/trsreagan3/kbouncer/internal/upstream"
 )
 
 // Mode is the proxy's operating mode. First-class user choice — not a
@@ -139,6 +140,14 @@ type Config struct {
 	// active (pauses already bypass enforcement). Defaults false so
 	// nothing is enqueued by default.
 	PromptOnDeny bool
+
+	// Upstream is the resolved kube-apiserver target the proxy forwards
+	// ALLOW verdicts to (K-Slice 2). Nil disables forwarding and the
+	// proxy keeps the K-Slice 1 observation-only JSON-body behavior —
+	// preserved so the K-Slice 1 + 7 tests keep working unchanged and
+	// so the proxy can boot in observation-only mode when no kubeconfig
+	// is reachable.
+	Upstream *upstream.Upstream
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -609,11 +618,31 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.http.Shutdown(ctx)
 }
 
-// handle is the catch-all HTTP handler. K-Slice 1 returned the parsed
-// observation as JSON; K-Slice 7 adds the x-kbouncer-decision-source
-// response header so curl-driven smoke tests can confirm which layer
-// produced the verdict without parsing the JSON body. K-Slice 2 will
-// replace this with real forwarding to the kube-apiserver on allow.
+// handle is the catch-all HTTP handler.
+//
+// K-Slice 2 behavior (this build):
+//
+//   - Evaluate the request (parser + profile + rule engine + default
+//     policy). Same evaluator the K-Slice 1 + 7 tests exercise.
+//   - On a transparent-mode DENY: return 403 with a K8s-shaped error
+//     body (apiVersion: v1, kind: Status, status: Failure, code: 403)
+//     so kubectl says "Error: ... forbidden" rather than "unparseable
+//     JSON". Decision-source header still set.
+//   - On an ALLOW (cooperative OR transparent) with an Upstream
+//     configured: rewrite onto the upstream URL, strip hop-by-hop
+//     headers, forward via the pooled http.Client, stream the response
+//     back.
+//   - On an ALLOW with NO upstream configured: fall back to K-Slice 1's
+//     observation JSON body so the existing observation-only test
+//     suite + the bare `kbouncer run` (no kubeconfig + no --upstream)
+//     paths keep working.
+//   - On an ALLOW where the inbound Host header points off-allowlist:
+//     refuse with 403 + x-kbouncer-refusal=forward-host-mismatch.
+//     Mirrors iam-jit-bouncer's CRIT-32-01 closure.
+//   - On a forwarding failure (timeout, DNS, TLS, connection refused):
+//     return 502 with a kbouncer-shaped JSON error so a debugging
+//     operator can tell "the proxy reached but couldn't talk to the
+//     apiserver" from "the proxy refused."
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
@@ -621,19 +650,67 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		EvalOptions{PromptOnDeny: s.cfg.PromptOnDeny},
 	)
 
-	// Set the decision-source header BEFORE WriteHeader. Empty values
-	// are still set so the header is always present — easier to assert
-	// on in tests and easier to grep audit pcaps for.
+	// Set the decision-source header BEFORE WriteHeader (Go HTTP
+	// requires headers go in before the first WriteHeader / Write).
 	w.Header().Set(DecisionSourceHeader, obs.DecisionSource)
 	if obs.ProfileName != "" {
 		w.Header().Set("x-kbouncer-profile", obs.ProfileName)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	status := http.StatusOK
+
+	// Transparent + DENY → 403 with K8s-shaped error, no forward.
 	if obs.Enforced {
-		status = http.StatusForbidden
+		writeK8sForbidden(w, obs)
+		return
 	}
-	w.WriteHeader(status)
+
+	// ALLOW (either mode) OR cooperative-mode DENY.
+	// If no upstream configured, preserve K-Slice 1 observation JSON
+	// behavior so existing tests + observation-only deploys keep
+	// working unchanged.
+	if s.cfg.Upstream == nil {
+		writeObservationBody(w, obs)
+		return
+	}
+
+	// Outbound host allowlist (mirror of iam-jit-bouncer CRIT-32-01).
+	// The inbound Host header is attacker-controllable; reject anything
+	// that doesn't match the upstream URL the operator pinned.
+	inboundHost := r.Host
+	if !hostAllowed(inboundHost, s.cfg.Upstream) {
+		log.Warn().
+			Str("inbound_host", inboundHost).
+			Str("upstream_host", s.cfg.Upstream.Host()).
+			Msg("kbouncer: refused forward — inbound Host does not match upstream")
+		writeHostMismatch(w, obs, inboundHost, s.cfg.Upstream.Host())
+		return
+	}
+
+	upReq, err := buildUpstreamRequest(r, s.cfg.Upstream)
+	if err != nil {
+		log.Warn().Err(err).Msg("kbouncer: build upstream request failed")
+		writeBadGateway(w, obs, err)
+		return
+	}
+
+	resp, err := s.cfg.Upstream.Client.Do(upReq)
+	if err != nil {
+		log.Warn().Err(err).
+			Str("upstream", upstreamURLForLog(s.cfg.Upstream.URL)).
+			Msg("kbouncer: forward to apiserver failed")
+		writeBadGateway(w, obs, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	writeUpstreamResponse(w, resp, obs)
+}
+
+// writeObservationBody is the K-Slice 1 observation JSON fallback.
+// Used when no upstream is configured so observation-only deploys +
+// the K-Slice 1 + 7 test suite keep working unchanged.
+func writeObservationBody(w http.ResponseWriter, obs *RequestObservation) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	body := struct {
 		Observation *RequestObservation `json:"proxy_observation"`
 		SliceNote   string              `json:"_slice1_note"`
@@ -644,9 +721,91 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			"this JSON body and fail to parse it as a kube-apiserver response.",
 	}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
-		// Encoding into an in-memory buffer should never fail; log and
-		// move on so a test failure surfaces.
-		log.Warn().Err(err).Msg("kbouncer: encode response failed")
+		log.Warn().Err(err).Msg("kbouncer: encode observation response failed")
+	}
+}
+
+// writeK8sForbidden returns 403 with a K8s-shaped Status error body
+// (apiVersion: v1, kind: Status). kubectl + client-go parse this
+// shape natively and print a clean "Error: ... forbidden" instead of
+// surfacing kbouncer's JSON as an unparseable response.
+//
+// Schema reference: kubernetes/apimachinery/pkg/apis/meta/v1/types.go
+// (Status).
+func writeK8sForbidden(w http.ResponseWriter, obs *RequestObservation) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(VerdictHeader, obs.DecisionVerdict)
+	w.Header().Set("x-kbouncer-mode", obs.ModeAtDecision)
+	w.WriteHeader(http.StatusForbidden)
+	body := map[string]any{
+		"kind":       "Status",
+		"apiVersion": "v1",
+		"metadata":   map[string]any{},
+		"status":     "Failure",
+		"message": "kbouncer denied: " + obs.DecisionReason +
+			" (decision_source=" + obs.DecisionSource + ")",
+		"reason": "Forbidden",
+		"details": map[string]any{
+			"kbouncer_decision_source": obs.DecisionSource,
+			"kbouncer_profile":         obs.ProfileName,
+			"kbouncer_verb":            obs.ParsedVerb,
+			"kbouncer_resource":        obs.ParsedResource,
+			"kbouncer_namespace":       obs.ParsedNamespace,
+		},
+		"code": 403,
+	}
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Warn().Err(err).Msg("kbouncer: encode forbidden response failed")
+	}
+}
+
+// writeHostMismatch refuses with 403 + x-kbouncer-refusal=
+// forward-host-mismatch. The body is kbouncer-shaped (NOT a K8s
+// Status) because the request never reached the gating engine in a
+// way the apiserver shape can sensibly describe — this is the proxy
+// refusing to act as an exfil channel.
+func writeHostMismatch(w http.ResponseWriter, obs *RequestObservation, inboundHost, upstreamHost string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(VerdictHeader, "deny")
+	w.Header().Set(RefusalHeader, "forward-host-mismatch")
+	w.WriteHeader(http.StatusForbidden)
+	body := map[string]any{
+		"error": "kbouncer refused to forward — inbound Host does not match upstream",
+		"refusal_reason": "The inbound Host header points to a target outside " +
+			"the configured upstream apiserver. kbouncer refuses to act as a " +
+			"redirector for attacker-controlled Host headers.",
+		"inbound_host":  inboundHost,
+		"upstream_host": upstreamHost,
+		"verb":          obs.ParsedVerb,
+		"resource":      obs.ParsedResource,
+	}
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Warn().Err(err).Msg("kbouncer: encode host-mismatch response failed")
+	}
+}
+
+// writeBadGateway returns 502 with a kbouncer-shaped JSON error. Used
+// when the proxy reached the gating engine + decided to forward but
+// the apiserver was unreachable / errored at the transport layer.
+//
+// Distinct from a K8s Status body so a debugging operator can tell
+// "the apiserver rejected" (would have been a proxied response with
+// real apiserver content) from "the proxy couldn't talk to the
+// apiserver" (this branch).
+func writeBadGateway(w http.ResponseWriter, obs *RequestObservation, cause error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(VerdictHeader, obs.DecisionVerdict)
+	w.Header().Set("x-kbouncer-forward-error", "true")
+	w.WriteHeader(http.StatusBadGateway)
+	body := map[string]any{
+		"error":          "kbouncer forward to kube-apiserver failed",
+		"upstream_error": cause.Error(),
+		"verb":           obs.ParsedVerb,
+		"resource":       obs.ParsedResource,
+		"namespace":      obs.ParsedNamespace,
+	}
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Warn().Err(err).Msg("kbouncer: encode bad-gateway response failed")
 	}
 }
 
