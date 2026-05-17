@@ -37,6 +37,41 @@ export KBOUNCER_PROFILE=safe-default
 Default port: `8766` (distinct from `bounce`'s `8767` so the two
 products can coexist on the same laptop). Default audit DB: `~/.kbouncer/state.db`.
 
+### Docker
+
+Prebuilt multi-arch images (`linux/amd64` + `linux/arm64`) are published
+to GHCR on every push to `main` and on every `v*` tag:
+
+```sh
+# Cooperative-mode passthrough, kubeconfig + audit DB mounted from host.
+docker run --rm \
+  -p 8766:8766 \
+  -v ~/.kube:/home/nonroot/.kube:ro \
+  -v ~/.kbouncer:/home/nonroot/.kbouncer \
+  ghcr.io/trsreagan3/kbounce:latest \
+  run --host 0.0.0.0 --port 8766 \
+      --kubeconfig /home/nonroot/.kube/config \
+      --upstream https://kubernetes.default.svc
+
+# Print version (Distroless: no shell, ENTRYPOINT runs the binary directly)
+docker run --rm ghcr.io/trsreagan3/kbounce:latest --version
+```
+
+Notes:
+
+- The image is a **packaging convenience** — same binary as
+  `go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest`, no
+  extra features, no telemetry, opt-in `version-check` honored.
+- Built on `gcr.io/distroless/static-debian12:nonroot` — non-root by
+  default, no shell, no package manager.
+- `--host 0.0.0.0` requires the operator to also pass
+  `--i-know-this-binds-externally` (see threat-model note on the `run`
+  subcommand); the default loopback bind only works when the client is
+  inside the same container/pod.
+- A Helm chart for in-cluster deployment is planned at
+  `trsreagan3/helm-charts` (not yet published; the repo reference is
+  forward-looking).
+
 ---
 
 ## Operating modes
