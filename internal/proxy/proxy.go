@@ -254,6 +254,14 @@ type RequestObservation struct {
 	// no profile is active. Carried into the audit row so the operator
 	// can correlate "we changed profiles at 14:02" with a wave of denies.
 	ProfileName string `json:"profile_name,omitempty"`
+
+	// StreamKind, set in K-Slice 5, names the streaming code path the
+	// proxy chose for this request: "watch" (chunked-body forwarder),
+	// "spdy" (hijack + bidirectional pipe for exec/port-forward/attach/
+	// websocket), or "" (the K-Slice 2 buffered REST path). Carried
+	// into the audit row so post-hoc review can filter to "show me
+	// only the exec sessions" without re-parsing URL shapes.
+	StreamKind string `json:"stream_kind,omitempty"`
 }
 
 // Verdict values used in observations + the audit log.
@@ -320,6 +328,12 @@ type EvalOptions struct {
 	// deployment; matches Python iam-jit-bouncer Slice B). Mirrors
 	// Config.TaskOwner; the proxy server populates it from there.
 	TaskOwner string
+
+	// StreamKind, set by the proxy in K-Slice 5, tags the decision row
+	// so reviewers can answer "did this open a long-lived stream?"
+	// without re-parsing the request URL. One of: "watch", "spdy", ""
+	// (not a stream). Pure-evaluator callers (tests) leave it empty.
+	StreamKind string
 }
 
 // EvaluateRequestWithProfile is the K-Slice 7 evaluator. It runs the
@@ -418,6 +432,7 @@ func EvaluateRequestFull(
 			ModeAtDecision:  string(effectiveMode),
 			Enforced:        effectiveMode == ModeTransparent,
 			DecisionSource:  SourceUnclassifiable,
+			StreamKind:      opts.StreamKind,
 		}
 		decisionID := writeDecision(st, obs, activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
@@ -438,6 +453,7 @@ func EvaluateRequestFull(
 		IsWatch:           parsed.IsWatch,
 		IsDryRun:          parsed.IsDryRun,
 		ModeAtDecision:    string(effectiveMode),
+		StreamKind:        opts.StreamKind,
 	}
 	if activeProfile != nil {
 		obs.ProfileName = activeProfile.Name
@@ -714,6 +730,8 @@ func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause 
 		DecisionSource:    obs.DecisionSource,
 		ProfileName:       obs.ProfileName,
 		TaskID:            taskID,
+		IsStream:          obs.StreamKind != "",
+		StreamKind:        obs.StreamKind,
 	}
 	if activePause != nil {
 		pid := activePause.ID
@@ -902,12 +920,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 //     operator can tell "the proxy reached but couldn't talk to the
 //     apiserver" from "the proxy refused."
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
+	// K-Slice 5: classify streaming BEFORE evaluating so the audit row
+	// can be tagged is_stream + stream_kind. The classification is a
+	// pure read of the inbound headers + query — no I/O.
+	streamKind := classifyStream(r)
+
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
 		s.cfg.ActiveProfile, s.cfg.Cluster,
 		EvalOptions{
 			PromptOnDeny: s.cfg.PromptOnDeny,
 			TaskOwner:    s.cfg.TaskOwner,
+			StreamKind:   string(streamKind),
 		},
 	)
 
@@ -919,6 +943,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Transparent + DENY → 403 with K8s-shaped error, no forward.
+	// This branch fires BEFORE the streaming/hijack code so a denied
+	// exec or watch never opens a long-lived connection. The audit
+	// row is already written by EvaluateRequestFull (tagged with the
+	// stream kind so reviewers see which exec the agent tried).
 	if obs.Enforced {
 		writeK8sForbidden(w, obs)
 		return
@@ -946,6 +974,17 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// K-Slice 5: streaming paths.
+	switch streamKind {
+	case StreamKindWatch:
+		forwardWatchStreaming(w, r, s.cfg.Upstream, obs)
+		return
+	case StreamKindSPDY:
+		forwardUpgrade(w, r, s.cfg.Upstream, obs)
+		return
+	}
+
+	// K-Slice 2 buffered path (the default for REST calls).
 	upReq, err := buildUpstreamRequest(r, s.cfg.Upstream)
 	if err != nil {
 		log.Warn().Err(err).Msg("kbouncer: build upstream request failed")

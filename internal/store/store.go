@@ -47,7 +47,8 @@ import (
 //	2 — add decisions.decision_source + decisions.profile_name (K-Slice 7)
 //	3 — add pause_events + decisions.pause_id (#6a timed escape hatch)
 //	4 — add pending_prompts (#5 async deny-prompt UX, v1.0 subset)
-const SchemaVersion = 4
+//	5 — add decisions.is_stream + decisions.stream_kind (K-Slice 5)
+const SchemaVersion = 5
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
@@ -264,6 +265,21 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("kbouncer: create idx_decisions_pause_id: %w", err)
 	}
 
+	// v5 additive migration (K-Slice 5): mark streaming decisions so
+	// audit-log readers can answer "did this open a long-lived stream?"
+	// without re-parsing the request URL. ONE row per stream (not one
+	// per chunk) — the decision happens at stream start; bytes flowing
+	// during the stream are not recorded as separate decisions.
+	//
+	// is_stream defaults 0 to keep existing rows backward-compatible.
+	// stream_kind is one of: "watch", "spdy", "" (not streaming).
+	if err := s.addColumnIfMissing("decisions", "is_stream", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("decisions", "stream_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it
 	// idempotent on re-open.
 	var ver int
@@ -318,6 +334,15 @@ type DecisionRow struct {
 	// was active at decision time so reviewers can ask "what calls
 	// happened inside pause N?" with a single JOIN. NULL otherwise.
 	PauseID *int64
+	// IsStream added in K-Slice 5. True when the decision opened a
+	// long-lived stream (watch, exec, port-forward, attach, follow-log).
+	// One audit row per STREAM, not per chunk — the byte flow during
+	// the stream is not separately audited.
+	IsStream bool
+	// StreamKind added in K-Slice 5. One of: "watch", "spdy", "" (not
+	// streaming). Lets a reviewer filter the audit log to just the
+	// streaming events without re-parsing URL shapes.
+	StreamKind string
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -337,8 +362,9 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			is_watch, is_dry_run,
 			decision_verdict, decision_reason, mode_at_decision, enforced,
 			matched_rule_id, task_id,
-			decision_source, profile_name, pause_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			decision_source, profile_name, pause_id,
+			is_stream, stream_kind
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Method, d.Path,
 		d.ParsedVerb, d.ParsedGroup, d.ParsedVersion, d.ParsedResource,
 		d.ParsedNamespace, d.ParsedName, d.ParsedSubresource,
@@ -346,6 +372,7 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 		d.DecisionVerdict, d.DecisionReason, d.ModeAtDecision, boolToInt(d.Enforced),
 		nullableInt(d.MatchedRuleID), nullableString(d.TaskID),
 		d.DecisionSource, nullableString(d.ProfileName), nullableInt(d.PauseID),
+		boolToInt(d.IsStream), d.StreamKind,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("kbouncer: record decision: %w", err)
@@ -386,7 +413,8 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		decision_verdict, decision_reason, mode_at_decision, enforced,
 		matched_rule_id, task_id,
 		COALESCE(decision_source, ''), COALESCE(profile_name, ''),
-		pause_id
+		pause_id,
+		COALESCE(is_stream, 0), COALESCE(stream_kind, '')
 		FROM decisions
 		ORDER BY id DESC
 		LIMIT ?`, limit)
@@ -405,6 +433,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			ruleID   sql.NullInt64
 			taskID   sql.NullString
 			pauseID  sql.NullInt64
+			isStream int
 		)
 		if err := rows.Scan(
 			&atStr, &d.Method, &d.Path,
@@ -414,6 +443,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&d.DecisionVerdict, &d.DecisionReason, &d.ModeAtDecision, &enforced,
 			&ruleID, &taskID,
 			&d.DecisionSource, &d.ProfileName, &pauseID,
+			&isStream, &d.StreamKind,
 		); err != nil {
 			return nil, fmt.Errorf("kbouncer: recent decisions scan: %w", err)
 		}
@@ -434,6 +464,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			pid := pauseID.Int64
 			d.PauseID = &pid
 		}
+		d.IsStream = isStream != 0
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {
