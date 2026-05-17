@@ -40,7 +40,12 @@ import (
 // SchemaVersion is bumped whenever the on-disk schema changes. Migrations
 // are additive only (CREATE TABLE IF NOT EXISTS + ALTER TABLE ADD COLUMN);
 // no destructive changes once we ship v1.
-const SchemaVersion = 1
+//
+// Version log:
+//
+//	1 — initial: decisions + rules + tasks tables (K-Slice 1)
+//	2 — add decisions.decision_source + decisions.profile_name (K-Slice 7)
+const SchemaVersion = 2
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
@@ -185,6 +190,17 @@ func (s *Store) migrate() error {
 		}
 	}
 
+	// K-Slice 7 additive columns. ALTER TABLE ADD COLUMN is idempotent-
+	// equivalent only if we detect the column first; SQLite errors on
+	// duplicate ADD COLUMN. addColumnIfMissing checks PRAGMA table_info
+	// so re-opening an existing v2 DB doesn't panic.
+	if err := s.addColumnIfMissing("decisions", "decision_source", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("decisions", "profile_name", "TEXT"); err != nil {
+		return err
+	}
+
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it
 	// idempotent on re-open.
 	var ver int
@@ -228,6 +244,13 @@ type DecisionRow struct {
 	Enforced          bool
 	MatchedRuleID     *int64
 	TaskID            string
+	// DecisionSource added in K-Slice 7. Names the rule layer that
+	// produced the verdict ("profile", "task", "global", "default",
+	// "unclassifiable"). Empty string means a pre-K-Slice-7 row.
+	DecisionSource string
+	// ProfileName added in K-Slice 7. The active profile at decision
+	// time, or "" when no profile was active.
+	ProfileName string
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -246,14 +269,16 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			parsed_namespace, parsed_name, parsed_subresource,
 			is_watch, is_dry_run,
 			decision_verdict, decision_reason, mode_at_decision, enforced,
-			matched_rule_id, task_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			matched_rule_id, task_id,
+			decision_source, profile_name
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Method, d.Path,
 		d.ParsedVerb, d.ParsedGroup, d.ParsedVersion, d.ParsedResource,
 		d.ParsedNamespace, d.ParsedName, d.ParsedSubresource,
 		boolToInt(d.IsWatch), boolToInt(d.IsDryRun),
 		d.DecisionVerdict, d.DecisionReason, d.ModeAtDecision, boolToInt(d.Enforced),
 		nullableInt(d.MatchedRuleID), nullableString(d.TaskID),
+		d.DecisionSource, nullableString(d.ProfileName),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("kbouncer: record decision: %w", err)
@@ -273,6 +298,41 @@ func (s *Store) CountDecisions() (int64, error) {
 		return 0, fmt.Errorf("kbouncer: count decisions: %w", err)
 	}
 	return n, nil
+}
+
+// addColumnIfMissing is an idempotent ALTER TABLE ADD COLUMN. SQLite
+// errors on a duplicate ADD; we check PRAGMA table_info first so a
+// reopen of an already-migrated DB is a no-op.
+func (s *Store) addColumnIfMissing(table, column, decl string) error {
+	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return fmt.Errorf("kbouncer: pragma table_info(%s): %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("kbouncer: scan table_info: %w", err)
+		}
+		if name == column {
+			return nil // already present
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("kbouncer: rows.Err: %w", err)
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)
+	if _, err := s.db.Exec(stmt); err != nil {
+		return fmt.Errorf("kbouncer: add column %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 func boolToInt(b bool) int {

@@ -39,6 +39,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/trsreagan3/kbouncer/internal/parser"
+	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/store"
 )
 
@@ -111,6 +112,22 @@ type Config struct {
 	// DefaultPolicy decides what transparent mode does when no rule
 	// matches. Defaults to DefaultPolicyDeny (the secure default).
 	DefaultPolicy DefaultPolicy
+
+	// ActiveProfile is the environment profile evaluated BEFORE the
+	// per-task scope and global rule engine. A profile deny is a hard
+	// floor — a permissive task scope CANNOT override it. nil disables
+	// profile evaluation entirely (equivalent to the "none" profile).
+	//
+	// The CLI populates this from the --profile flag or KBOUNCER_PROFILE
+	// env var (K-Slice 7). Auto-detection from kubectl context lands in
+	// K-Slice 8.
+	ActiveProfile *profile.Profile
+
+	// Cluster is the current kubeconfig cluster name (when known),
+	// surfaced into the profile's ParsedRequest for only_clusters
+	// matching and the "cluster" keyword target. Empty when the proxy
+	// can't determine the cluster.
+	Cluster string
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -168,6 +185,17 @@ type RequestObservation struct {
 	// Enforced is true only when mode=transparent AND verdict=deny.
 	// In cooperative mode every verdict has Enforced=false (advisory).
 	Enforced bool `json:"enforced"`
+	// DecisionSource names the rule layer that produced the verdict.
+	// Known values: "profile" (K-Slice 7), "task" (K-Slice 3),
+	// "global" (K-Slice 3), "default" (no rule matched; fell through to
+	// the default policy), "unclassifiable" (parser rejected the URL).
+	// Surfaced into the audit log so reviewers can answer "which layer
+	// blocked this?" without re-running the request.
+	DecisionSource string `json:"decision_source"`
+	// ProfileName names the active profile at decision time, or "" when
+	// no profile is active. Carried into the audit row so the operator
+	// can correlate "we changed profiles at 14:02" with a wave of denies.
+	ProfileName string `json:"profile_name,omitempty"`
 }
 
 // Verdict values used in observations + the audit log.
@@ -176,23 +204,72 @@ const (
 	VerdictDeny  = "deny"
 )
 
+// DecisionSource constants name the rule layer that produced a verdict.
+// Mirrors the columns the audit-review tooling joins on across kbouncer
+// and iam-jit-bouncer — keep these strings stable.
+const (
+	// SourceProfile means an environment profile (K-Slice 7) fired the
+	// verdict. Profile denies are a hard floor: a permissive task scope
+	// cannot override them.
+	SourceProfile = "profile"
+	// SourceTask means the active per-task scope (K-Slice 3) fired.
+	SourceTask = "task"
+	// SourceGlobal means a global rule (K-Slice 3) fired.
+	SourceGlobal = "global"
+	// SourceDefault means no rule matched and the default policy applied.
+	SourceDefault = "default"
+	// SourceUnclassifiable means the parser could not classify the URL.
+	SourceUnclassifiable = "unclassifiable"
+)
+
+// DecisionSourceHeader is the HTTP response header the proxy sets on
+// every gated request. Lowercase ASCII; HTTP normalizes header names
+// case-insensitively but cURL prints the literal we send.
+//
+// Tests + the read-only audit CLI key off this header to confirm WHICH
+// layer produced the verdict without parsing the JSON body.
+const DecisionSourceHeader = "x-kbouncer-decision-source"
+
 // EvaluateRequest is the pure-function evaluator for one inbound HTTP
 // request. It parses, runs the (currently minimal) rule engine, and
 // records the decision to the store.
 //
-// Rule logic for K-Slice 1 is intentionally trivial: with no rules
-// loaded (rule engine ships in K-Slice 3), every well-formed request
-// falls through to the default policy. Malformed requests always
-// receive a synthetic deny so the proxy can refuse forwarding when
-// K-Slice 2 plugs in.
-//
-// Side effect: writes the decision row to store. A write failure is
-// logged at WARN but does not fail the request — same policy as
-// iam-jit-bouncer (audit-write failure must not crash the proxy).
+// Backwards-compatible thin wrapper around EvaluateRequestWithProfile —
+// kept so K-Slice 1 callers (and the original test suite) keep working
+// unchanged. New callers should prefer EvaluateRequestWithProfile so
+// they get profile evaluation, cluster context, and decision_source
+// labelling.
 //
 // store may be nil during pure-evaluation unit tests; if so, no audit
 // row is written. Production callers always pass a real store.
 func EvaluateRequest(r *http.Request, st *store.Store, mode Mode, defaultPolicy DefaultPolicy) *RequestObservation {
+	return EvaluateRequestWithProfile(r, st, mode, defaultPolicy, nil, "")
+}
+
+// EvaluateRequestWithProfile is the K-Slice 7 evaluator. It runs the
+// composition order documented on the profile package:
+//
+//  1. Profile rules (deny_keywords, only_clusters, deny_verbs) — hard floor
+//  2. Per-task scope     (K-Slice 3)
+//  3. Global rule engine (K-Slice 3)
+//  4. Default policy     (fall-through)
+//
+// activeProfile may be nil (or the "none" profile) to disable profile
+// evaluation entirely. cluster is the kubeconfig cluster name when
+// known; surfaced into the profile's ParsedRequest for only_clusters
+// matching. Empty cluster + a profile with only_clusters set will deny
+// fail-closed (we can't prove the request targets an allowed cluster).
+//
+// Side effect: writes the decision row to store. Audit-write failures
+// are logged at WARN but never propagated — same policy as iam-jit-bouncer.
+func EvaluateRequestWithProfile(
+	r *http.Request,
+	st *store.Store,
+	mode Mode,
+	defaultPolicy DefaultPolicy,
+	activeProfile *profile.Profile,
+	cluster string,
+) *RequestObservation {
 	now := time.Now().UTC()
 	mode = normalizeMode(mode)
 	defaultPolicy = normalizeDefaultPolicy(defaultPolicy)
@@ -221,20 +298,10 @@ func EvaluateRequest(r *http.Request, st *store.Store, mode Mode, defaultPolicy 
 			DecisionReason:  "unclassifiable request — does not match any known kube-apiserver URL shape",
 			ModeAtDecision:  string(mode),
 			Enforced:        mode == ModeTransparent,
+			DecisionSource:  SourceUnclassifiable,
 		}
 		writeDecision(st, obs)
 		return obs
-	}
-
-	// K-Slice 1: with no rules loaded, every classifiable request falls
-	// through to the default policy. The reason string makes the audit
-	// log self-explanatory so reviewers don't wonder why a request was
-	// allowed/denied without a rule match.
-	verdict := VerdictAllow
-	reason := "default policy: allow (no rules loaded; K-Slice 1)"
-	if defaultPolicy == DefaultPolicyDeny {
-		verdict = VerdictDeny
-		reason = "default policy: deny (no rules loaded; K-Slice 1)"
 	}
 
 	obs := &RequestObservation{
@@ -250,11 +317,48 @@ func EvaluateRequest(r *http.Request, st *store.Store, mode Mode, defaultPolicy 
 		ParsedSubresource: parsed.Subresource,
 		IsWatch:           parsed.IsWatch,
 		IsDryRun:          parsed.IsDryRun,
-		DecisionVerdict:   verdict,
-		DecisionReason:    reason,
 		ModeAtDecision:    string(mode),
-		Enforced:          mode == ModeTransparent && verdict == VerdictDeny,
 	}
+	if activeProfile != nil {
+		obs.ProfileName = activeProfile.Name
+	}
+
+	// Composition order step 1: profile rules. Profile denies are a hard
+	// floor — a permissive task scope or global rule cannot override
+	// them. Short-circuit on a profile deny so the audit row + response
+	// header surface SourceProfile.
+	if activeProfile != nil {
+		pv := activeProfile.Evaluate(&profile.ParsedRequest{
+			Verb:         parsed.Verb,
+			Namespace:    parsed.Namespace,
+			ResourceName: parsed.Name,
+			Cluster:      cluster,
+		})
+		if pv.Denied {
+			obs.DecisionVerdict = VerdictDeny
+			obs.DecisionReason = pv.Reason
+			obs.DecisionSource = SourceProfile
+			obs.Enforced = mode == ModeTransparent
+			writeDecision(st, obs)
+			return obs
+		}
+	}
+
+	// Composition order steps 2–3 (task + global rules) land in K-Slice 3.
+	// Until then, fall through to the default policy. The reason string
+	// makes the audit log self-explanatory so reviewers don't wonder
+	// why a request was allowed/denied without a rule match.
+	verdict := VerdictAllow
+	reason := "default policy: allow (no rules loaded; K-Slice 1)"
+	if defaultPolicy == DefaultPolicyDeny {
+		verdict = VerdictDeny
+		reason = "default policy: deny (no rules loaded; K-Slice 1)"
+	}
+	obs.DecisionVerdict = verdict
+	obs.DecisionReason = reason
+	obs.DecisionSource = SourceDefault
+	obs.Enforced = mode == ModeTransparent && verdict == VerdictDeny
+
 	writeDecision(st, obs)
 	return obs
 }
@@ -283,6 +387,8 @@ func writeDecision(st *store.Store, obs *RequestObservation) {
 		DecisionReason:    obs.DecisionReason,
 		ModeAtDecision:    obs.ModeAtDecision,
 		Enforced:          obs.Enforced,
+		DecisionSource:    obs.DecisionSource,
+		ProfileName:       obs.ProfileName,
 	})
 	if err != nil {
 		log.Warn().Err(err).Msg("kbouncer: audit-write failed")
@@ -357,11 +463,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.http.Shutdown(ctx)
 }
 
-// handle is the catch-all HTTP handler. K-Slice 1 returns the
-// observation as JSON; K-Slice 2 will replace this with real
-// forwarding to the kube-apiserver on allow.
+// handle is the catch-all HTTP handler. K-Slice 1 returned the parsed
+// observation as JSON; K-Slice 7 adds the x-kbouncer-decision-source
+// response header so curl-driven smoke tests can confirm which layer
+// produced the verdict without parsing the JSON body. K-Slice 2 will
+// replace this with real forwarding to the kube-apiserver on allow.
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
-	obs := EvaluateRequest(r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy)
+	obs := EvaluateRequestWithProfile(r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy, s.cfg.ActiveProfile, s.cfg.Cluster)
+
+	// Set the decision-source header BEFORE WriteHeader. Empty values
+	// are still set so the header is always present — easier to assert
+	// on in tests and easier to grep audit pcaps for.
+	w.Header().Set(DecisionSourceHeader, obs.DecisionSource)
+	if obs.ProfileName != "" {
+		w.Header().Set("x-kbouncer-profile", obs.ProfileName)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	status := http.StatusOK
 	if obs.Enforced {

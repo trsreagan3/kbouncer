@@ -19,15 +19,22 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
 	"github.com/trsreagan3/kbouncer/internal/store"
 )
+
+// envProfileVar is the env-var name used to select the active profile
+// when --profile is not passed. Documented in the README + on the run
+// subcommand's flag help text.
+const envProfileVar = "KBOUNCER_PROFILE"
 
 // version is overridden at build time via -ldflags "-X main.version=..."
 // for release builds. Unstamped builds report "dev".
@@ -52,6 +59,7 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: false,
 	}
 	root.AddCommand(newRunCmd())
+	root.AddCommand(newProfileCmd())
 	return root
 }
 
@@ -76,6 +84,9 @@ func newRunCmd() *cobra.Command {
 		modeStr       string
 		defaultPolStr string
 		dbPath        string
+		profileName   string
+		profilesPath  string
+		cluster       string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -108,11 +119,51 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			}
 			defer st.Close()
 
+			// Profile resolution. Precedence: --profile flag > KBOUNCER_PROFILE
+			// env var. The env-var fallback intentionally only fires when
+			// the flag is unset so a shell-wide default can be overridden
+			// per-invocation without unsetting the env var.
+			//
+			// Profiles.yaml is auto-created from embedded defaults on first
+			// run so a fresh install always has something to point --profile
+			// at. Existing files are NEVER overwritten — operator edits
+			// survive upgrades.
+			if profileName == "" {
+				profileName = os.Getenv(envProfileVar)
+			}
+			resolvedProfilesPath := profilesPath
+			if resolvedProfilesPath == "" {
+				resolvedProfilesPath, err = profile.DefaultProfilesPath()
+				if err != nil {
+					return fmt.Errorf("resolve profiles path: %w", err)
+				}
+			}
+			if written, ferr := profile.EnsureDefaultProfilesFile(resolvedProfilesPath); ferr != nil {
+				// Non-fatal: a write failure (read-only home, etc.) must
+				// not prevent the proxy starting. Log + continue with
+				// embedded defaults.
+				log.Warn().Err(ferr).Str("path", resolvedProfilesPath).
+					Msg("kbouncer: could not write default profiles.yaml; using embedded defaults")
+			} else if written {
+				fmt.Fprintf(os.Stderr,
+					"kbouncer: wrote default profiles to %s\n", resolvedProfilesPath)
+			}
+			profiles, err := profile.LoadProfiles(resolvedProfilesPath)
+			if err != nil {
+				return fmt.Errorf("load profiles: %w", err)
+			}
+			activeProfile, err := profiles.Active(profileName)
+			if err != nil {
+				return fmt.Errorf("select profile: %w", err)
+			}
+
 			cfg := proxy.Config{
 				Host:          host,
 				Port:          port,
 				Mode:          mode,
 				DefaultPolicy: defaultPol,
+				ActiveProfile: activeProfile,
+				Cluster:       cluster,
 			}.Normalize()
 
 			s := proxy.NewServer(cfg, st)
@@ -120,9 +171,10 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			// Print a friendly startup banner to stderr so stdout stays
 			// clean for tools that might pipe kbouncer's output.
 			fmt.Fprintf(os.Stderr,
-				"kbouncer proxy starting on http://%s:%d (mode=%s, default-policy=%s)\n",
-				cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy)
+				"kbouncer proxy starting on http://%s:%d (mode=%s, default-policy=%s, profile=%s)\n",
+				cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name)
 			fmt.Fprintf(os.Stderr, "audit db: %s\n", st.Path())
+			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
 			fmt.Fprintln(os.Stderr, "Ctrl+C to stop.")
 
 			// Run Serve in a goroutine so we can intercept signals and
@@ -174,5 +226,107 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 		"allow | deny. What transparent mode does when no rule matches.")
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	cmd.Flags().StringVar(&profileName, "profile", "",
+		"Active environment profile (e.g. staging-work, prod-readonly, "+
+			"sandbox, incident-response, none). Falls back to "+
+			envProfileVar+" env var; defaults to 'none' if neither is set. "+
+			"Profile denies are a hard floor — a permissive task scope "+
+			"CANNOT override them. See `kbouncer profile list`.")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml). "+
+			"Honors KBOUNCER_PROFILES_PATH env var if --profiles-path unset.")
+	cmd.Flags().StringVar(&cluster, "cluster", "",
+		"Kubeconfig cluster name surfaced to profile evaluation for "+
+			"only_clusters and the 'cluster' keyword target. K-Slice 7 "+
+			"requires explicit pass-through; auto-detection from kubeconfig "+
+			"ships in K-Slice 8.")
+	return cmd
+}
+
+// newProfileCmd implements `kbouncer profile ...` subcommands. K-Slice 7
+// ships `list` only; later slices may add `show`, `validate`, and
+// `set-default`.
+func newProfileCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "profile",
+		Short: "Manage kbouncer environment profiles",
+		Long: `kbouncer environment profiles add an environment-aware deny
+layer that fires BEFORE per-task scopes and global rules. A profile
+deny is a hard floor — a permissive task scope cannot override it.
+
+Use ` + "`kbouncer profile list`" + ` to see the available profiles and
+which one would be active given the current --profile flag /
+` + envProfileVar + ` env var.`,
+	}
+	cmd.AddCommand(newProfileListCmd())
+	return cmd
+}
+
+func newProfileListCmd() *cobra.Command {
+	var (
+		profileName  string
+		profilesPath string
+	)
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List available profiles and show which is active",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if profileName == "" {
+				profileName = os.Getenv(envProfileVar)
+			}
+			if profilesPath == "" {
+				p, err := profile.DefaultProfilesPath()
+				if err != nil {
+					return err
+				}
+				profilesPath = p
+			}
+			profiles, err := profile.LoadProfiles(profilesPath)
+			if err != nil {
+				return fmt.Errorf("load profiles: %w", err)
+			}
+			active, _ := profiles.Active(profileName) // err only on unknown name; we still want to list
+			source := "embedded defaults"
+			if profiles.Path != "" {
+				source = profiles.Path
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"kbouncer profiles (source: %s)\n", source)
+			if profileName != "" && active == nil {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"WARNING: requested profile %q is not in this file. "+
+						"`kbouncer run` would refuse to start.\n", profileName)
+			}
+			for _, name := range profiles.NamesSorted() {
+				p := profiles.All[name]
+				marker := "  "
+				if active != nil && p.Name == active.Name && profileName != "" {
+					marker = "* "
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s%-20s %s\n", marker, name, p.Description)
+				if len(p.DenyKeywords) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "    deny_keywords: %s\n", strings.Join(p.DenyKeywords, ", "))
+				}
+				if len(p.DenyVerbs) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "    deny_verbs:    %s\n", strings.Join(p.DenyVerbs, ", "))
+				}
+				if len(p.OnlyClusters) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "    only_clusters: %s\n", strings.Join(p.OnlyClusters, ", "))
+				}
+				if len(p.Exceptions) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "    exceptions:    %s\n", strings.Join(p.Exceptions, ", "))
+				}
+			}
+			if profileName == "" {
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"\n(no profile selected; pass --profile NAME or set "+envProfileVar+")")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&profileName, "profile", "",
+		"Profile to mark as active in the listing. Falls back to "+envProfileVar+".")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
 	return cmd
 }

@@ -43,14 +43,17 @@ already understand one product understand the other.
 `kbouncer` ships in stages so each slice can land + be reviewed
 independently:
 
-- **K-Slice 1 (this build).** Foundation: HTTP server, kube-apiserver
-  URL parser, SQLite audit store, `kbouncer run` CLI. No upstream
-  forwarding yet — the proxy returns the parsed observation as JSON.
-  Useful as a pure observability tool.
+- **K-Slice 1.** Foundation: HTTP server, kube-apiserver URL parser,
+  SQLite audit store, `kbouncer run` CLI. No upstream forwarding yet —
+  the proxy returns the parsed observation as JSON. Useful as a pure
+  observability tool.
 - **K-Slice 2.** Upstream forwarding to a real kube-apiserver
   (kubeconfig-aware; TLS to the apiserver; SAR-style preflight optional).
 - **K-Slice 3.** Rule engine + per-task scopes + MCP tools for
   active-mode declaration.
+- **K-Slice 7 (this build).** Environment profiles — a switchable deny
+  layer that fires BEFORE per-task scopes and global rules. See
+  "Environment profiles" below.
 - **K-Slice 4.** Client-cert handling on the proxy listener (mTLS for
   kubectl that prefers cert auth).
 - **K-Slice 5.** Streaming subresources: watch / exec / port-forward /
@@ -95,12 +98,63 @@ go test ./...
 All tests are pure-Go and use a temp-directory SQLite DB per test — no
 external cluster, no Docker, no fixtures to manage.
 
+## Environment profiles
+
+A **profile** is a named, switchable rule layer that adds environment-
+aware keyword denies on top of `kbouncer`'s existing per-task scopes
+and global rules. When a profile is active, its denies are a **hard
+floor** — they fire even if a task scope or global rule would have
+allowed the call. This is the property SecOps teams need to approve
+the install: "if I say `staging-work`, the agent CAN NOT touch prod
+regardless of which other rules are loaded."
+
+Activate a profile with `--profile NAME` or the `KBOUNCER_PROFILE`
+env var:
+
+```sh
+kbouncer run --profile staging-work
+# or:
+KBOUNCER_PROFILE=staging-work kbouncer run
+```
+
+`kbouncer profile list` shows the available profiles and marks the
+active one. The first time `kbouncer run` starts it writes the five
+default profiles to `~/.kbouncer/profiles.yaml`; existing files are
+**never** overwritten so operator edits survive upgrades.
+
+### The five default profiles
+
+| Profile | What it does |
+| --- | --- |
+| `staging-work` | Blocks anything that looks like prod (keyword match on `prod`, `production`, `uat`, `live`, `customer` against namespace + resource name). Word-boundary by default so `productivity` is not caught. |
+| `prod-readonly` | Even in prod, no writes. Denies `delete`, `patch`, `create`, `update`, `deletecollection`, `exec`, `portforward`, `attach`. |
+| `sandbox` | Restricts the proxy to a specific cluster via `only_clusters`. Default config: `sandbox-cluster`. |
+| `incident-response` | Read-everything, write-nothing safety net for high-pressure debugging. Same deny_verbs as `prod-readonly`. |
+| `none` | No profile rules fire; existing per-task + global rule system unchanged. Useful when you want kbouncer's audit log without the profile floor. |
+
+Composition order (LOAD-BEARING):
+
+1. Profile rules — keyword, `only_clusters`, `deny_verbs`
+2. Per-task scope (K-Slice 3)
+3. Global rule engine (K-Slice 3)
+4. Default policy fall-through
+
+Every gated response carries an `x-kbouncer-decision-source` header
+naming the rule layer (`profile`, `task`, `global`, `default`,
+`unclassifiable`) so a curl-driven smoke test or audit-log review can
+confirm which layer produced the verdict without parsing the JSON
+body.
+
+Profile auto-detection from the active `kubectl` context is
+**out-of-scope** for K-Slice 7 — ships in K-Slice 8.
+
 ## Layout
 
 ```
 kbouncer/
 ├── cmd/kbouncer/                 # the CLI entry point (cobra)
 ├── internal/parser/              # kube-apiserver URL → ParsedRequest
+├── internal/profile/             # environment profiles (K-Slice 7)
 ├── internal/proxy/               # Mode + Config + Server + EvaluateRequest
 ├── internal/store/               # SQLite-backed audit store
 ├── go.mod

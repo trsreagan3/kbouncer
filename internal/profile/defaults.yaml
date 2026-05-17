@@ -1,0 +1,73 @@
+# kbouncer default profiles.
+#
+# Profiles are environment-aware deny layers that fire BEFORE per-task
+# scopes and global rules. A profile deny is a hard floor — a permissive
+# task scope cannot override it. Pick the profile that matches what
+# you're doing with `--profile NAME` or `KBOUNCER_PROFILE=NAME`.
+#
+# Edit freely: kbouncer NEVER overwrites this file once it exists. To
+# regenerate from defaults, delete the file and rerun `kbouncer run`.
+#
+# See `kbouncer profile list` for the active profile and what each
+# default profile covers.
+profiles:
+
+  staging-work:
+    description: "Working on staging; block anything that looks like prod."
+    deny_keywords:
+      - "prod"
+      - "production"
+      - "uat"
+      - "live"
+      - "customer"
+    keyword_targets:
+      - resource_name
+      - namespace
+    keyword_match: word_boundary
+    # only_clusters can hard-restrict this profile to specific clusters.
+    # Uncomment + edit when you've named your staging cluster:
+    # only_clusters: ["staging-cluster"]
+    exceptions:
+      # Example exception: a team whose name happens to contain a denied
+      # keyword. Adjust to your org. Exceptions match as substrings
+      # (case-insensitive) so partial names work.
+      - "eng-productivity-tooling"
+
+  prod-readonly:
+    description: "Even in prod, no writes — read-only safety net for risky sessions."
+    deny_verbs:
+      - delete
+      - patch
+      - create
+      - update
+      - deletecollection
+      # Subresource verbs that mutate or escalate:
+      - exec
+      - portforward
+      - attach
+
+  sandbox:
+    description: "Sandbox-only work; restricts the proxy to the sandbox cluster."
+    # only_clusters is a HARD restriction. Any request whose Cluster
+    # field is not in this list is denied with source=profile.
+    only_clusters:
+      - "sandbox-cluster"
+
+  incident-response:
+    description: "Incident-response mode: read everything, write nothing, audit verbose."
+    deny_verbs:
+      - delete
+      - patch
+      - create
+      - update
+      - deletecollection
+      - exec
+      - portforward
+      - attach
+
+  none:
+    description: "No profile active; existing rule system unchanged."
+    # `none` is a sentinel — zero deny rules. Use this when you want
+    # only per-task scopes + global rules to drive verdicts. The proxy
+    # synthesizes this profile automatically even if you delete it from
+    # this file, so name lookup for "none" always succeeds.
