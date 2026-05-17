@@ -26,6 +26,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/kbouncer/internal/mcp"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
 	"github.com/trsreagan3/kbouncer/internal/store"
@@ -82,6 +83,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRulesCmd())
 	root.AddCommand(newTasksCmd())
 	root.AddCommand(newInitTLSCmd())
+	root.AddCommand(newMCPCmd())
 	return root
 }
 
@@ -748,5 +750,119 @@ func newAuditTailCmd() *cobra.Command {
 		"Max rows to return (1-1000). Default 50.")
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	return cmd
+}
+
+// newMCPCmd implements `kbouncer mcp` — the MCP-over-stdio server an
+// agent (Claude Code, Cursor, Codex, Devin) connects to so it can
+// introspect + scope itself via the kbounce_* tool family.
+//
+// Configuration mirrors `kbouncer run` so the MCP server speaks for
+// the same live state the proxy enforces:
+//
+//   --db / KBOUNCER_DB          audit store
+//   --profile / KBOUNCER_PROFILE active profile
+//   --profiles-path             path to profiles.yaml
+//   --mode / --default-policy   so kbounce_active_mode returns truth
+//   --owner                     task-owner slot
+//
+// stdin/stdout are reserved for the JSON-RPC stream; the CLI banner
+// goes to stderr so it doesn't poison the wire.
+func newMCPCmd() *cobra.Command {
+	var (
+		dbPath        string
+		profileName   string
+		profilesPath  string
+		modeStr       string
+		defaultPolStr string
+		owner         string
+		actor         string
+	)
+	cmd := &cobra.Command{
+		Use:   "mcp",
+		Short: "Run the MCP-over-stdio server for agent clients",
+		Long: `Run the kbouncer MCP server on stdin/stdout.
+
+Agents (Claude Code, Cursor, Codex, Devin) connect to this command via
+their MCP transport config + discover tools via JSON-RPC 2.0
+` + "`tools/list`" + `. The tool family mirrors iam-jit-bouncer's
+` + "`bouncer_*`" + ` shape so agents that learned one product
+understand the other.
+
+The MCP server reads the SAME on-disk state the running proxy uses
+(--db + --profiles-path). It does NOT start a proxy listener of its
+own — run ` + "`kbouncer run`" + ` separately for the gating + forwarding
+layer.
+
+stdin/stdout are reserved for the JSON-RPC stream; logs + banner go
+to stderr so they don't poison the wire.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mode, err := proxy.ParseMode(modeStr)
+			if err != nil {
+				return err
+			}
+			defaultPol, err := proxy.ParseDefaultPolicy(defaultPolStr)
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(dbPath)
+			if err != nil {
+				return fmt.Errorf("open store: %w", err)
+			}
+			defer st.Close()
+
+			if profileName == "" {
+				profileName = os.Getenv(envProfileVar)
+			}
+			resolvedProfilesPath := profilesPath
+			if resolvedProfilesPath == "" {
+				resolvedProfilesPath, err = profile.DefaultProfilesPath()
+				if err != nil {
+					return fmt.Errorf("resolve profiles path: %w", err)
+				}
+			}
+			profiles, err := profile.LoadProfiles(resolvedProfilesPath)
+			if err != nil {
+				return fmt.Errorf("load profiles: %w", err)
+			}
+			activeProfile, _ := profiles.Active(profileName) // err on unknown; we still want to serve
+
+			srv := mcp.NewServer(mcp.Config{
+				Store:         st,
+				ActiveProfile: activeProfile,
+				ProfilesPath:  resolvedProfilesPath,
+				Mode:          mode,
+				DefaultPolicy: defaultPol,
+				TaskOwner:     owner,
+				Actor:         actor,
+			})
+
+			fmt.Fprintf(os.Stderr,
+				"kbouncer mcp serving on stdio (mode=%s, profile=%s, db=%s)\n",
+				mode, profileName, st.Path())
+			fmt.Fprintln(os.Stderr, "Press Ctrl+D / close stdin to stop.")
+
+			return srv.Serve(os.Stdin, os.Stdout)
+		},
+	}
+	cmd.Flags().StringVar(&dbPath, "db", "",
+		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env). "+
+			"MUST match the path the running proxy uses for live audit-log "+
+			"access via kbounce_tail_decisions.")
+	cmd.Flags().StringVar(&profileName, "profile", "",
+		"Active environment profile name (mirror of `kbouncer run --profile`). "+
+			"Surfaced by kbounce_active_profile.")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
+	cmd.Flags().StringVar(&modeStr, "mode", "cooperative",
+		"Mode the running proxy is in (cooperative | transparent). "+
+			"Returned by kbounce_active_mode.")
+	cmd.Flags().StringVar(&defaultPolStr, "default-policy", "deny",
+		"Default policy the running proxy is in (allow | deny).")
+	cmd.Flags().StringVar(&owner, "owner", "",
+		"Task-owner slot. Empty = default-owner slot (single-laptop).")
+	cmd.Flags().StringVar(&actor, "actor", "",
+		"Actor name recorded in audit rows when MCP-initiated mutations land "+
+			"(default: 'kbouncer-mcp').")
 	return cmd
 }
