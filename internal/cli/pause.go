@@ -21,7 +21,7 @@
 // friendlier middle ground between "Ctrl-C the proxy" and
 // "redo my rules". Audit-trail does the work; the bypass is
 // acceptable precisely because every call during it is logged.
-package main
+package cli
 
 import (
 	"errors"
@@ -50,7 +50,10 @@ client. Auto-reverts at expiry; resume early with 'pause stop'.
 Use this when you NEED to do something the rules don't permit and
 editing rules would take longer than the work. The friendlier middle
 ground between "Ctrl-C the proxy" and "redo my rules."`,
+		Args: cobra.NoArgs,
 	}
+	// UAT-K2 BLOCKER-K2-02: reject unknown sub-subcommands.
+	cmd.RunE = parentRequiresSubcommand("pause", cmd)
 	cmd.AddCommand(newPauseStartCmd())
 	cmd.AddCommand(newPauseStopCmd())
 	cmd.AddCommand(newPauseStatusCmd())

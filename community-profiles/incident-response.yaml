@@ -1,0 +1,25 @@
+# Community profile: incident-response
+#
+# Read-everything, write-nothing safety net for high-pressure debugging.
+# Same deny_verbs as the built-in `readonly` profile, but conceptually
+# distinct: incident-response signals "we are in an incident; nothing
+# should be CHANGING unless someone explicitly opens a write window."
+#
+# Pair with `kbounce pause start --for 5m --reason "applying fix"` for
+# a tightly-bounded write window during the incident.
+#
+# Install with:
+#   kbounce profile install --from <URL-to-this-file>
+# Or copy/paste into your ~/.kbounce/profiles.yaml.
+profiles:
+  incident-response:
+    description: "Incident-response mode: read everything, write nothing, audit verbose."
+    deny_verbs:
+      - delete
+      - patch
+      - create
+      - update
+      - deletecollection
+      - exec
+      - portforward
+      - attach

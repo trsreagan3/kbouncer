@@ -145,7 +145,7 @@ func forwardWatchStreaming(
 ) {
 	upReq, err := buildUpstreamRequestStreaming(r, up)
 	if err != nil {
-		log.Warn().Err(err).Msg("kbouncer: build streaming upstream request failed")
+		log.Warn().Err(err).Msg("kbounce: build streaming upstream request failed")
 		writeBadGateway(w, obs, err)
 		return
 	}
@@ -159,7 +159,7 @@ func forwardWatchStreaming(
 
 	resp, err := streamingClient.Do(upReq)
 	if err != nil {
-		log.Warn().Err(err).Msg("kbouncer: forward watch stream failed")
+		log.Warn().Err(err).Msg("kbounce: forward watch stream failed")
 		writeBadGateway(w, obs, err)
 		return
 	}
@@ -194,7 +194,7 @@ func forwardWatchStreaming(
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				// Client disconnected mid-stream. Logged but not
 				// surfaced — common when kubectl Ctrl+Cs a watch.
-				log.Debug().Err(werr).Msg("kbouncer: client closed watch stream")
+				log.Debug().Err(werr).Msg("kbounce: client closed watch stream")
 				return
 			}
 			if flusher != nil {
@@ -203,7 +203,7 @@ func forwardWatchStreaming(
 		}
 		if rerr != nil {
 			if !errors.Is(rerr, io.EOF) {
-				log.Debug().Err(rerr).Msg("kbouncer: watch stream upstream ended")
+				log.Debug().Err(rerr).Msg("kbounce: watch stream upstream ended")
 			}
 			return
 		}
@@ -265,7 +265,7 @@ func forwardUpgrade(
 		// Should not happen with the stdlib http.Server; surface the
 		// failure cleanly so a test harness that wraps the response
 		// writer gets a useful error instead of a panic.
-		log.Warn().Msg("kbouncer: response writer does not implement Hijacker; cannot upgrade")
+		log.Warn().Msg("kbounce: response writer does not implement Hijacker; cannot upgrade")
 		writeBadGateway(w, obs, fmt.Errorf("response writer not hijackable"))
 		return
 	}
@@ -273,7 +273,7 @@ func forwardUpgrade(
 	// Step 1: hijack inbound.
 	inboundConn, inboundBuf, err := hj.Hijack()
 	if err != nil {
-		log.Warn().Err(err).Msg("kbouncer: hijack inbound conn failed")
+		log.Warn().Err(err).Msg("kbounce: hijack inbound conn failed")
 		// We can't writeBadGateway here — hijack failure means the
 		// writer is in an undefined state. Log + return.
 		return
@@ -283,7 +283,7 @@ func forwardUpgrade(
 	// Step 2: dial upstream.
 	upstreamConn, err := dialUpstream(up)
 	if err != nil {
-		log.Warn().Err(err).Msg("kbouncer: dial upstream for upgrade failed")
+		log.Warn().Err(err).Msg("kbounce: dial upstream for upgrade failed")
 		// Best-effort write a 502 onto the hijacked inbound conn so the
 		// client sees a reason; ignore write error (the inbound may
 		// already be closed).
@@ -292,7 +292,7 @@ func forwardUpgrade(
 			"x-kbouncer-forward-error: true\r\n" +
 			"x-kbouncer-stream: spdy\r\n" +
 			"Connection: close\r\n\r\n" +
-			`{"error":"kbouncer forward to apiserver failed","upstream_error":"` +
+			`{"error":"kbounce forward to apiserver failed","upstream_error":"` +
 			escapeJSON(err.Error()) + `"}`))
 		return
 	}
@@ -300,7 +300,7 @@ func forwardUpgrade(
 
 	// Step 3: write the request line + headers to upstream.
 	if err := writeUpgradeRequestToUpstream(upstreamConn, r, up); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: write upgrade request to upstream failed")
+		log.Warn().Err(err).Msg("kbounce: write upgrade request to upstream failed")
 		return
 	}
 
@@ -312,7 +312,7 @@ func forwardUpgrade(
 	upstreamReader := bufio.NewReader(upstreamConn)
 	resp, err := http.ReadResponse(upstreamReader, r)
 	if err != nil {
-		log.Warn().Err(err).Msg("kbouncer: read upstream upgrade response failed")
+		log.Warn().Err(err).Msg("kbounce: read upstream upgrade response failed")
 		return
 	}
 
@@ -326,7 +326,7 @@ func forwardUpgrade(
 		resp.Header.Set("x-kbouncer-profile", obs.ProfileName)
 	}
 	if err := writeResponseStatusAndHeaders(inboundConn, resp); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: write upgrade response to inbound failed")
+		log.Warn().Err(err).Msg("kbounce: write upgrade response to inbound failed")
 		return
 	}
 
@@ -376,7 +376,7 @@ func forwardUpgrade(
 // http.Client). In that case the upgrade just fails cleanly.
 func dialUpstream(up *upstream.Upstream) (net.Conn, error) {
 	if up == nil || up.URL == nil {
-		return nil, errors.New("kbouncer: upstream missing")
+		return nil, errors.New("kbounce: upstream missing")
 	}
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
@@ -398,7 +398,7 @@ func dialUpstream(up *upstream.Upstream) (net.Conn, error) {
 		}
 		return tls.DialWithDialer(dialer, "tcp", host, tlsCfg)
 	default:
-		return nil, fmt.Errorf("kbouncer: upstream scheme %q not supported for upgrade", up.URL.Scheme)
+		return nil, fmt.Errorf("kbounce: upstream scheme %q not supported for upgrade", up.URL.Scheme)
 	}
 }
 

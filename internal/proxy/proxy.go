@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -397,7 +398,7 @@ func EvaluateRequestFull(
 	if st != nil {
 		ap, err := st.GetActivePause()
 		if err != nil {
-			log.Warn().Err(err).Msg("kbouncer: pause-lookup failed")
+			recordLookupError(err, "kbounce: pause-lookup failed")
 		} else {
 			activePause = ap
 		}
@@ -508,7 +509,7 @@ func EvaluateRequestFull(
 			// Read failure: log + fall through as "no active task" so
 			// a transient SQLite hiccup doesn't crash the proxy. Same
 			// policy as the pause lookup above.
-			log.Warn().Err(terr).Msg("kbouncer: active-task lookup failed")
+			recordLookupError(terr, "kbounce: active-task lookup failed")
 		} else {
 			activeTask = at
 		}
@@ -538,7 +539,7 @@ func EvaluateRequestFull(
 	if st != nil {
 		rs, rerr := st.LoadRuleSet()
 		if rerr != nil {
-			log.Warn().Err(rerr).Msg("kbouncer: load ruleset failed")
+			recordLookupError(rerr, "kbounce: load ruleset failed")
 		} else {
 			ruleSet = rs
 		}
@@ -684,7 +685,7 @@ func maybeEnqueuePrompt(
 		input.Name = parsed.Name
 	}
 	if _, err := st.AddPendingPrompt(input); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: prompt-enqueue failed")
+		recordLookupError(err, "kbounce: prompt-enqueue failed")
 	}
 }
 
@@ -739,7 +740,7 @@ func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause 
 	}
 	id, err := st.RecordDecision(row)
 	if err != nil {
-		log.Warn().Err(err).Msg("kbouncer: audit-write failed")
+		recordLookupError(err, "kbounce: audit-write failed")
 		return 0
 	}
 	return id
@@ -775,6 +776,39 @@ type Server struct {
 	cfg   Config
 	store *store.Store
 	http  *http.Server
+}
+
+// lookupErrorsCounter is a process-wide counter of lookup-class
+// failures the proxy has observed (pause lookup, active-task lookup,
+// ruleset load, prompt enqueue, audit write). Surfaced via /healthz
+// as `lookup_errors_counter` per UAT-K2 MED-K2-06 — mirrors the
+// Python iam-jit-bouncer healthz field of the same name. Package-
+// level + atomic so EvaluateRequestFull (a package function) can
+// increment without changing function signatures. healthz reads it
+// via LookupErrorsCount().
+var lookupErrorsCounter atomic.Int64
+
+// recordLookupError increments the lookup-error counter + logs the
+// underlying error at WARN. Centralized so we have one definition of
+// "what counts as a lookup error" for the healthz surface.
+func recordLookupError(err error, msg string) {
+	if err == nil {
+		return
+	}
+	lookupErrorsCounter.Add(1)
+	log.Warn().Err(err).Msg(msg)
+}
+
+// LookupErrorsCount returns the current value of the package-level
+// lookup error counter. Exposed for test inspection + healthz.
+func LookupErrorsCount() int64 {
+	return lookupErrorsCounter.Load()
+}
+
+// ResetLookupErrorsCount zeros the counter. Test-only helper so
+// independent tests can assert deltas without cross-test contamination.
+func ResetLookupErrorsCount() {
+	lookupErrorsCounter.Store(0)
 }
 
 // NewServer constructs the proxy server. The caller still has to call
@@ -821,7 +855,7 @@ func (s *Server) Serve() error {
 		Str("default_policy", string(s.cfg.DefaultPolicy)).
 		Bool("tls", s.cfg.TLSCertPath != "" && s.cfg.TLSKeyPath != "").
 		Bool("require_client_cert", s.cfg.RequireClientCertCAPath != "").
-		Msg("kbouncer proxy starting")
+		Msg("kbounce proxy starting")
 	if s.cfg.TLSCertPath != "" && s.cfg.TLSKeyPath != "" {
 		tlsCfg, err := s.buildListenerTLSConfig()
 		if err != nil {
@@ -853,7 +887,7 @@ func (s *Server) buildListenerTLSConfig() (*tls.Config, error) {
 	pair, err := tls.LoadX509KeyPair(s.cfg.TLSCertPath, s.cfg.TLSKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"kbouncer: load TLS cert pair (%s / %s): %w",
+			"kbounce: load TLS cert pair (%s / %s): %w",
 			s.cfg.TLSCertPath, s.cfg.TLSKeyPath, err)
 	}
 	tlsCfg := &tls.Config{
@@ -864,13 +898,13 @@ func (s *Server) buildListenerTLSConfig() (*tls.Config, error) {
 		caBytes, err := os.ReadFile(s.cfg.RequireClientCertCAPath)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"kbouncer: read client-cert CA bundle %q: %w",
+				"kbounce: read client-cert CA bundle %q: %w",
 				s.cfg.RequireClientCertCAPath, err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(caBytes) {
 			return nil, fmt.Errorf(
-				"kbouncer: client-cert CA bundle at %q is not valid PEM",
+				"kbounce: client-cert CA bundle at %q is not valid PEM",
 				s.cfg.RequireClientCertCAPath)
 		}
 		tlsCfg.ClientCAs = pool
@@ -969,7 +1003,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		log.Warn().
 			Str("inbound_host", inboundHost).
 			Str("upstream_host", s.cfg.Upstream.Host()).
-			Msg("kbouncer: refused forward — inbound Host does not match upstream")
+			Msg("kbounce: refused forward — inbound Host does not match upstream")
 		writeHostMismatch(w, obs, inboundHost, s.cfg.Upstream.Host())
 		return
 	}
@@ -987,7 +1021,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// K-Slice 2 buffered path (the default for REST calls).
 	upReq, err := buildUpstreamRequest(r, s.cfg.Upstream)
 	if err != nil {
-		log.Warn().Err(err).Msg("kbouncer: build upstream request failed")
+		log.Warn().Err(err).Msg("kbounce: build upstream request failed")
 		writeBadGateway(w, obs, err)
 		return
 	}
@@ -996,7 +1030,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Warn().Err(err).
 			Str("upstream", upstreamURLForLog(s.cfg.Upstream.URL)).
-			Msg("kbouncer: forward to apiserver failed")
+			Msg("kbounce: forward to apiserver failed")
 		writeBadGateway(w, obs, err)
 		return
 	}
@@ -1005,23 +1039,29 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	writeUpstreamResponse(w, resp, obs)
 }
 
-// writeObservationBody is the K-Slice 1 observation JSON fallback.
-// Used when no upstream is configured so observation-only deploys +
-// the K-Slice 1 + 7 test suite keep working unchanged.
+// writeObservationBody is the observation-only JSON fallback used when
+// no upstream apiserver is configured. Lets observation-only deploys +
+// the test suite keep working unchanged.
+//
+// UAT-K2 MED-K2-04: the JSON wrapper field is `_observation_only_note`
+// (renamed from `_slice1_note`, which leaked internal task
+// terminology).
 func writeObservationBody(w http.ResponseWriter, obs *RequestObservation) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	body := struct {
-		Observation *RequestObservation `json:"proxy_observation"`
-		SliceNote   string              `json:"_slice1_note"`
+		Observation         *RequestObservation `json:"proxy_observation"`
+		ObservationOnlyNote string              `json:"_observation_only_note"`
 	}{
 		Observation: obs,
-		SliceNote: "K-Slice 1 returns observations only. Forwarding ships " +
-			"in K-Slice 2; until then the kubectl / SDK client will see " +
-			"this JSON body and fail to parse it as a kube-apiserver response.",
+		ObservationOnlyNote: "kbounce is running in observation-only mode (no " +
+			"upstream apiserver configured). Decisions are logged + returned " +
+			"as JSON; the kubectl / SDK client will NOT see a kube-apiserver " +
+			"response shape. Configure --upstream or --kubeconfig to forward " +
+			"ALLOW verdicts to a real apiserver.",
 	}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: encode observation response failed")
+		log.Warn().Err(err).Msg("kbounce: encode observation response failed")
 	}
 }
 
@@ -1042,7 +1082,7 @@ func writeK8sForbidden(w http.ResponseWriter, obs *RequestObservation) {
 		"apiVersion": "v1",
 		"metadata":   map[string]any{},
 		"status":     "Failure",
-		"message": "kbouncer denied: " + obs.DecisionReason +
+		"message": "kbounce denied: " + obs.DecisionReason +
 			" (decision_source=" + obs.DecisionSource + ")",
 		"reason": "Forbidden",
 		"details": map[string]any{
@@ -1055,7 +1095,7 @@ func writeK8sForbidden(w http.ResponseWriter, obs *RequestObservation) {
 		"code": 403,
 	}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: encode forbidden response failed")
+		log.Warn().Err(err).Msg("kbounce: encode forbidden response failed")
 	}
 }
 
@@ -1070,7 +1110,7 @@ func writeHostMismatch(w http.ResponseWriter, obs *RequestObservation, inboundHo
 	w.Header().Set(RefusalHeader, "forward-host-mismatch")
 	w.WriteHeader(http.StatusForbidden)
 	body := map[string]any{
-		"error": "kbouncer refused to forward — inbound Host does not match upstream",
+		"error": "kbounce refused to forward — inbound Host does not match upstream",
 		"refusal_reason": "The inbound Host header points to a target outside " +
 			"the configured upstream apiserver. kbouncer refuses to act as a " +
 			"redirector for attacker-controlled Host headers.",
@@ -1080,7 +1120,7 @@ func writeHostMismatch(w http.ResponseWriter, obs *RequestObservation, inboundHo
 		"resource":      obs.ParsedResource,
 	}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: encode host-mismatch response failed")
+		log.Warn().Err(err).Msg("kbounce: encode host-mismatch response failed")
 	}
 }
 
@@ -1098,14 +1138,14 @@ func writeBadGateway(w http.ResponseWriter, obs *RequestObservation, cause error
 	w.Header().Set("x-kbouncer-forward-error", "true")
 	w.WriteHeader(http.StatusBadGateway)
 	body := map[string]any{
-		"error":          "kbouncer forward to kube-apiserver failed",
+		"error":          "kbounce forward to kube-apiserver failed",
 		"upstream_error": cause.Error(),
 		"verb":           obs.ParsedVerb,
 		"resource":       obs.ParsedResource,
 		"namespace":      obs.ParsedNamespace,
 	}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: encode bad-gateway response failed")
+		log.Warn().Err(err).Msg("kbounce: encode bad-gateway response failed")
 	}
 }
 
@@ -1128,16 +1168,18 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Reason    string `json:"reason,omitempty"`
 	}
 	payload := struct {
-		Status         string        `json:"status"`
-		Mode           string        `json:"mode"`
-		DefaultPolicy  string        `json:"default_policy"`
-		ActiveProfile  string        `json:"active_profile"`
-		DecisionsCount int64         `json:"decisions_count"`
-		Pause          *HealthzPause `json:"pause"`
+		Status               string        `json:"status"`
+		Mode                 string        `json:"mode"`
+		DefaultPolicy        string        `json:"default_policy"`
+		ActiveProfile        string        `json:"active_profile"`
+		DecisionsCount       int64         `json:"decisions_count"`
+		LookupErrorsCounter  int64         `json:"lookup_errors_counter"`
+		Pause                *HealthzPause `json:"pause"`
 	}{
-		Status:        "ok",
-		Mode:          string(s.cfg.Mode),
-		DefaultPolicy: string(s.cfg.DefaultPolicy),
+		Status:              "ok",
+		Mode:                string(s.cfg.Mode),
+		DefaultPolicy:       string(s.cfg.DefaultPolicy),
+		LookupErrorsCounter: LookupErrorsCount(),
 	}
 	if s.cfg.ActiveProfile != nil {
 		payload.ActiveProfile = s.cfg.ActiveProfile.Name
@@ -1168,18 +1210,26 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: encode /healthz response failed")
+		log.Warn().Err(err).Msg("kbounce: encode /healthz response failed")
 	}
 }
 
 // EnsureLogger applies a minimal zerolog config when the caller has
 // not set one. CLI calls this at startup so library users (tests)
 // get plain JSON logs without configuring the logger themselves.
+//
+// Default level is InfoLevel — Debug-level entries (e.g. UAT-K2
+// HIGH-K2-04's "no-kubeconfig" notice) stay quiet unless the operator
+// opts into verbose logging via KBOUNCER_LOG_LEVEL=debug.
 func EnsureLogger() {
 	zerolog.TimeFieldFormat = time.RFC3339
-	if log.Logger.GetLevel() == zerolog.NoLevel {
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	level := zerolog.InfoLevel
+	if v := os.Getenv("KBOUNCER_LOG_LEVEL"); v != "" {
+		if parsed, err := zerolog.ParseLevel(v); err == nil {
+			level = parsed
+		}
 	}
+	zerolog.SetGlobalLevel(level)
 }
 
 // ParseMode parses a CLI flag value into a Mode, returning an error
@@ -1190,7 +1240,7 @@ func ParseMode(s string) (Mode, error) {
 	if m.IsValid() {
 		return m, nil
 	}
-	return "", fmt.Errorf("kbouncer: unknown mode %q (want cooperative or transparent)", s)
+	return "", fmt.Errorf("kbounce: unknown mode %q (want cooperative or transparent)", s)
 }
 
 // ParseDefaultPolicy parses a CLI flag value into a DefaultPolicy.
@@ -1199,9 +1249,9 @@ func ParseDefaultPolicy(s string) (DefaultPolicy, error) {
 	if p.IsValid() {
 		return p, nil
 	}
-	return "", fmt.Errorf("kbouncer: unknown default policy %q (want allow or deny)", s)
+	return "", fmt.Errorf("kbounce: unknown default policy %q (want allow or deny)", s)
 }
 
 // ErrInvalidConfig is surfaced when a Config fails validation before
 // Serve binds. Kept exported so callers can errors.Is check.
-var ErrInvalidConfig = errors.New("kbouncer: invalid proxy config")
+var ErrInvalidConfig = errors.New("kbounce: invalid proxy config")

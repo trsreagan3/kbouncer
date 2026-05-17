@@ -126,7 +126,7 @@ func DefaultDir() (string, error) {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("kbouncer: resolve home dir: %w", err)
+		return "", fmt.Errorf("kbounce: resolve home dir: %w", err)
 	}
 	return filepath.Join(home, ".kbouncer", "tls"), nil
 }
@@ -147,7 +147,7 @@ func Init(opts InitOptions) (*InitResult, error) {
 		dir = d
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("kbouncer: mkdir %q: %w", dir, err)
+		return nil, fmt.Errorf("kbounce: mkdir %q: %w", dir, err)
 	}
 
 	caKeyPath := filepath.Join(dir, FileNameCAKey)
@@ -159,7 +159,7 @@ func Init(opts InitOptions) (*InitResult, error) {
 		for _, p := range []string{caKeyPath, caCertPath, serverKeyPath, serverCertPath} {
 			if _, err := os.Stat(p); err == nil {
 				return nil, fmt.Errorf(
-					"kbouncer: %s already exists; pass --force to overwrite "+
+					"kbounce: %s already exists; pass --force to overwrite "+
 						"(this rotates the CA + invalidates any kubectl context "+
 						"that pins the prior cert)", p)
 			}
@@ -178,7 +178,7 @@ func Init(opts InitOptions) (*InitResult, error) {
 	// --- CA ---
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: generate CA key: %w", err)
+		return nil, fmt.Errorf("kbounce: generate CA key: %w", err)
 	}
 	caTemplate := &x509.Certificate{
 		SerialNumber: mustSerial(),
@@ -194,13 +194,13 @@ func Init(opts InitOptions) (*InitResult, error) {
 	}
 	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: self-sign CA: %w", err)
+		return nil, fmt.Errorf("kbounce: self-sign CA: %w", err)
 	}
 
 	// --- Server cert ---
 	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: generate server key: %w", err)
+		return nil, fmt.Errorf("kbounce: generate server key: %w", err)
 	}
 	dnsNames := []string{"localhost"}
 	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
@@ -229,11 +229,11 @@ func Init(opts InitOptions) (*InitResult, error) {
 	}
 	caCert, err := x509.ParseCertificate(caDER)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: parse self-signed CA: %w", err)
+		return nil, fmt.Errorf("kbounce: parse self-signed CA: %w", err)
 	}
 	serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, caCert, &serverKey.PublicKey, caKey)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: sign server cert: %w", err)
+		return nil, fmt.Errorf("kbounce: sign server cert: %w", err)
 	}
 
 	// --- Persist ---
@@ -241,16 +241,16 @@ func Init(opts InitOptions) (*InitResult, error) {
 	// matching set of "no key" rather than "cert without key" which the
 	// proxy startup would crash on with a less-helpful error.
 	if err := writePEM(caKeyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(caKey), 0o400); err != nil {
-		return nil, fmt.Errorf("kbouncer: write ca.key: %w", err)
+		return nil, fmt.Errorf("kbounce: write ca.key: %w", err)
 	}
 	if err := writePEM(caCertPath, "CERTIFICATE", caDER, 0o644); err != nil {
-		return nil, fmt.Errorf("kbouncer: write ca.crt: %w", err)
+		return nil, fmt.Errorf("kbounce: write ca.crt: %w", err)
 	}
 	if err := writePEM(serverKeyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(serverKey), 0o400); err != nil {
-		return nil, fmt.Errorf("kbouncer: write server.key: %w", err)
+		return nil, fmt.Errorf("kbounce: write server.key: %w", err)
 	}
 	if err := writePEM(serverCertPath, "CERTIFICATE", serverDER, 0o644); err != nil {
-		return nil, fmt.Errorf("kbouncer: write server.crt: %w", err)
+		return nil, fmt.Errorf("kbounce: write server.crt: %w", err)
 	}
 
 	return &InitResult{
@@ -282,7 +282,7 @@ func mustSerial() *big.Int {
 	limit := new(big.Int).Lsh(big.NewInt(1), 128)
 	n, err := rand.Int(rand.Reader, limit)
 	if err != nil {
-		panic(fmt.Sprintf("kbouncer: crypto/rand failed generating serial: %v", err))
+		panic(fmt.Sprintf("kbounce: crypto/rand failed generating serial: %v", err))
 	}
 	return n
 }
@@ -290,4 +290,4 @@ func mustSerial() *big.Int {
 // ErrFilesPresent is returned (wrapped) by Init when --force was not
 // supplied and existing files would have been overwritten. Kept exported
 // so the CLI can errors.Is + print a different exit code if needed.
-var ErrFilesPresent = errors.New("kbouncer: TLS files already present")
+var ErrFilesPresent = errors.New("kbounce: TLS files already present")

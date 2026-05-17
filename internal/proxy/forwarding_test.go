@@ -255,7 +255,7 @@ func TestForwarding_UpstreamErrorReturnsBadGateway(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	var payload map[string]any
 	require.NoError(t, json.Unmarshal(body, &payload))
-	assert.Equal(t, "kbouncer forward to kube-apiserver failed", payload["error"])
+	assert.Equal(t, "kbounce forward to kube-apiserver failed", payload["error"])
 	assert.NotEmpty(t, payload["upstream_error"],
 		"upstream_error must explain WHY the forward failed")
 }

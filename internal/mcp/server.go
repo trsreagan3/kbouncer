@@ -66,9 +66,12 @@ import (
 const ProtocolVersion = "2024-11-05"
 
 // ServerName / ServerVersion identify the server to MCP clients.
+// ServerName tracks the renamed canonical binary (`kbounce`) per
+// [[bounce-suite-rename]]; agents that learned the old name still
+// work because the protocol-level handshake doesn't pin on this value.
 const (
-	ServerName    = "kbouncer"
-	ServerVersion = "0.6.0-kslice6"
+	ServerName    = "kbounce"
+	ServerVersion = "1.0.0"
 )
 
 // Config wires the MCP server to the live kbouncer state on disk.
@@ -103,7 +106,7 @@ type Config struct {
 	TaskOwner string
 
 	// Actor is the string recorded in audit rows when MCP-initiated
-	// mutations land. Defaults to "kbouncer-mcp" when empty.
+	// mutations land. Defaults to "kbounce-mcp" when empty.
 	Actor string
 }
 
@@ -117,7 +120,7 @@ type Server struct {
 // NewServer constructs an MCP server from the given config.
 func NewServer(cfg Config) *Server {
 	if cfg.Actor == "" {
-		cfg.Actor = "kbouncer-mcp"
+		cfg.Actor = "kbounce-mcp"
 	}
 	return &Server{cfg: cfg}
 }
@@ -243,7 +246,7 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 // SQLite. Returns a structured error caller can return directly.
 func (s *Server) requireStore() error {
 	if s.cfg.Store == nil {
-		return errors.New("kbouncer mcp: store not configured; pass --db to `kbouncer mcp`")
+		return errors.New("kbounce mcp: store not configured; pass --db to `kbounce mcp`")
 	}
 	return nil
 }
@@ -261,10 +264,10 @@ func (s *Server) toolActiveMode(_ map[string]any) (map[string]any, error) {
 
 func (s *Server) toolActiveProfile(_ map[string]any) (map[string]any, error) {
 	if s.cfg.ActiveProfile == nil || s.cfg.ActiveProfile.Name == "" ||
-		s.cfg.ActiveProfile.Name == profile.NoneProfileName {
+		s.cfg.ActiveProfile.Name == profile.FullUserProfileName {
 		return map[string]any{
-			"name":             profile.NoneProfileName,
-			"description":      "No profile active; existing rule system unchanged",
+			"name":             profile.FullUserProfileName,
+			"description":      "No profile active; calls forwarded as-is + audit-logged. Default.",
 			"deny_keyword_n":   0,
 			"deny_verb_n":      0,
 			"only_cluster_n":   0,

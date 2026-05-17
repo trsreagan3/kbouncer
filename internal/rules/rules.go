@@ -184,7 +184,7 @@ type ErrInvalidPattern struct {
 }
 
 func (e *ErrInvalidPattern) Error() string {
-	return fmt.Sprintf("kbouncer: invalid rule pattern %q: %s", e.Pattern, e.Reason)
+	return fmt.Sprintf("kbounce: invalid rule pattern %q: %s", e.Pattern, e.Reason)
 }
 
 // ParsePattern splits a `resource:verb_glob` pattern. Returns
@@ -353,7 +353,7 @@ func (rs *RuleSet) Add(r ProxyRule) error {
 		return err
 	}
 	if r.Effect != "" && !r.Effect.IsValid() {
-		return fmt.Errorf("kbouncer: invalid rule effect %q (want allow or deny)", r.Effect)
+		return fmt.Errorf("kbounce: invalid rule effect %q (want allow or deny)", r.Effect)
 	}
 	rs.rules = append(rs.rules, r)
 	return nil

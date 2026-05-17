@@ -181,8 +181,8 @@ func TestServer_EndToEnd_RespondsWithObservationJSON(t *testing.T) {
 	require.NoError(t, err)
 
 	var decoded struct {
-		Observation *RequestObservation `json:"proxy_observation"`
-		SliceNote   string              `json:"_slice1_note"`
+		Observation         *RequestObservation `json:"proxy_observation"`
+		ObservationOnlyNote string              `json:"_observation_only_note"`
 	}
 	require.NoError(t, json.Unmarshal(body, &decoded))
 
@@ -190,7 +190,10 @@ func TestServer_EndToEnd_RespondsWithObservationJSON(t *testing.T) {
 	assert.Equal(t, "get", decoded.Observation.ParsedVerb)
 	assert.Equal(t, "pods", decoded.Observation.ParsedResource)
 	assert.Equal(t, "my-pod", decoded.Observation.ParsedName)
-	assert.Contains(t, decoded.SliceNote, "K-Slice 1")
+	// UAT-K2 MED-K2-04: the wrapper field is _observation_only_note + the
+	// message explains observation-only mode in user-visible terms (not
+	// "K-Slice 1" internal task terminology).
+	assert.Contains(t, decoded.ObservationOnlyNote, "observation-only mode")
 
 	// And it should have written exactly one decision row.
 	n, err := st.CountDecisions()
@@ -275,16 +278,39 @@ func TestParseDefaultPolicy(t *testing.T) {
 // K-Slice 7: profile integration.
 // ---------------------------------------------------------------------
 
-// loadStagingProfile returns the embedded "staging-work" default profile.
-// Used by the proxy-integration tests so they exercise the SAME profile
-// shape an operator gets out of the box.
+// loadStagingProfile constructs the canonical "staging-work" community
+// profile in memory. The 2026-05-17 default-profile reshape
+// ([[bounce-default-profile-pattern]]) moved staging-work out of the
+// embedded defaults + into community-profiles/, so the integration
+// tests build it locally to keep exercising the same profile shape an
+// operator gets when they install community-profiles/staging-work.yaml.
 func loadStagingProfile(t *testing.T) *profile.Profile {
 	t.Helper()
-	ps, err := profile.LoadProfiles("")
-	require.NoError(t, err)
-	p, err := ps.Active("staging-work")
-	require.NoError(t, err)
-	return p
+	return &profile.Profile{
+		Name:        "staging-work",
+		Description: "Working on staging; block anything that looks like prod.",
+		DenyKeywords: []string{
+			"prod", "production", "uat", "live", "customer",
+		},
+		KeywordTargets: []profile.KeywordTarget{
+			profile.TargetResourceName,
+			profile.TargetNamespace,
+		},
+		KeywordMatch: profile.MatchWordBoundary,
+		Exceptions:   []string{"eng-productivity-tooling"},
+	}
+}
+
+// loadSandboxProfile constructs the canonical "sandbox" community
+// profile in memory (only_clusters restriction). Same rationale as
+// loadStagingProfile.
+func loadSandboxProfile(t *testing.T) *profile.Profile {
+	t.Helper()
+	return &profile.Profile{
+		Name:         "sandbox",
+		Description:  "Sandbox-only work; restricts the proxy to the sandbox cluster.",
+		OnlyClusters: []string{"sandbox-cluster"},
+	}
 }
 
 func TestEvaluateRequestWithProfile_KeywordDenyShortCircuits(t *testing.T) {
@@ -330,19 +356,19 @@ func TestEvaluateRequestWithProfile_NilProfileNoRegression(t *testing.T) {
 	assert.Empty(t, obs.ProfileName)
 }
 
-func TestEvaluateRequestWithProfile_NoneProfileNoRegression(t *testing.T) {
+func TestEvaluateRequestWithProfile_FullUserProfileNoRegression(t *testing.T) {
 	st := freshStore(t)
 	ps, err := profile.LoadProfiles("")
 	require.NoError(t, err)
-	none, err := ps.Active("none")
+	fu, err := ps.Active("full-user")
 	require.NoError(t, err)
 
 	req := parser.MustParseTestURL(http.MethodGet, "/api/v1/namespaces/prod-app/pods/foo")
-	obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, none, "")
+	obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, fu, "")
 	assert.Equal(t, VerdictAllow, obs.DecisionVerdict)
 	assert.Equal(t, SourceDefault, obs.DecisionSource,
-		"none profile must abstain → default policy applies")
-	assert.Equal(t, "none", obs.ProfileName)
+		"full-user profile must abstain → default policy applies")
+	assert.Equal(t, "full-user", obs.ProfileName)
 }
 
 func TestEvaluateRequestWithProfile_ExceptionAllows(t *testing.T) {
@@ -361,10 +387,7 @@ func TestEvaluateRequestWithProfile_ExceptionAllows(t *testing.T) {
 
 func TestEvaluateRequestWithProfile_OnlyClustersMismatchDenies(t *testing.T) {
 	st := freshStore(t)
-	ps, err := profile.LoadProfiles("")
-	require.NoError(t, err)
-	sandbox, err := ps.Active("sandbox")
-	require.NoError(t, err)
+	sandbox := loadSandboxProfile(t)
 
 	req := parser.MustParseTestURL(http.MethodGet, "/api/v1/namespaces/default/pods/foo")
 	// Cluster "prod-cluster" is not in only_clusters; deny.
@@ -376,10 +399,7 @@ func TestEvaluateRequestWithProfile_OnlyClustersMismatchDenies(t *testing.T) {
 
 func TestEvaluateRequestWithProfile_OnlyClustersMatchAllows(t *testing.T) {
 	st := freshStore(t)
-	ps, err := profile.LoadProfiles("")
-	require.NoError(t, err)
-	sandbox, err := ps.Active("sandbox")
-	require.NoError(t, err)
+	sandbox := loadSandboxProfile(t)
 
 	req := parser.MustParseTestURL(http.MethodGet, "/api/v1/namespaces/default/pods/foo")
 	obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, sandbox, "sandbox-cluster")
@@ -391,10 +411,10 @@ func TestEvaluateRequestWithProfile_DenyVerbsBlockMutation(t *testing.T) {
 	st := freshStore(t)
 	ps, err := profile.LoadProfiles("")
 	require.NoError(t, err)
-	ro, err := ps.Active("prod-readonly")
+	ro, err := ps.Active("readonly")
 	require.NoError(t, err)
 
-	// delete is in the prod-readonly deny_verbs list.
+	// delete is in the readonly deny_verbs list.
 	req := parser.MustParseTestURL(http.MethodDelete, "/api/v1/namespaces/default/pods/foo")
 	obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, ro, "")
 	assert.Equal(t, VerdictDeny, obs.DecisionVerdict)

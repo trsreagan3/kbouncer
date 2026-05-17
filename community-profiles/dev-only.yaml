@@ -1,0 +1,16 @@
+# Community profile: dev-only
+#
+# Restricts the proxy to a specific dev / sandbox cluster via
+# only_clusters. Any request whose Cluster field is not in this list is
+# denied with source=profile.
+#
+# Edit the cluster name to match your environment.
+#
+# Install with:
+#   kbounce profile install --from <URL-to-this-file>
+# Or copy/paste into your ~/.kbounce/profiles.yaml.
+profiles:
+  dev-only:
+    description: "Dev-only work; restricts the proxy to the dev/sandbox cluster."
+    only_clusters:
+      - "sandbox-cluster"

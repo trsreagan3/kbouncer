@@ -1,14 +1,14 @@
-// Package profile implements environment-aware kbouncer profiles.
+// Package profile implements environment-aware kbounce profiles.
 //
 // A profile is a named, switchable rule layer that adds environment-aware
 // keyword denies on top of the existing per-task scope and global rule
 // engine. When active, a profile's denies are a HARD FLOOR — they fire
 // even if a task scope or global rule would have allowed the call. This
 // is the property SecOps teams need to approve the install: "if I say
-// 'staging-work', the agent CAN NOT touch prod regardless of which
+// 'readonly', the agent CAN NOT mutate anything regardless of which
 // other rules are loaded."
 //
-// Profiles are symmetric across kbouncer (this package) and the Python
+// Profiles are symmetric across kbounce (this package) and the Python
 // iam-jit-bouncer; the YAML schema is intentionally identical so an
 // operator who reads one understands the other.
 //
@@ -25,16 +25,23 @@
 // CANNOT override a profile deny. See [[safety-mode-two-modes]] and
 // [[safety-mode-lean-permissive]] in the product memory.
 //
-// K-Slice 7 ships:
-//   - The Profile struct + Profiles container + YAML load + name lookup
-//   - Five default profiles embedded at compile time (staging-work,
-//     prod-readonly, sandbox, incident-response, none)
-//   - The Evaluate() pure-function entry point the proxy short-circuits on
+// Embedded default profiles (only two, intentionally):
 //
-// K-Slice 7 does NOT ship:
-//   - Auto-detection of the active profile from kubectl context (K-Slice 8)
-//   - Hot reload of profiles.yaml on file change (post-v1.0)
-//   - MCP-tool introspection of the active profile (K-Slice 6)
+//   - full-user — passthrough sentinel (zero rules). Default when no
+//     --profile / KBOUNCER_PROFILE is selected.
+//   - readonly  — blocks write + destructive verbs (delete, patch,
+//     create, update, deletecollection, exec, portforward, attach).
+//     General-purpose safety net; works in any environment.
+//
+// Backward-compat aliases (mapped to new names at lookup; deprecation-
+// warned in v1.0, removed in v1.1):
+//
+//   - "none"          → "full-user"
+//   - "prod-readonly" → "readonly"
+//
+// Other environment-specific profiles (staging-work, dev-only,
+// incident-response) ship in the kbounce repo's `community-profiles/`
+// directory and install via `kbounce profile install --from URL`.
 package profile
 
 import (
@@ -265,18 +272,53 @@ type Verdict struct {
 // repeating the string literal.
 const SourceProfile = "profile"
 
-// NoneProfileName is the reserved profile name that disables profile
-// rules entirely. Always present in Profiles.All.
+// FullUserProfileName is the reserved profile name that disables profile
+// rules entirely. Always present in Profiles.All. Renamed from "none"
+// in the 2026-05-17 default-profile reshape — see [[bounce-suite-rename]]
+// and [[bounce-default-profile-pattern]] in the product memory.
+const FullUserProfileName = "full-user"
+
+// NoneProfileName is the legacy alias for FullUserProfileName. Kept for
+// backward-compat at the lookup surface (resolveProfileAlias). v1.1
+// removes the alias.
+//
+// Deprecated: use FullUserProfileName.
 const NoneProfileName = "none"
+
+// ReadonlyProfileName is the reserved profile name for the general-
+// purpose read-only safety net. Renamed from "prod-readonly" in the
+// 2026-05-17 default-profile reshape (the rule set isn't prod-specific —
+// it's "block write + destructive verbs in ANY environment").
+const ReadonlyProfileName = "readonly"
+
+// profileAliases maps legacy profile names to their canonical
+// replacement. Lookups that hit an alias emit a one-shot deprecation
+// warning + transparently resolve to the canonical name. v1.1 removes
+// this map.
+var profileAliases = map[string]string{
+	"none":          FullUserProfileName,
+	"prod-readonly": ReadonlyProfileName,
+}
+
+// resolveProfileAlias returns the canonical profile name for an alias,
+// plus a bool indicating whether the input was an alias. Used by
+// Profiles.Active so unknown-name errors print the canonical names but
+// legacy invocations still succeed.
+func resolveProfileAlias(name string) (string, bool) {
+	if canonical, ok := profileAliases[name]; ok {
+		return canonical, true
+	}
+	return name, false
+}
 
 // ErrUnknownProfile is returned by Profiles.Active when the requested
 // name is not in the loaded set. Kept distinct from a YAML parse error
-// so the CLI can give a different message ("did you mean 'staging-work'?").
-var ErrUnknownProfile = errors.New("kbouncer: unknown profile")
+// so the CLI can give a different message ("did you mean 'readonly'?").
+var ErrUnknownProfile = errors.New("kbounce: unknown profile")
 
 // ErrInvalidProfile is returned by LoadProfiles when a profile's fields
 // are internally inconsistent (e.g. unknown keyword target).
-var ErrInvalidProfile = errors.New("kbouncer: invalid profile")
+var ErrInvalidProfile = errors.New("kbounce: invalid profile")
 
 // profileFile is the on-disk YAML shape; private because callers see
 // Profiles, not the raw file struct.
@@ -298,7 +340,7 @@ func LoadProfiles(path string) (*Profiles, error) {
 			return parseProfiles(raw, path)
 		}
 		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("kbouncer: read profiles %q: %w", path, err)
+			return nil, fmt.Errorf("kbounce: read profiles %q: %w", path, err)
 		}
 		// File missing → fall through to defaults. Don't error: kbouncer
 		// runs without a profile file just fine (no profile is selected
@@ -312,7 +354,7 @@ func LoadProfiles(path string) (*Profiles, error) {
 func parseProfiles(raw []byte, path string) (*Profiles, error) {
 	var pf profileFile
 	if err := yaml.Unmarshal(raw, &pf); err != nil {
-		return nil, fmt.Errorf("kbouncer: parse profiles yaml: %w", err)
+		return nil, fmt.Errorf("kbounce: parse profiles yaml: %w", err)
 	}
 	if pf.Profiles == nil {
 		pf.Profiles = map[string]*Profile{}
@@ -329,14 +371,14 @@ func parseProfiles(raw []byte, path string) (*Profiles, error) {
 			return nil, fmt.Errorf("%w: %q: %v", ErrInvalidProfile, name, err)
 		}
 	}
-	// Always make "none" addressable, even if the YAML doesn't define it.
-	// "none" is a hard-coded sentinel: zero rules of its own, so it always
-	// abstains. Codifying it here means callers don't need a special-case
-	// branch.
-	if _, ok := pf.Profiles[NoneProfileName]; !ok {
-		pf.Profiles[NoneProfileName] = &Profile{
-			Name:        NoneProfileName,
-			Description: "No profile active; existing rule system unchanged",
+	// Always make "full-user" addressable, even if the YAML doesn't define
+	// it. "full-user" is a hard-coded sentinel: zero rules of its own,
+	// so it always abstains. Codifying it here means callers don't need
+	// a special-case branch.
+	if _, ok := pf.Profiles[FullUserProfileName]; !ok {
+		pf.Profiles[FullUserProfileName] = &Profile{
+			Name:        FullUserProfileName,
+			Description: "No profile active; calls forwarded as-is + audit-logged. Default.",
 		}
 	}
 	return &Profiles{Path: path, All: pf.Profiles}, nil
@@ -359,19 +401,32 @@ func (p *Profile) validate() error {
 
 // Active returns the named profile or ErrUnknownProfile. The lookup is
 // strict: an unknown name surfaces an error rather than silently falling
-// back to "none". Silent fallback hides typos and would let the operator
-// think they're protected when they're not.
+// back to the default. Silent fallback hides typos and would let the
+// operator think they're protected when they're not.
+//
+// Backward-compat: legacy profile names ("none", "prod-readonly")
+// resolve to their canonical replacements ("full-user", "readonly")
+// with a one-line deprecation notice printed to stderr. v1.1 removes
+// the alias path entirely. End-user invocations are the only consumers
+// of aliases; internal callers use the canonical names directly.
 func (ps *Profiles) Active(name string) (*Profile, error) {
 	if ps == nil {
 		return nil, ErrUnknownProfile
 	}
 	if name == "" {
 		// Empty string == no profile selected. The CLI handles this by
-		// returning the "none" profile so the proxy's evaluate path
-		// always has a non-nil profile to call.
-		return ps.All[NoneProfileName], nil
+		// returning the "full-user" profile so the proxy's evaluate
+		// path always has a non-nil profile to call.
+		return ps.All[FullUserProfileName], nil
 	}
-	p, ok := ps.All[name]
+	canonical, wasAlias := resolveProfileAlias(name)
+	if wasAlias {
+		fmt.Fprintf(os.Stderr,
+			"kbounce: profile name %q is deprecated; use %q. "+
+				"Aliases remain in v1.0 + are removed in v1.1.\n",
+			name, canonical)
+	}
+	p, ok := ps.All[canonical]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q (loaded: %s)", ErrUnknownProfile, name, ps.NamesSorted())
 	}
@@ -393,14 +448,14 @@ func (ps *Profiles) NamesSorted() []string {
 }
 
 // Evaluate runs profile rules in the documented composition order and
-// returns the verdict. A nil receiver, the "none" profile, or a profile
-// with zero rules returns Denied=false (abstain).
+// returns the verdict. A nil receiver, the "full-user" profile, or a
+// profile with zero rules returns Denied=false (abstain).
 //
 // The function is pure: no I/O, no audit-store writes. The caller (proxy)
 // is responsible for recording the verdict + carrying Source / Reason
 // into the audit row.
 func (p *Profile) Evaluate(req *ParsedRequest) Verdict {
-	if p == nil || p.Name == NoneProfileName || req == nil {
+	if p == nil || p.Name == FullUserProfileName || req == nil {
 		return Verdict{}
 	}
 
@@ -613,7 +668,7 @@ func DefaultProfilesPath() (string, error) {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("kbouncer: resolve home dir: %w", err)
+		return "", fmt.Errorf("kbounce: resolve home dir: %w", err)
 	}
 	return filepath.Join(home, ".kbouncer", "profiles.yaml"), nil
 }
@@ -631,15 +686,15 @@ func EnsureDefaultProfilesFile(path string) (bool, error) {
 	if _, err := os.Stat(path); err == nil {
 		return false, nil
 	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("kbouncer: stat profiles %q: %w", path, err)
+		return false, fmt.Errorf("kbounce: stat profiles %q: %w", path, err)
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return false, fmt.Errorf("kbouncer: mkdir %q: %w", dir, err)
+			return false, fmt.Errorf("kbounce: mkdir %q: %w", dir, err)
 		}
 	}
 	if err := os.WriteFile(path, DefaultProfilesYAML(), 0o600); err != nil {
-		return false, fmt.Errorf("kbouncer: write profiles %q: %w", path, err)
+		return false, fmt.Errorf("kbounce: write profiles %q: %w", path, err)
 	}
 	return true, nil
 }

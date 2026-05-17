@@ -239,7 +239,7 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response, obs *Requ
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Warn().Err(err).Msg("kbouncer: response-body copy failed mid-stream")
+		log.Warn().Err(err).Msg("kbounce: response-body copy failed mid-stream")
 	}
 }
 

@@ -118,12 +118,28 @@ type ParsedRequest struct {
 	// hold. The proxy forwards the header verbatim; the apiserver is
 	// authoritative.
 	BearerTokenPresent bool
+
+	// IsStream is true when the URL shape itself indicates a streaming
+	// subresource (exec / attach / portforward) OR ?watch=true /
+	// ?follow=true is set. URL-derived; the proxy may also set this
+	// via the Upgrade header (see proxy.classifyStream). Closes UAT-K2
+	// HIGH-K2-05: the URL parser was the only layer that could decide
+	// this for exec/attach/portforward when a client didn't send an
+	// Upgrade header on the initial request.
+	IsStream bool
+
+	// StreamKind names the streaming type the URL implies. One of:
+	// "watch", "exec", "attach", "portforward", "log", or "" (none).
+	// Mirrors proxy.StreamKind but is URL-derived rather than header-
+	// derived. The proxy combines both signals when recording the
+	// audit row.
+	StreamKind string
 }
 
 // ErrMalformedURL is returned by [Parse] when the request URL does not
 // match any known kube-apiserver path shape. The proxy treats this as
 // an unclassifiable call and applies its default policy.
-var ErrMalformedURL = errors.New("kbouncer: malformed kube-apiserver URL")
+var ErrMalformedURL = errors.New("kbounce: malformed kube-apiserver URL")
 
 // Parse builds a [ParsedRequest] from the inbound HTTP request.
 //
@@ -201,6 +217,31 @@ func Parse(r *http.Request) (*ParsedRequest, error) {
 	// Verb inference. If a subresource is present it wins; otherwise
 	// derive from method + whether Name is set.
 	out.Verb = inferVerb(method, out)
+
+	// UAT-K2 HIGH-K2-05: set IsStream + StreamKind based on URL shape.
+	// The proxy will also set these via the Upgrade header (see
+	// proxy.classifyStream); URL-level detection is the floor so an
+	// exec/attach/portforward call without an Upgrade header still gets
+	// tagged correctly in the audit log.
+	switch out.Subresource {
+	case "exec", "attach", "portforward":
+		out.IsStream = true
+		out.StreamKind = out.Subresource
+	case "log":
+		// Logs stream when ?follow=true; the apiserver treats unfollow'd
+		// logs as a buffered REST read. Mirror the apiserver's behavior.
+		if isTruthy(q.Get("follow")) {
+			out.IsStream = true
+			out.StreamKind = "log"
+		}
+	}
+	if out.IsWatch {
+		out.IsStream = true
+		if out.StreamKind == "" {
+			out.StreamKind = "watch"
+		}
+	}
+
 	return out, nil
 }
 

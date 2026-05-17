@@ -11,9 +11,11 @@ import (
 )
 
 // TestDefaultProfilesLoad makes sure the embedded YAML parses cleanly
-// AND that every documented default profile is present. If someone
-// renames a default profile in defaults.yaml without updating callers,
-// this test will catch it.
+// AND that the documented default profiles are present. The 2026-05-17
+// default-profile reshape ([[bounce-default-profile-pattern]]) reduced
+// embedded defaults to TWO: full-user (passthrough) + readonly (write/
+// destructive-verb deny). Other profiles ship in community-profiles/
+// and install via `kbounce profile install --from URL`.
 func TestDefaultProfilesLoad(t *testing.T) {
 	ps, err := LoadProfiles("") // empty path → embedded defaults
 	require.NoError(t, err)
@@ -21,22 +23,42 @@ func TestDefaultProfilesLoad(t *testing.T) {
 	assert.Empty(t, ps.Path, "loading defaults should leave Path empty")
 
 	for _, want := range []string{
-		"staging-work",
-		"prod-readonly",
-		"sandbox",
-		"incident-response",
-		"none",
+		"full-user",
+		"readonly",
 	} {
 		p, err := ps.Active(want)
 		require.NoError(t, err, "default %q must be present", want)
 		assert.Equal(t, want, p.Name)
 	}
 
-	// `none` profile must abstain on any request.
-	p, err := ps.Active("none")
+	// `full-user` profile must abstain on any request.
+	p, err := ps.Active("full-user")
 	require.NoError(t, err)
 	v := p.Evaluate(&ParsedRequest{Verb: "delete", Namespace: "prod", ResourceName: "prod-pod"})
-	assert.False(t, v.Denied, "none profile must always abstain")
+	assert.False(t, v.Denied, "full-user profile must always abstain")
+
+	// `readonly` profile must deny destructive verbs.
+	p, err = ps.Active("readonly")
+	require.NoError(t, err)
+	v = p.Evaluate(&ParsedRequest{Verb: "delete"})
+	assert.True(t, v.Denied, "readonly profile must deny destructive verbs")
+}
+
+// TestDefaultProfiles_LegacyAliasesResolve pins the backward-compat
+// alias map: lookups for the legacy names "none" / "prod-readonly"
+// resolve to "full-user" / "readonly" with a deprecation warning.
+// Removes in v1.1. See [[bounce-suite-rename]].
+func TestDefaultProfiles_LegacyAliasesResolve(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+
+	p, err := ps.Active("none")
+	require.NoError(t, err, "legacy alias 'none' must resolve to 'full-user'")
+	assert.Equal(t, FullUserProfileName, p.Name)
+
+	p, err = ps.Active("prod-readonly")
+	require.NoError(t, err, "legacy alias 'prod-readonly' must resolve to 'readonly'")
+	assert.Equal(t, ReadonlyProfileName, p.Name)
 }
 
 func TestLoadProfilesFromDisk_RoundTrip(t *testing.T) {
@@ -60,9 +82,9 @@ func TestLoadProfilesFromDisk_RoundTrip(t *testing.T) {
 	ps, err := LoadProfiles(path)
 	require.NoError(t, err)
 	assert.Equal(t, path, ps.Path)
-	// All five defaults must round-trip.
+	// Both embedded defaults must round-trip.
 	for _, want := range []string{
-		"staging-work", "prod-readonly", "sandbox", "incident-response", "none",
+		"full-user", "readonly",
 	} {
 		_, err := ps.Active(want)
 		assert.NoError(t, err, "profile %q missing after disk round-trip", want)
@@ -78,13 +100,13 @@ func TestActive_UnknownProfileErrors(t *testing.T) {
 		"unknown profile must surface ErrUnknownProfile (not silent fallback)")
 }
 
-func TestActive_EmptyNameReturnsNoneProfile(t *testing.T) {
+func TestActive_EmptyNameReturnsFullUserProfile(t *testing.T) {
 	ps, err := LoadProfiles("")
 	require.NoError(t, err)
 	p, err := ps.Active("")
 	require.NoError(t, err)
-	assert.Equal(t, NoneProfileName, p.Name,
-		"empty name resolves to 'none' so the proxy always has a profile to call")
+	assert.Equal(t, FullUserProfileName, p.Name,
+		"empty name resolves to 'full-user' so the proxy always has a profile to call")
 }
 
 func TestNamesSorted(t *testing.T) {
@@ -133,7 +155,7 @@ func TestLoadProfiles_MissingFilePathFallsBackToDefaults(t *testing.T) {
 	// run.
 	ps, err := LoadProfiles(filepath.Join(t.TempDir(), "nothing-here.yaml"))
 	require.NoError(t, err)
-	_, err = ps.Active("staging-work")
+	_, err = ps.Active("readonly")
 	require.NoError(t, err)
 }
 
@@ -322,17 +344,17 @@ func TestEvaluate_CompositionOrder_KeywordsBeforeVerbs(t *testing.T) {
 	assert.Contains(t, v.Reason, "keyword", "keyword deny must win when both would fire")
 }
 
-func TestEvaluate_NoneProfileAbstains(t *testing.T) {
-	// The "none" profile, even if someone configures it with denies in
-	// YAML (which would be a misconfig), is treated as an abstain by
+func TestEvaluate_FullUserProfileAbstains(t *testing.T) {
+	// The "full-user" profile, even if someone configures it with denies
+	// in YAML (which would be a misconfig), is treated as an abstain by
 	// name. Defends against typos that re-enable an unconfigured profile.
 	p := &Profile{
-		Name:         NoneProfileName,
+		Name:         FullUserProfileName,
 		DenyVerbs:    []string{"delete"},
 		DenyKeywords: []string{"prod"},
 	}
 	v := p.Evaluate(&ParsedRequest{Verb: "delete", Namespace: "prod"})
-	assert.False(t, v.Denied, "name 'none' is a sentinel for abstain")
+	assert.False(t, v.Denied, "name 'full-user' is a sentinel for abstain")
 }
 
 func TestEvaluate_NilProfileSafe(t *testing.T) {

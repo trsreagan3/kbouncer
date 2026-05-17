@@ -15,7 +15,7 @@
 // task-deny + global-deny both block; global-allow that wasn't declared
 // in task-allow still goes through (so infrastructure calls keep
 // working). See the proxy package's composition-order doc.
-package main
+package cli
 
 import (
 	"encoding/json"
@@ -38,11 +38,11 @@ func newTasksCmd() *cobra.Command {
 		Short: "Open / inspect / close per-task scopes",
 		Long: `Open / inspect / close per-task scopes.
 
-A task narrows kbouncer's behavior for its duration. Use this when an
+A task narrows kbounce's behavior for its duration. Use this when an
 agent (or you) is doing a discrete task that should be tightly scoped,
 e.g. "investigate prod alert", "rotate staging cert". The agent declares
 allow rules (what the task needs) + deny rules (what the task must not
-touch); kbouncer enforces the scope until the task ends or its TTL
+touch); kbounce enforces the scope until the task ends or its TTL
 expires.
 
 Rule shorthand: 'pattern[@namespace_scope][#resource_scope]'.
@@ -50,7 +50,10 @@ Examples:
   pods:get,pods:list             — collection allow shorthand
   pods:*@prod-billing            — pods:* scoped to namespace prod-billing
   *:delete*                      — cross-resource delete deny`,
+		Args: cobra.NoArgs,
 	}
+	// UAT-K2 BLOCKER-K2-02: reject unknown sub-subcommands.
+	cmd.RunE = parentRequiresSubcommand("tasks", cmd)
 	cmd.AddCommand(newTasksStartCmd())
 	cmd.AddCommand(newTasksActiveCmd())
 	cmd.AddCommand(newTasksEndCmd())
@@ -76,8 +79,20 @@ func newTasksStartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			allowRules := tasks.ParseShorthandList(allowCSV)
-			denyRules := tasks.ParseShorthandList(denyCSV)
+			// UAT-K2 HIGH-K2-01: use the strict shorthand parser so
+			// malformed @ns=value scopes are surfaced as errors at
+			// task-start time rather than silently producing a never-
+			// matching rule.
+			allowRules, err := tasks.ParseShorthandListStrict(allowCSV)
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "rejected --allow: %v\n", err)
+				os.Exit(2)
+			}
+			denyRules, err := tasks.ParseShorthandListStrict(denyCSV)
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "rejected --deny: %v\n", err)
+				os.Exit(2)
+			}
 
 			scope, err := tasks.BuildScope(
 				description, allowRules, denyRules,

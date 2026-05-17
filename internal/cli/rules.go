@@ -15,7 +15,7 @@
 // Per [[scorer-is-ground-truth]] precedent: rule matching is
 // deterministic. No LLM in this path. Predictable behavior is the
 // whole point of a gate.
-package main
+package cli
 
 import (
 	"encoding/json"
@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -34,9 +35,9 @@ import (
 func newRulesCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rules",
-		Short: "Manage kbouncer global rules (allow / deny + namespace / resource scoping)",
-		Long: `Manage the global rule table kbouncer's proxy consults between the
-profile-deny hard floor (K-Slice 7) and the default-policy fallthrough.
+		Short: "Manage kbounce global rules (allow / deny + namespace / resource scoping)",
+		Long: `Manage the global rule table kbounce's proxy consults between the
+profile-deny hard floor and the default-policy fallthrough.
 
 Pattern shape: 'resource:verb_glob'. Examples:
   pods:create        — exact pods+create
@@ -48,7 +49,10 @@ Pattern shape: 'resource:verb_glob'. Examples:
 
 Verb_glob supports '*' and '?'. Resource half may be '*' or a bare
 plural ('pods', 'deployments', ...).`,
+		Args: cobra.NoArgs,
 	}
+	// UAT-K2 BLOCKER-K2-02: reject unknown sub-subcommands.
+	cmd.RunE = parentRequiresSubcommand("rules", cmd)
 	cmd.AddCommand(newRulesAddCmd())
 	cmd.AddCommand(newRulesListCmd())
 	cmd.AddCommand(newRulesRemoveCmd())
@@ -90,7 +94,12 @@ func newRulesAddCmd() *cobra.Command {
 			id, err := st.AddRule(r)
 			if err != nil {
 				if errors.Is(err, store.ErrInvalidRule) {
-					fmt.Fprintf(cmd.ErrOrStderr(), "rejected: %v\n", err)
+					// UAT-K2 MED-K2-01: strip one "kbounce:" prefix layer
+					// so the error doesn't read "rejected: kbounce: invalid
+					// rule: kbounce: invalid rule pattern ...". Both layers
+					// add the prefix; one is sufficient at the CLI surface.
+					msg := strings.TrimPrefix(err.Error(), "kbounce: invalid rule: ")
+					fmt.Fprintf(cmd.ErrOrStderr(), "rejected: %s\n", msg)
 					os.Exit(2)
 				}
 				return err

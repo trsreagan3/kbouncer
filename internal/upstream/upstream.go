@@ -50,7 +50,7 @@ import (
 // path could be resolved into a usable apiserver URL. Surfaced as a
 // startup error in the CLI so operators learn at boot — not when the
 // first kubectl call lands.
-var ErrNoUpstream = errors.New("kbouncer: no upstream apiserver URL resolved " +
+var ErrNoUpstream = errors.New("kbounce: no upstream apiserver URL resolved " +
 	"(pass --upstream or set KUBECONFIG / ~/.kube/config)")
 
 // Options carries the inputs Resolve consumes. Built from CLI flags so
@@ -168,16 +168,16 @@ func Resolve(opts Options) (*Upstream, error) {
 
 	parsed, err := url.Parse(urlStr)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: parse upstream URL %q: %w", urlStr, err)
+		return nil, fmt.Errorf("kbounce: parse upstream URL %q: %w", urlStr, err)
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("kbouncer: upstream URL %q missing scheme or host", urlStr)
+		return nil, fmt.Errorf("kbounce: upstream URL %q missing scheme or host", urlStr)
 	}
 	// Reject anything other than http/https — kbouncer is an HTTP proxy
 	// and won't speak unix-domain-socket apiservers (KIND, etc) in this
 	// slice. Documented limitation.
 	if s := strings.ToLower(parsed.Scheme); s != "http" && s != "https" {
-		return nil, fmt.Errorf("kbouncer: upstream URL scheme %q not supported (want http or https)", parsed.Scheme)
+		return nil, fmt.Errorf("kbounce: upstream URL scheme %q not supported (want http or https)", parsed.Scheme)
 	}
 
 	tlsCfg, err := buildTLSConfig(restCfg, opts.InsecureSkipTLSVerify, parsed)
@@ -324,7 +324,7 @@ func buildTLSConfig(restCfg *rest.Config, insecure bool, parsed *url.URL) (*tls.
 	if len(caBytes) > 0 {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(caBytes) {
-			return nil, errors.New("kbouncer: kubeconfig CA bundle is not valid PEM")
+			return nil, errors.New("kbounce: kubeconfig CA bundle is not valid PEM")
 		}
 		tlsCfg.RootCAs = pool
 	}

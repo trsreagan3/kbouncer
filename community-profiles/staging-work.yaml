@@ -1,0 +1,30 @@
+# Community profile: staging-work
+#
+# Block anything that looks like prod while working on staging. Keyword
+# match on prod/production/uat/live/customer against namespace + resource
+# name. Word-boundary by default so "productivity" isn't a false positive.
+#
+# Install with:
+#   kbounce profile install --from <URL-to-this-file>
+# Or copy/paste into your ~/.kbounce/profiles.yaml.
+profiles:
+  staging-work:
+    description: "Working on staging; block anything that looks like prod."
+    deny_keywords:
+      - "prod"
+      - "production"
+      - "uat"
+      - "live"
+      - "customer"
+    keyword_targets:
+      - resource_name
+      - namespace
+    keyword_match: word_boundary
+    # only_clusters can hard-restrict this profile to specific clusters.
+    # Uncomment + edit when you've named your staging cluster:
+    # only_clusters: ["staging-cluster"]
+    exceptions:
+      # Example exception: a team whose name happens to contain a denied
+      # keyword. Adjust to your org. Exceptions match as substrings
+      # (case-insensitive) so partial names work.
+      - "eng-productivity-tooling"

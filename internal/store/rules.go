@@ -27,7 +27,7 @@ import (
 // validation. Mirrors the Python InvalidRuleError so a typo'd pattern
 // surfaces at insert time, NOT at decision time (where a never-matching
 // rule would silently confuse the operator).
-var ErrInvalidRule = errors.New("kbouncer: invalid rule")
+var ErrInvalidRule = errors.New("kbounce: invalid rule")
 
 // AddRule persists a rule + returns its row id. Rejects malformed
 // patterns / effects via ErrInvalidRule wrapping.
@@ -56,11 +56,11 @@ func (s *Store) AddRule(r rules.ProxyRule) (rules.ID, error) {
 		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: add rule: %w", err)
+		return 0, fmt.Errorf("kbounce: add rule: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: add rule last insert id: %w", err)
+		return 0, fmt.Errorf("kbounce: add rule last insert id: %w", err)
 	}
 	return rules.ID(id), nil
 }
@@ -76,7 +76,7 @@ func (s *Store) ListRules() ([]rules.StoredRule, error) {
 		        COALESCE(verb_scope, ''), COALESCE(note, ''), COALESCE(origin, 'user')
 		 FROM rules ORDER BY id`)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: list rules: %w", err)
+		return nil, fmt.Errorf("kbounce: list rules: %w", err)
 	}
 	defer rs.Close()
 	out := make([]rules.StoredRule, 0, 16)
@@ -88,7 +88,7 @@ func (s *Store) ListRules() ([]rules.StoredRule, error) {
 		)
 		if err := rs.Scan(&id, &r.Pattern, &effect, &r.NamespaceScope,
 			&r.ResourceScope, &r.VerbScope, &r.Note, &r.Origin); err != nil {
-			return nil, fmt.Errorf("kbouncer: list rules scan: %w", err)
+			return nil, fmt.Errorf("kbounce: list rules scan: %w", err)
 		}
 		eff := rules.Effect(effect)
 		if !eff.IsValid() {
@@ -101,7 +101,7 @@ func (s *Store) ListRules() ([]rules.StoredRule, error) {
 		out = append(out, rules.StoredRule{ID: rules.ID(id), Rule: r})
 	}
 	if err := rs.Err(); err != nil {
-		return nil, fmt.Errorf("kbouncer: list rules iterate: %w", err)
+		return nil, fmt.Errorf("kbounce: list rules iterate: %w", err)
 	}
 	return out, nil
 }
@@ -123,7 +123,7 @@ func (s *Store) GetRule(id rules.ID) (*rules.ProxyRule, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: get rule: %w", err)
+		return nil, fmt.Errorf("kbounce: get rule: %w", err)
 	}
 	r.Effect = rules.Effect(effect)
 	return &r, nil
@@ -134,11 +134,11 @@ func (s *Store) GetRule(id rules.ID) (*rules.ProxyRule, error) {
 func (s *Store) RemoveRule(id rules.ID) (bool, error) {
 	res, err := s.db.Exec(`DELETE FROM rules WHERE id = ?`, int64(id))
 	if err != nil {
-		return false, fmt.Errorf("kbouncer: remove rule: %w", err)
+		return false, fmt.Errorf("kbounce: remove rule: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("kbouncer: remove rule rows affected: %w", err)
+		return false, fmt.Errorf("kbounce: remove rule rows affected: %w", err)
 	}
 	return n > 0, nil
 }
@@ -169,7 +169,7 @@ func (s *Store) LoadRuleSet() (*rules.RuleSet, error) {
 // already active for the same owner. Caller decides whether to end the
 // existing task first or surface the conflict to the agent. Mirrors
 // the Python ActiveTaskExistsError.
-var ErrActiveTaskExists = errors.New("kbouncer: another task is already active")
+var ErrActiveTaskExists = errors.New("kbounce: another task is already active")
 
 // AddTask persists a new task scope as ACTIVE. Enforces the single-
 // active-per-owner invariant: a same-owner active task causes
@@ -183,10 +183,10 @@ var ErrActiveTaskExists = errors.New("kbouncer: another task is already active")
 // daemon, wrap both in BEGIN IMMEDIATE.
 func (s *Store) AddTask(sc *tasks.Scope) error {
 	if sc == nil {
-		return errors.New("kbouncer: AddTask: nil scope")
+		return errors.New("kbounce: AddTask: nil scope")
 	}
 	if sc.TaskID == "" || sc.Description == "" {
-		return errors.New("kbouncer: AddTask: scope missing required fields")
+		return errors.New("kbounce: AddTask: scope missing required fields")
 	}
 	// Check single-active-per-owner.
 	var existing string
@@ -197,18 +197,18 @@ func (s *Store) AddTask(sc *tasks.Scope) error {
 	case errors.Is(err, sql.ErrNoRows):
 		// OK; proceed.
 	case err != nil:
-		return fmt.Errorf("kbouncer: active-task check: %w", err)
+		return fmt.Errorf("kbounce: active-task check: %w", err)
 	default:
 		return fmt.Errorf("%w: %s (owner=%q)", ErrActiveTaskExists, existing, sc.Owner)
 	}
 
 	allowJSON, err := rulesToJSON(sc.AllowRules)
 	if err != nil {
-		return fmt.Errorf("kbouncer: encode allow rules: %w", err)
+		return fmt.Errorf("kbounce: encode allow rules: %w", err)
 	}
 	denyJSON, err := rulesToJSON(sc.DenyRules)
 	if err != nil {
-		return fmt.Errorf("kbouncer: encode deny rules: %w", err)
+		return fmt.Errorf("kbounce: encode deny rules: %w", err)
 	}
 
 	_, err = s.db.Exec(
@@ -223,7 +223,7 @@ func (s *Store) AddTask(sc *tasks.Scope) error {
 		nullableString(sc.EndReason), nullableString(sc.Owner),
 	)
 	if err != nil {
-		return fmt.Errorf("kbouncer: insert task: %w", err)
+		return fmt.Errorf("kbounce: insert task: %w", err)
 	}
 	return nil
 }
@@ -260,7 +260,7 @@ func (s *Store) GetActiveTask(owner string) (*tasks.Scope, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: get active task: %w", err)
+		return nil, fmt.Errorf("kbounce: get active task: %w", err)
 	}
 	if sc.IsExpired(time.Now().UTC()) {
 		// Auto-expire + log; return nil to the caller.
@@ -287,7 +287,7 @@ func (s *Store) GetTask(taskID string) (*tasks.Scope, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: get task: %w", err)
+		return nil, fmt.Errorf("kbounce: get task: %w", err)
 	}
 	return sc, nil
 }
@@ -319,19 +319,19 @@ func (s *Store) ListTasks(statusFilter string, limit int) ([]*tasks.Scope, error
 
 	rs, err := s.db.Query(query, params...)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: list tasks: %w", err)
+		return nil, fmt.Errorf("kbounce: list tasks: %w", err)
 	}
 	defer rs.Close()
 	out := make([]*tasks.Scope, 0, limit)
 	for rs.Next() {
 		sc, err := scanTaskRow(rs)
 		if err != nil {
-			return nil, fmt.Errorf("kbouncer: list tasks scan: %w", err)
+			return nil, fmt.Errorf("kbounce: list tasks scan: %w", err)
 		}
 		out = append(out, sc)
 	}
 	if err := rs.Err(); err != nil {
-		return nil, fmt.Errorf("kbouncer: list tasks iterate: %w", err)
+		return nil, fmt.Errorf("kbounce: list tasks iterate: %w", err)
 	}
 	return out, nil
 }
@@ -342,7 +342,7 @@ func (s *Store) ListTasks(statusFilter string, limit int) ([]*tasks.Scope, error
 // the CLI/MCP `tasks end` path passes status=StatusCompleted.
 func (s *Store) EndTask(taskID, actor, endReason string, status tasks.Status) (bool, error) {
 	if !status.IsValid() || status == tasks.StatusActive {
-		return false, fmt.Errorf("kbouncer: EndTask: invalid status %q", status)
+		return false, fmt.Errorf("kbounce: EndTask: invalid status %q", status)
 	}
 	endedAt := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	res, err := s.db.Exec(
@@ -351,11 +351,11 @@ func (s *Store) EndTask(taskID, actor, endReason string, status tasks.Status) (b
 		string(status), endedAt, actor, endReason, taskID,
 	)
 	if err != nil {
-		return false, fmt.Errorf("kbouncer: end task: %w", err)
+		return false, fmt.Errorf("kbounce: end task: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("kbouncer: end task rows affected: %w", err)
+		return false, fmt.Errorf("kbounce: end task rows affected: %w", err)
 	}
 	return n > 0, nil
 }
@@ -402,7 +402,7 @@ func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
 		`SELECT at, decision_verdict, parsed_verb, parsed_resource, parsed_name, decision_reason
 		 FROM decisions WHERE task_id = ? ORDER BY id`, taskID)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: task review decisions: %w", err)
+		return nil, fmt.Errorf("kbounce: task review decisions: %w", err)
 	}
 	defer rs.Close()
 	out := &TaskReview{
@@ -419,7 +419,7 @@ func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
 	for rs.Next() {
 		var at, verdict, verb, resource, name, reason string
 		if err := rs.Scan(&at, &verdict, &verb, &resource, &name, &reason); err != nil {
-			return nil, fmt.Errorf("kbouncer: task review scan: %w", err)
+			return nil, fmt.Errorf("kbounce: task review scan: %w", err)
 		}
 		out.DecisionCount++
 		if out.FirstDecisionAt == "" {
@@ -437,7 +437,7 @@ func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
 		}
 	}
 	if err := rs.Err(); err != nil {
-		return nil, fmt.Errorf("kbouncer: task review iterate: %w", err)
+		return nil, fmt.Errorf("kbounce: task review iterate: %w", err)
 	}
 	// Cap at 1000 entries per the Python WB27 MED-27-01 bound.
 	if len(denied) > 1000 {
@@ -469,11 +469,11 @@ func scanTaskRow(sc scanner) (*tasks.Scope, error) {
 	}
 	allow, derr := jsonToRules(allowJSON, rules.EffectAllow)
 	if derr != nil {
-		return nil, fmt.Errorf("kbouncer: decode allow rules: %w", derr)
+		return nil, fmt.Errorf("kbounce: decode allow rules: %w", derr)
 	}
 	deny, derr := jsonToRules(denyJSON, rules.EffectDeny)
 	if derr != nil {
-		return nil, fmt.Errorf("kbouncer: decode deny rules: %w", derr)
+		return nil, fmt.Errorf("kbounce: decode deny rules: %w", derr)
 	}
 	return &tasks.Scope{
 		TaskID:      taskID,

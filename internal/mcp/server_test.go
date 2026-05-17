@@ -130,10 +130,10 @@ func TestActiveMode_ReflectsConfig(t *testing.T) {
 	assert.Equal(t, "deny", got["default_policy"])
 }
 
-func TestActiveProfile_NoneWhenUnset(t *testing.T) {
+func TestActiveProfile_FullUserWhenUnset(t *testing.T) {
 	srv := NewServer(Config{})
 	got := callTool(t, srv, "kbounce_active_profile", nil)
-	assert.Equal(t, profile.NoneProfileName, got["name"])
+	assert.Equal(t, profile.FullUserProfileName, got["name"])
 }
 
 func TestActiveProfile_ReturnsLiveProfile(t *testing.T) {

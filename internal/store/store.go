@@ -59,7 +59,7 @@ func DefaultDBPath() (string, error) {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("kbouncer: resolve home dir: %w", err)
+		return "", fmt.Errorf("kbounce: resolve home dir: %w", err)
 	}
 	return filepath.Join(home, ".kbouncer", "state.db"), nil
 }
@@ -86,13 +86,13 @@ func Open(path string) (*Store, error) {
 	// shared-machine user can't read another user's decision history.
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, fmt.Errorf("kbouncer: mkdir %q: %w", dir, err)
+			return nil, fmt.Errorf("kbounce: mkdir %q: %w", dir, err)
 		}
 	}
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: sql.Open: %w", err)
+		return nil, fmt.Errorf("kbounce: sql.Open: %w", err)
 	}
 	// modernc sqlite supports only one writer at a time per file; a
 	// small connection cap keeps contention predictable and matches the
@@ -239,7 +239,7 @@ func (s *Store) migrate() error {
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
-			return fmt.Errorf("kbouncer: migrate: %w (stmt=%q)", err, q)
+			return fmt.Errorf("kbounce: migrate: %w (stmt=%q)", err, q)
 		}
 	}
 
@@ -262,7 +262,7 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_decisions_pause_id ON decisions(pause_id)`); err != nil {
-		return fmt.Errorf("kbouncer: create idx_decisions_pause_id: %w", err)
+		return fmt.Errorf("kbounce: create idx_decisions_pause_id: %w", err)
 	}
 
 	// v5 additive migration (K-Slice 5): mark streaming decisions so
@@ -287,14 +287,14 @@ func (s *Store) migrate() error {
 	switch err := row.Scan(&ver); {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := s.db.Exec(`INSERT INTO schema_version(version) VALUES (?)`, SchemaVersion); err != nil {
-			return fmt.Errorf("kbouncer: stamp schema_version: %w", err)
+			return fmt.Errorf("kbounce: stamp schema_version: %w", err)
 		}
 	case err != nil:
-		return fmt.Errorf("kbouncer: read schema_version: %w", err)
+		return fmt.Errorf("kbounce: read schema_version: %w", err)
 	default:
 		if ver < SchemaVersion {
 			if _, err := s.db.Exec(`UPDATE schema_version SET version = ?`, SchemaVersion); err != nil {
-				return fmt.Errorf("kbouncer: bump schema_version: %w", err)
+				return fmt.Errorf("kbounce: bump schema_version: %w", err)
 			}
 		}
 	}
@@ -375,11 +375,11 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 		boolToInt(d.IsStream), d.StreamKind,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: record decision: %w", err)
+		return 0, fmt.Errorf("kbounce: record decision: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: last insert id: %w", err)
+		return 0, fmt.Errorf("kbounce: last insert id: %w", err)
 	}
 	return id, nil
 }
@@ -389,7 +389,7 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 func (s *Store) CountDecisions() (int64, error) {
 	var n int64
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM decisions`).Scan(&n); err != nil {
-		return 0, fmt.Errorf("kbouncer: count decisions: %w", err)
+		return 0, fmt.Errorf("kbounce: count decisions: %w", err)
 	}
 	return n, nil
 }
@@ -419,7 +419,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		ORDER BY id DESC
 		LIMIT ?`, limit)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: recent decisions query: %w", err)
+		return nil, fmt.Errorf("kbounce: recent decisions query: %w", err)
 	}
 	defer rows.Close()
 	out := make([]DecisionRow, 0, limit)
@@ -445,7 +445,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&d.DecisionSource, &d.ProfileName, &pauseID,
 			&isStream, &d.StreamKind,
 		); err != nil {
-			return nil, fmt.Errorf("kbouncer: recent decisions scan: %w", err)
+			return nil, fmt.Errorf("kbounce: recent decisions scan: %w", err)
 		}
 		if t, perr := time.Parse("2006-01-02T15:04:05Z", atStr); perr == nil {
 			d.At = t
@@ -468,7 +468,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("kbouncer: recent decisions iterate: %w", err)
+		return nil, fmt.Errorf("kbounce: recent decisions iterate: %w", err)
 	}
 	return out, nil
 }
@@ -479,7 +479,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 func (s *Store) addColumnIfMissing(table, column, decl string) error {
 	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
-		return fmt.Errorf("kbouncer: pragma table_info(%s): %w", table, err)
+		return fmt.Errorf("kbounce: pragma table_info(%s): %w", table, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -492,18 +492,18 @@ func (s *Store) addColumnIfMissing(table, column, decl string) error {
 			pk      int
 		)
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return fmt.Errorf("kbouncer: scan table_info: %w", err)
+			return fmt.Errorf("kbounce: scan table_info: %w", err)
 		}
 		if name == column {
 			return nil // already present
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("kbouncer: rows.Err: %w", err)
+		return fmt.Errorf("kbounce: rows.Err: %w", err)
 	}
 	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)
 	if _, err := s.db.Exec(stmt); err != nil {
-		return fmt.Errorf("kbouncer: add column %s.%s: %w", table, column, err)
+		return fmt.Errorf("kbounce: add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -563,11 +563,11 @@ const MaxPauseDurationSeconds int64 = 24 * 3600
 // MaxPauseDurationSeconds).
 func (s *Store) StartPause(durationSeconds int64, reason, startedBy string) (int64, error) {
 	if durationSeconds <= 0 {
-		return 0, fmt.Errorf("kbouncer: pause duration must be > 0 seconds")
+		return 0, fmt.Errorf("kbounce: pause duration must be > 0 seconds")
 	}
 	if durationSeconds > MaxPauseDurationSeconds {
 		return 0, fmt.Errorf(
-			"kbouncer: pause duration cannot exceed 24h; for longer windows " +
+			"kbounce: pause duration cannot exceed 24h; for longer windows " +
 				"stop the proxy and restart later")
 	}
 	now := time.Now().UTC()
@@ -582,7 +582,7 @@ func (s *Store) StartPause(durationSeconds int64, reason, startedBy string) (int
 	}
 	if active != nil {
 		return 0, fmt.Errorf(
-			"kbouncer: a pause is already active (id=%d, ends_at=%s); "+
+			"kbounce: a pause is already active (id=%d, ends_at=%s); "+
 				"resume first to start a new one",
 			active.ID, active.EndsAt)
 	}
@@ -594,11 +594,11 @@ func (s *Store) StartPause(durationSeconds int64, reason, startedBy string) (int
 		startedBy,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: start pause: %w", err)
+		return 0, fmt.Errorf("kbounce: start pause: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: start pause last insert id: %w", err)
+		return 0, fmt.Errorf("kbounce: start pause last insert id: %w", err)
 	}
 	return id, nil
 }
@@ -625,7 +625,7 @@ func (s *Store) EndPause(endedBy string) (*int64, error) {
 		active.ID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: end pause: %w", err)
+		return nil, fmt.Errorf("kbounce: end pause: %w", err)
 	}
 	// Note: endedBy is recorded by the CLI layer in a future audit-
 	// event table; the pause_events row itself tracks lifecycle, not
@@ -648,7 +648,7 @@ func (s *Store) GetActivePause() (*PauseRow, error) {
 		 WHERE ended_at_actual IS NULL AND ends_at <= ?`,
 		nowStr,
 	); err != nil {
-		return nil, fmt.Errorf("kbouncer: gc expired pauses: %w", err)
+		return nil, fmt.Errorf("kbounce: gc expired pauses: %w", err)
 	}
 	row := s.db.QueryRow(
 		`SELECT id, started_at, ends_at, reason, started_by,
@@ -663,7 +663,7 @@ func (s *Store) GetActivePause() (*PauseRow, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: get active pause: %w", err)
+		return nil, fmt.Errorf("kbounce: get active pause: %w", err)
 	}
 	return &p, nil
 }
@@ -683,19 +683,19 @@ func (s *Store) ListRecentPauses(limit int) ([]PauseRow, error) {
 		 FROM pause_events ORDER BY id DESC LIMIT ?`, limit,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: list pauses: %w", err)
+		return nil, fmt.Errorf("kbounce: list pauses: %w", err)
 	}
 	defer rows.Close()
 	out := make([]PauseRow, 0, limit)
 	for rows.Next() {
 		var p PauseRow
 		if err := rows.Scan(&p.ID, &p.StartedAt, &p.EndsAt, &p.Reason, &p.StartedBy, &p.EndedAtActual, &p.EndKind); err != nil {
-			return nil, fmt.Errorf("kbouncer: list pauses scan: %w", err)
+			return nil, fmt.Errorf("kbounce: list pauses scan: %w", err)
 		}
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("kbouncer: list pauses iterate: %w", err)
+		return nil, fmt.Errorf("kbounce: list pauses iterate: %w", err)
 	}
 	return out, nil
 }
@@ -755,7 +755,7 @@ func (s *Store) AddPendingPrompt(p PromptInput) (int64, error) {
 	if err := row.Scan(&prior); err == nil {
 		return prior, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("kbouncer: lookup pending prompt: %w", err)
+		return 0, fmt.Errorf("kbounce: lookup pending prompt: %w", err)
 	}
 	res, err := s.db.Exec(
 		`INSERT INTO pending_prompts(
@@ -767,11 +767,11 @@ func (s *Store) AddPendingPrompt(p PromptInput) (int64, error) {
 		p.Namespace, p.Name, p.DenyReason,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: add pending prompt: %w", err)
+		return 0, fmt.Errorf("kbounce: add pending prompt: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("kbouncer: add pending prompt last insert id: %w", err)
+		return 0, fmt.Errorf("kbounce: add pending prompt last insert id: %w", err)
 	}
 	return id, nil
 }
@@ -806,7 +806,7 @@ func (s *Store) ListPendingPrompts(status string, limit int) ([]PromptRow, error
 		 ORDER BY id DESC LIMIT ?`, status, limit,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: list pending prompts: %w", err)
+		return nil, fmt.Errorf("kbounce: list pending prompts: %w", err)
 	}
 	defer rows.Close()
 	out := make([]PromptRow, 0, limit)
@@ -817,12 +817,12 @@ func (s *Store) ListPendingPrompts(status string, limit int) ([]PromptRow, error
 			&p.Resource, &p.Namespace, &p.Name, &p.DenyReason, &p.Status,
 			&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
 		); err != nil {
-			return nil, fmt.Errorf("kbouncer: list pending prompts scan: %w", err)
+			return nil, fmt.Errorf("kbounce: list pending prompts scan: %w", err)
 		}
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("kbouncer: list pending prompts iterate: %w", err)
+		return nil, fmt.Errorf("kbounce: list pending prompts iterate: %w", err)
 	}
 	return out, nil
 }
@@ -847,7 +847,7 @@ func (s *Store) GetPendingPrompt(id int64) (*PromptRow, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: get pending prompt: %w", err)
+		return nil, fmt.Errorf("kbounce: get pending prompt: %w", err)
 	}
 	return &p, nil
 }
@@ -876,7 +876,7 @@ func (s *Store) AnswerPendingPrompt(id int64, kind, target, answeredBy string) (
 		// ok
 	default:
 		return false, fmt.Errorf(
-			"kbouncer: answer_kind must be one of: always, profile, ignore (got %q)",
+			"kbounce: answer_kind must be one of: always, profile, ignore (got %q)",
 			kind)
 	}
 	res, err := s.db.Exec(
@@ -888,11 +888,11 @@ func (s *Store) AnswerPendingPrompt(id int64, kind, target, answeredBy string) (
 		id,
 	)
 	if err != nil {
-		return false, fmt.Errorf("kbouncer: answer pending prompt: %w", err)
+		return false, fmt.Errorf("kbounce: answer pending prompt: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("kbouncer: answer pending prompt rows affected: %w", err)
+		return false, fmt.Errorf("kbounce: answer pending prompt rows affected: %w", err)
 	}
 	return n > 0, nil
 }

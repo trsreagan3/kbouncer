@@ -3,7 +3,7 @@
 // Symmetric to the Python tests/bouncer/test_pause_for.py::
 // test_parse_duration_* cases — keeps suffix-based input shape stable
 // across both products.
-package main
+package cli
 
 import (
 	"testing"

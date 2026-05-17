@@ -578,32 +578,32 @@ func writeInstalledProfiles(path string, profiles []*Profile, _ []string) error 
 // by-value ergonomics can do `UpsertProfile(&Profile{...}, path)`.
 func UpsertProfile(p *Profile, path string) error {
 	if p == nil || p.Name == "" {
-		return errors.New("kbouncer: UpsertProfile: Name is required")
+		return errors.New("kbounce: UpsertProfile: Name is required")
 	}
 	resolved := path
 	if resolved == "" {
 		rp, err := DefaultProfilesPath()
 		if err != nil {
-			return fmt.Errorf("kbouncer: resolve profiles path: %w", err)
+			return fmt.Errorf("kbounce: resolve profiles path: %w", err)
 		}
 		resolved = rp
 	}
 	if dir := filepath.Dir(resolved); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("kbouncer: mkdir %q: %w", dir, err)
+			return fmt.Errorf("kbounce: mkdir %q: %w", dir, err)
 		}
 	}
 
 	merged := profileFile{Profiles: map[string]*Profile{}}
 	if raw, err := os.ReadFile(resolved); err == nil {
 		if err := yaml.Unmarshal(raw, &merged); err != nil {
-			return fmt.Errorf("kbouncer: parse existing profiles yaml: %w", err)
+			return fmt.Errorf("kbounce: parse existing profiles yaml: %w", err)
 		}
 		if merged.Profiles == nil {
 			merged.Profiles = map[string]*Profile{}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("kbouncer: read profiles yaml: %w", err)
+		return fmt.Errorf("kbounce: read profiles yaml: %w", err)
 	}
 
 	// READ-ONLY check: refuse to clobber an org-distributed profile.
@@ -624,7 +624,7 @@ func UpsertProfile(p *Profile, path string) error {
 func upsertProfileClean(path string, p *Profile, merged *profileFile) error {
 	name := p.Name
 	if name == "" {
-		return errors.New("kbouncer: UpsertProfile: Name is required")
+		return errors.New("kbounce: UpsertProfile: Name is required")
 	}
 	if merged.Profiles == nil {
 		merged.Profiles = map[string]*Profile{}
@@ -637,27 +637,27 @@ func upsertProfileClean(path string, p *Profile, merged *profileFile) error {
 
 	out, err := yaml.Marshal(merged)
 	if err != nil {
-		return fmt.Errorf("kbouncer: encode profiles yaml: %w", err)
+		return fmt.Errorf("kbounce: encode profiles yaml: %w", err)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".profiles-*.yaml.tmp")
 	if err != nil {
-		return fmt.Errorf("kbouncer: create temp file: %w", err)
+		return fmt.Errorf("kbounce: create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := tmp.Write(out); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("kbouncer: write temp file: %w", err)
+		return fmt.Errorf("kbounce: write temp file: %w", err)
 	}
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("kbouncer: chmod temp file: %w", err)
+		return fmt.Errorf("kbounce: chmod temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("kbouncer: close temp file: %w", err)
+		return fmt.Errorf("kbounce: close temp file: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("kbouncer: rename into place: %w", err)
+		return fmt.Errorf("kbounce: rename into place: %w", err)
 	}
 	return nil
 }

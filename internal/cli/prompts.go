@@ -32,7 +32,7 @@
 //	          are read-only at this CLI surface per [[enterprise-
 //	          profile-distribution]])
 //	ignore  → mark answered with no side effect
-package main
+package cli
 
 import (
 	"encoding/json"
@@ -58,7 +58,10 @@ DENY also writes a row here so the operator can later answer
 (always-allow / add-to-profile / ignore). The agent has already
 been denied by the time the prompt appears — answers take effect
 on the NEXT call of the same shape.`,
+		Args: cobra.NoArgs,
 	}
+	// UAT-K2 BLOCKER-K2-02: reject unknown sub-subcommands.
+	cmd.RunE = parentRequiresSubcommand("prompts", cmd)
 	cmd.AddCommand(newPromptsListCmd())
 	cmd.AddCommand(newPromptsShowCmd())
 	cmd.AddCommand(newPromptsAnswerCmd())

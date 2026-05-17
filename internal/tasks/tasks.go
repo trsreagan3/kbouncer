@@ -42,11 +42,22 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/trsreagan3/kbouncer/internal/rules"
 )
+
+// shorthandScopeRe enforces that the namespace and resource scope
+// segments of a task shorthand match the K8s-name-ish charset:
+// lowercase letters, digits, hyphens, and the glob metachars `*` / `?`.
+// Closes UAT-K2 HIGH-K2-01: the prior parser silently accepted
+// `@ns=value` (user habit from kubectl) which produced a rule with
+// NamespaceScope="ns=value" — never matched anything, the operator
+// thought they had a guardrail, they didn't. Reject hard with a
+// pointer at the correct shape.
+var shorthandScopeRe = regexp.MustCompile(`^[a-z0-9*?-]+$`)
 
 // Status is the lifecycle state of a task scope.
 type Status string
@@ -160,7 +171,7 @@ type ValidationError struct {
 	Reason string
 }
 
-func (e *ValidationError) Error() string { return "kbouncer: " + e.Reason }
+func (e *ValidationError) Error() string { return "kbounce: " + e.Reason }
 
 // BuildScope is the validating constructor used by the CLI + (later)
 // MCP. Mirrors the Python build_task_scope semantics.
@@ -230,7 +241,7 @@ func BuildScope(
 	now := time.Now().UTC()
 	taskID, err := randomTaskID()
 	if err != nil {
-		return nil, fmt.Errorf("kbouncer: generate task id: %w", err)
+		return nil, fmt.Errorf("kbounce: generate task id: %w", err)
 	}
 	return &Scope{
 		TaskID:      taskID,
@@ -263,7 +274,11 @@ func coerceRules(in []rules.ProxyRule, effect rules.Effect) ([]rules.ProxyRule, 
 	return out, nil
 }
 
-// ParseShorthand parses a CLI rule shorthand into a ProxyRule.
+// ParseShorthand parses a CLI rule shorthand into a ProxyRule. Legacy
+// signature kept for callers that don't care about validation errors;
+// the underlying logic now lives in ParseShorthandStrict, which is the
+// preferred entry point + returns a validation error rather than
+// silently producing a never-matching rule.
 //
 // Shape: `pattern[@namespace_scope][#resource_scope]`. Both scopes
 // optional. Effect is set by the caller (allow / deny list).
@@ -278,6 +293,22 @@ func coerceRules(in []rules.ProxyRule, effect rules.Effect) ([]rules.ProxyRule, 
 // crisp — namespace is the K8s analog of ARN-scope, name is the
 // analog of the resource-half-of-an-ARN).
 func ParseShorthand(s string) rules.ProxyRule {
+	// Best-effort: discard the error so legacy callers keep working.
+	// New callers should use ParseShorthandStrict to surface bad input.
+	r, _ := ParseShorthandStrict(s)
+	return r
+}
+
+// ParseShorthandStrict parses a CLI rule shorthand into a ProxyRule
+// + validates the namespace/resource scope segments. Closes UAT-K2
+// HIGH-K2-01.
+//
+// Returns *ValidationError when the scope contains characters outside
+// the K8s-name-ish charset (lowercase letters, digits, hyphens, and
+// the glob metachars `*` / `?`). The common bad input is
+// `@ns=prod-billing` (user habit from kubectl); the correct shape is
+// `@prod-billing`.
+func ParseShorthandStrict(s string) (rules.ProxyRule, error) {
 	pattern := s
 	var nsScope, resScope string
 	if at := strings.Index(pattern, "@"); at >= 0 {
@@ -293,19 +324,54 @@ func ParseShorthand(s string) rules.ProxyRule {
 		resScope = pattern[hash+1:]
 		pattern = pattern[:hash]
 	}
-	return rules.ProxyRule{
-		Pattern:        strings.TrimSpace(pattern),
-		NamespaceScope: strings.TrimSpace(nsScope),
-		ResourceScope:  strings.TrimSpace(resScope),
-		Origin:         rules.OriginTask,
+	nsScope = strings.TrimSpace(nsScope)
+	resScope = strings.TrimSpace(resScope)
+	pattern = strings.TrimSpace(pattern)
+
+	if nsScope != "" && !shorthandScopeRe.MatchString(nsScope) {
+		return rules.ProxyRule{}, &ValidationError{
+			Reason: fmt.Sprintf(
+				"shorthand %q: namespace scope %q is malformed — "+
+					"use bare names (e.g. `@prod-billing`), not "+
+					"key=value (e.g. `@ns=prod-billing`); allowed "+
+					"chars are [a-z0-9-] plus glob `*` / `?`",
+				s, nsScope),
+		}
 	}
+	if resScope != "" && !shorthandScopeRe.MatchString(resScope) {
+		return rules.ProxyRule{}, &ValidationError{
+			Reason: fmt.Sprintf(
+				"shorthand %q: resource scope %q is malformed — "+
+					"use bare names (e.g. `#api-*`), not "+
+					"key=value (e.g. `#name=api-*`); allowed "+
+					"chars are [a-z0-9-] plus glob `*` / `?`",
+				s, resScope),
+		}
+	}
+
+	return rules.ProxyRule{
+		Pattern:        pattern,
+		NamespaceScope: nsScope,
+		ResourceScope:  resScope,
+		Origin:         rules.OriginTask,
+	}, nil
 }
 
 // ParseShorthandList parses a comma-separated list of shorthand rules.
-// Used by the CLI's --allow / --deny CSV flag form.
+// Used by the CLI's --allow / --deny CSV flag form. Legacy signature;
+// see ParseShorthandListStrict for the error-surfacing variant.
 func ParseShorthandList(csv string) []rules.ProxyRule {
+	out, _ := ParseShorthandListStrict(csv)
+	return out
+}
+
+// ParseShorthandListStrict is the validation-surfacing variant of
+// ParseShorthandList. Returns the first ValidationError encountered;
+// callers that want all errors should iterate manually using
+// ParseShorthandStrict.
+func ParseShorthandListStrict(csv string) ([]rules.ProxyRule, error) {
 	if strings.TrimSpace(csv) == "" {
-		return nil
+		return nil, nil
 	}
 	out := make([]rules.ProxyRule, 0, 4)
 	for _, part := range strings.Split(csv, ",") {
@@ -313,9 +379,13 @@ func ParseShorthandList(csv string) []rules.ProxyRule {
 		if p == "" {
 			continue
 		}
-		out = append(out, ParseShorthand(p))
+		r, err := ParseShorthandStrict(p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
-	return out
+	return out, nil
 }
 
 func formatISO(t time.Time) string {

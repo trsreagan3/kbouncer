@@ -1,200 +1,292 @@
-# kbouncer
+# kbounce
 
 **Local Kubernetes API-call gating proxy.** Sits between your kubectl /
 Helm / coding agent and the real kube-apiserver, parses every request,
-records the decision in an audit log, and (in transparent mode) can
-deny calls that don't match its rule set.
+records the decision in a SQLite audit log, and (in transparent mode)
+can deny calls that don't match its rule set.
 
-`kbouncer` is one of the products in the LLC's suite — the K8s-shaped
-sibling of `iam-jit-bouncer` (the AWS-IAM-shaped local proxy that lives
-in `src/iam_jit/bouncer/` in the same repository). It is **separate**
-from `iam-jit-bouncer`:
+`kbounce` is one product in the Bounce suite — the K8s-shaped sibling
+of `bounce` (the AWS-SDK-shaped local proxy in the `iam-jit` /
+`iam-roles` repo). Both products use the same vocabulary: profiles,
+modes, rules, tasks, prompts, pauses. An operator who learned one
+understands the other.
 
-- Different target audience: K8s platform admins (cloud-agnostic — GKE,
-  AKS, EKS, on-prem) vs the AWS-IAM admins `iam-jit-bouncer` targets.
-- Different threat model: K8s RBAC + OPA already exist as the
-  cluster-side defense. `kbouncer` is local-side defense-in-depth that
-  catches "the cluster boundary is correct, but the call target is
-  wrong" — the prompt-injection + agent-typo failure modes.
-- Different runtime: `kbouncer` is written in Go (the K8s ecosystem's
-  native language) and ships as a single static binary;
-  `iam-jit-bouncer` is Python because it sits inside the larger
-  `iam-jit` Python codebase.
+The binary was renamed from `kbouncer` to `kbounce` in the 2026-05-17
+Bounce-suite rename. The old `kbouncer` binary keeps working for v1.0
+with a one-line deprecation warning + is removed in v1.1.
 
-Same architectural pattern as `iam-jit-bouncer`, intentionally — same
-two-mode model, same audit-store shape, same MCP-tool plans (later
-slice). Cross-product audit-log review will join across both products'
-SQLite databases without translation.
+---
 
-## Two-mode model
+## Quickstart
 
-`kbouncer` runs in one of two modes, picked at startup via `--mode`:
+```sh
+# Build (single static binary).
+go build ./cmd/kbounce
+
+# Default run: cooperative mode, no profile (passthrough), audit-only.
+# Banner reminds you about --profile readonly for the write-blocking layer.
+./kbounce run
+
+# Opt into the readonly safety net:
+./kbounce run --profile readonly
+# Or, persistent for your shell:
+export KBOUNCER_PROFILE=readonly
+./kbounce run
+```
+
+Default port: `8766` (distinct from `bounce`'s `8767` so the two
+products can coexist on the same laptop). Default audit DB: `~/.kbouncer/state.db`.
+
+---
+
+## Operating modes
 
 | Mode | Behavior | Use case |
 | --- | --- | --- |
-| `cooperative` (default) | Parses + logs every call; always forwards (when forwarding lands in K-Slice 2). Verdicts are **advisory**. | Solo dev iterating fast; previewing what transparent mode WOULD block; running with high-trust agents you want auditing on. |
-| `transparent` | `deny` verdicts return **HTTP 403** to the client without forwarding. `allow` verdicts forward unchanged. | Locked-down environments where any K8s call must be gated; running with lower-trust agents; compliance-sensitive deploys. |
+| `cooperative` (default) | Parse + log every call; always forward. Verdicts are advisory. | Solo dev iterating fast; previewing what transparent mode would block. |
+| `transparent` | DENY verdicts return HTTP 403 to the client. ALLOW forwards unchanged. | Locked-down environments; lower-trust agents; compliance deploys. |
 
-Same two-mode taxonomy as `iam-jit-bouncer`, on purpose: operators who
-already understand one product understand the other.
+Switch with `--mode cooperative` or `--mode transparent`.
 
-## Stage shipping plan
+---
 
-`kbouncer` ships in stages so each slice can land + be reviewed
-independently:
+## Profiles (the default-profile reshape)
 
-- **K-Slice 1.** Foundation: HTTP server, kube-apiserver URL parser,
-  SQLite audit store, `kbouncer run` CLI. No upstream forwarding yet —
-  the proxy returns the parsed observation as JSON. Useful as a pure
-  observability tool.
-- **K-Slice 2.** Upstream forwarding to a real kube-apiserver
-  (kubeconfig-aware; TLS to the apiserver; SAR-style preflight optional).
-- **K-Slice 3.** Rule engine + per-task scopes + MCP tools for
-  active-mode declaration.
-- **K-Slice 7 (this build).** Environment profiles — a switchable deny
-  layer that fires BEFORE per-task scopes and global rules. See
-  "Environment profiles" below.
-- **K-Slice 4.** Client-cert handling on the proxy listener (mTLS for
-  kubectl that prefers cert auth).
-- **K-Slice 5.** Streaming subresources: watch / exec / port-forward /
-  attach properly proxied.
-- **K-Slice 6.** Additional MCP tools (recommend-mode, end-task,
-  review) + the agent-friendly intake flow.
-- **Post-v1.0.** Admission-webhook deployment shape for in-cluster
-  installs.
+A **profile** is an environment-aware deny layer that fires BEFORE
+per-task scopes + global rules. A profile deny is a **hard floor** —
+a permissive task scope cannot override it.
 
-## Build + run
+Built-in defaults (only two, intentionally):
 
-```sh
-# Build the single static binary.
-cd kbouncer
-go build ./cmd/kbouncer
+| Profile | What it does |
+| --- | --- |
+| `full-user` | Passthrough; no rules. Calls forwarded as-is + audit-logged. **Default** when `--profile` / `KBOUNCER_PROFILE` is unset. |
+| `readonly` | Blocks write + destructive verbs (`delete`, `patch`, `create`, `update`, `deletecollection`, `exec`, `portforward`, `attach`). General-purpose safety net for any environment. |
 
-# Run the proxy in observation-only mode (default flags).
-./kbouncer run
+Activate with `--profile NAME` or `KBOUNCER_PROFILE=NAME`. When neither
+is set, `kbounce run` prints a one-line banner reminding you you're in
+passthrough mode + the two ways to opt into `readonly`.
 
-# Or with explicit flags:
-./kbouncer run \
-  --port 8766 \
-  --host 127.0.0.1 \
-  --mode cooperative \
-  --default-policy deny \
-  --db ~/.kbouncer/state.db
-```
+### Backward-compat aliases
 
-Default port is **`8766`** (distinct from `iam-jit-bouncer`'s `8767`
-so the two products can coexist on the same machine without colliding).
+Legacy profile names resolve to their canonical replacements with a
+one-line deprecation notice. v1.1 removes the aliases.
 
-The audit DB lives at `~/.kbouncer/state.db` by default; override with
-`--db` or the `KBOUNCER_DB` env var.
+| Legacy | Canonical |
+| --- | --- |
+| `none` | `full-user` |
+| `prod-readonly` | `readonly` |
 
-### Inspect the audit log
+### Community profiles
 
-After the proxy has been running, see what just happened:
+Environment-specific profiles (`staging-work`, `dev-only`,
+`incident-response`) ship under `community-profiles/` in this repo
+rather than as built-in defaults. Install one with:
 
 ```sh
-kbouncer audit tail            # 50 newest decisions
-kbouncer audit tail --limit 10 # 10 newest
+kbounce profile install --from https://raw.githubusercontent.com/trsreagan3/kbouncer/main/community-profiles/staging-work.yaml
 ```
 
-Each row shows timestamp, mode, verdict, decision-source (profile /
-global / default / unclassifiable) and the parsed request. Useful
-for "what is my agent actually asking the cluster to do?" debugging.
+Org-curated profiles install the same way. The fetched URL becomes the
+profile's `source`; org-distributed profiles (non-local `source`) are
+READ-ONLY at the CLI surface — engineers cannot edit them to bypass
+SecOps guardrails.
 
-### Liveness probe
+---
 
-`GET /healthz` returns 200 + a small JSON status payload
-(`{status, mode, default_policy, active_profile, decisions_count}`)
-without writing to the audit log — safe to poll from monit, k8s
-liveness probes, or systemd watchdogs.
+## Subcommand reference
+
+### `kbounce run`
+
+Start the HTTP proxy. The most-used flags:
+
+- `--port 8766` — listen port (loopback only).
+- `--host 127.0.0.1` — interface. Binding to anything else requires
+  `--i-know-this-binds-externally` to acknowledge the credential-
+  handling threat surface.
+- `--mode cooperative|transparent` — see above.
+- `--default-policy allow|deny` — what transparent mode does when no
+  rule matches.
+- `--profile NAME` — environment profile. Defaults to `full-user`
+  (passthrough). See "Profiles" above.
+- `--upstream URL` / `--kubeconfig PATH` — apiserver to forward to.
+  When unset, the proxy returns observation-only JSON instead of
+  proxying.
+- `--tls-cert PATH` / `--tls-key PATH` / `--require-client-cert PATH` —
+  inbound TLS / mTLS. Generate the material with `kbounce init-tls`.
+- `--prompt-on-deny` — async deny-prompt UX. Every transparent-mode
+  DENY queues a prompt the operator can answer later via
+  `kbounce prompts answer`.
+
+### `kbounce init-tls`
+
+One-time setup. Writes `ca.crt` / `ca.key` / `server.crt` / `server.key`
+into `~/.kbouncer/tls/`. Add `ca.crt` to your kubectl context's
+`certificate-authority` field + start the proxy with `--tls-cert ...
+--tls-key ...`.
+
+### `kbounce profile {list, show, install}`
+
+- `kbounce profile list` — show available profiles + which one is
+  currently active (per `--profile` / `KBOUNCER_PROFILE`).
+- `kbounce profile show NAME` — full record for one profile (deny
+  keywords, deny verbs, only-clusters, exceptions, allow rules).
+- `kbounce profile install --from URL [--sha256 HEX] [--force]` —
+  fetch + install profiles from an HTTPS URL. `http://` refused.
+  Installed profiles' `source` is the URL; they are read-only at the
+  CLI.
+
+### `kbounce audit tail [--limit N]`
+
+Show the most recent N decisions, newest first. `--limit` must be
+1-1000 (rejected at parse time; closes UAT-K2 HIGH-K2-03).
+
+### `kbounce rules {add, list, remove}`
+
+Global rule table consulted between the profile-deny hard floor and the
+default-policy fallthrough.
+
+- `kbounce rules add --pattern P --effect E [--namespace-scope NS] [--resource-scope RS]` —
+  insert a rule. Pattern shape `resource:verb_glob` (e.g. `pods:*`,
+  `*:delete*`).
+- `kbounce rules list [--json]` — show all rules in evaluation order.
+- `kbounce rules remove ID` — delete by numeric id.
+
+### `kbounce tasks {start, active, end, review, list}`
+
+Per-task scopes. An agent (or you) declares a task scope at start;
+kbounce enforces it for the duration; the audit log captures the
+lifecycle.
+
+- `kbounce tasks start --description "..." [--allow CSV] [--deny CSV] [--ttl 30m]` —
+  open a task. Shorthand: `pattern[@namespace][#resource_name]` (e.g.
+  `pods:*@prod-billing`, `*:delete*`). Malformed shorthand like
+  `@ns=value` is rejected with a clear pointer (UAT-K2 HIGH-K2-01).
+- `kbounce tasks active` — show current task if any.
+- `kbounce tasks end [--reason "..."]` — close the current task.
+- `kbounce tasks review TASK_ID` — post-task summary: decisions,
+  allow/deny breakdown, denied calls.
+- `kbounce tasks list` — newest-first task history.
+
+### `kbounce prompts {list, show, answer}`
+
+When the proxy runs with `--prompt-on-deny`, every transparent-mode
+DENY queues a row here.
+
+- `kbounce prompts list [--status pending|answered|ignored]` — show
+  the queue.
+- `kbounce prompts show ID` — full prompt detail.
+- `kbounce prompts answer ID --kind always|profile|ignore [--target NAME]` —
+  answer + apply side effect. The agent has already been denied;
+  answers take effect on the NEXT call of the same shape.
+
+### `kbounce pause {start, stop, status, history}`
+
+Timed escape hatch — temporarily demote the proxy to advisory mode for
+a window. The proxy keeps observing + logging every call (decisions
+audit row links to the pause id), but DENY verdicts no longer return
+403. Auto-reverts at expiry; resume early with `pause stop`.
+
+- `kbounce pause start --for 30m [--reason "..."]` — open a window.
+- `kbounce pause stop` — end the active window early.
+- `kbounce pause status` — show the active window if any.
+- `kbounce pause history [--limit N]` — recent windows for audit
+  review.
+
+### `kbounce mcp`
+
+Run the MCP-over-stdio server an agent (Claude Code, Cursor, Codex,
+Devin) connects to. Tool family: `kbounce_active_mode`,
+`kbounce_active_profile`, `kbounce_active_task`,
+`kbounce_recommend_mode_for_task`, `kbounce_scope_self_for_task`,
+`kbounce_end_task`, `kbounce_task_review`, `kbounce_list_rules`,
+`kbounce_add_rule`, `kbounce_remove_rule`, `kbounce_decide`,
+`kbounce_tail_decisions`.
+
+The MCP server reads the SAME on-disk state the running proxy uses
+(`--db` + `--profiles-path`). It does NOT start a proxy listener of
+its own — run `kbounce run` separately for the gating + forwarding
+layer.
+
+stdin/stdout reserved for the JSON-RPC stream; logs + banner go to
+stderr.
+
+### `kbounce --version`
+
+Prints `kbounce <version> (commit X, built Y)`. Set at build time via
+`-ldflags "-X github.com/trsreagan3/kbouncer/internal/cli.version=v1.0.0
+-X github.com/trsreagan3/kbouncer/internal/cli.commit=$(git rev-parse HEAD)
+-X github.com/trsreagan3/kbouncer/internal/cli.buildTime=$(date -u +%FT%TZ)"`.
+
+---
+
+## Liveness probe
+
+`GET /healthz` returns 200 with a small JSON status payload (`status`,
+`mode`, `default_policy`, `active_profile`, `decisions_count`,
+`lookup_errors_counter`, `pause`). Never writes to the audit log;
+safe to poll from monit / k8s liveness probes / systemd watchdogs.
+
+The `lookup_errors_counter` field mirrors `bounce`'s healthz shape and
+surfaces SQLite-class lookup failures (pause-lookup, active-task
+lookup, ruleset load, prompt enqueue, audit write) so monitors can
+flag degraded persistence without parsing logs.
+
+---
 
 ## Test
 
 ```sh
 cd kbouncer
-go test ./...
+go build ./... && go vet ./... && go test ./...
 ```
 
 All tests are pure-Go and use a temp-directory SQLite DB per test — no
 external cluster, no Docker, no fixtures to manage.
 
-## Environment profiles
-
-A **profile** is a named, switchable rule layer that adds environment-
-aware keyword denies on top of `kbouncer`'s existing per-task scopes
-and global rules. When a profile is active, its denies are a **hard
-floor** — they fire even if a task scope or global rule would have
-allowed the call. This is the property SecOps teams need to approve
-the install: "if I say `staging-work`, the agent CAN NOT touch prod
-regardless of which other rules are loaded."
-
-Activate a profile with `--profile NAME` or the `KBOUNCER_PROFILE`
-env var:
-
-```sh
-kbouncer run --profile staging-work
-# or:
-KBOUNCER_PROFILE=staging-work kbouncer run
-```
-
-`kbouncer profile list` shows the available profiles and marks the
-active one. The first time `kbouncer run` starts it writes the five
-default profiles to `~/.kbouncer/profiles.yaml`; existing files are
-**never** overwritten so operator edits survive upgrades.
-
-### The five default profiles
-
-| Profile | What it does |
-| --- | --- |
-| `staging-work` | Blocks anything that looks like prod (keyword match on `prod`, `production`, `uat`, `live`, `customer` against namespace + resource name). Word-boundary by default so `productivity` is not caught. |
-| `prod-readonly` | Even in prod, no writes. Denies `delete`, `patch`, `create`, `update`, `deletecollection`, `exec`, `portforward`, `attach`. |
-| `sandbox` | Restricts the proxy to a specific cluster via `only_clusters`. Default config: `sandbox-cluster`. |
-| `incident-response` | Read-everything, write-nothing safety net for high-pressure debugging. Same deny_verbs as `prod-readonly`. |
-| `none` | No profile rules fire; existing per-task + global rule system unchanged. Useful when you want kbouncer's audit log without the profile floor. |
-
-Composition order (LOAD-BEARING):
-
-1. Profile rules — keyword, `only_clusters`, `deny_verbs`
-2. Per-task scope (K-Slice 3)
-3. Global rule engine (K-Slice 3)
-4. Default policy fall-through
-
-Every gated response carries an `x-kbouncer-decision-source` header
-naming the rule layer (`profile`, `task`, `global`, `default`,
-`unclassifiable`) so a curl-driven smoke test or audit-log review can
-confirm which layer produced the verdict without parsing the JSON
-body.
-
-Profile auto-detection from the active `kubectl` context is
-**out-of-scope** for K-Slice 7 — ships in K-Slice 8.
+---
 
 ## Layout
 
 ```
 kbouncer/
-├── cmd/kbouncer/                 # the CLI entry point (cobra)
+├── cmd/kbounce/                  # canonical binary (5 lines; delegates to internal/cli)
+├── cmd/kbouncer/                 # v1.0 deprecation shim — warns + delegates
+├── community-profiles/           # opt-in profiles installed via `kbounce profile install`
+├── internal/cli/                 # all cobra command wiring; shared by both binaries
 ├── internal/parser/              # kube-apiserver URL → ParsedRequest
-├── internal/profile/             # environment profiles (K-Slice 7)
+├── internal/profile/             # environment profiles (full-user, readonly, + custom)
 ├── internal/proxy/               # Mode + Config + Server + EvaluateRequest
-├── internal/store/               # SQLite-backed audit store
-├── go.mod
+├── internal/rules/               # global rule table
+├── internal/store/               # SQLite-backed audit + rules + tasks + prompts + pauses
+├── internal/tasks/               # per-task scope shorthand parser + builder
+├── internal/tlsmat/              # local CA + server cert generator (`kbounce init-tls`)
+├── internal/upstream/            # kubeconfig parser + upstream resolution
+├── internal/mcp/                 # MCP-over-stdio server (kbounce_* tools)
+├── go.mod                        # module path stays github.com/trsreagan3/kbouncer for v1.0
 └── README.md
 ```
 
-`internal/...` packages are intentionally not exported — `kbouncer` is
-a shipped binary, not a library other Go programs link against. If a
-library need emerges (e.g. for the admission-webhook shape), promote
-the relevant package to a top-level `pkg/...` directory at that time.
+The Go module path stays `github.com/trsreagan3/kbouncer` for v1.0 to
+minimize downstream import-path breakage. A future v1.x may move the
+module path with a `go.mod replace` directive for one release.
 
-## Position in the suite
+`internal/...` packages are intentionally not exported — `kbounce` is a
+shipped binary, not a library other Go programs link against.
 
-The LLC ships five products under one brand:
+---
+
+## Position in the Bounce suite
+
+The LLC ships five products under one umbrella, all built on the same
+JIT + audit + ground-truth-scorer DNA:
 
 1. **iam-risk-score.com** — free hosted stateless AWS-IAM-policy scorer.
-2. **iam-jit-bouncer** — local AWS-SDK-call gating proxy (Python,
-   `src/iam_jit/bouncer/`).
-3. **kbouncer** — local K8s-API-call gating proxy (Go; this directory).
-4. **iam-jit CLI / SaaS** — the JIT IAM credential issuer (`src/iam_jit/`).
+2. **bounce** — local AWS-SDK-call gating proxy (Python; lives in
+   `iam-jit` repo).
+3. **kbounce** (this repo) — local K8s-API-call gating proxy (Go;
+   single static binary).
+4. **iam-jit CLI / SaaS** — JIT IAM credential issuer.
 5. **iam-jit Enterprise** — self-hosted, license + support + advanced
    plugins.
 

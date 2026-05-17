@@ -5,7 +5,7 @@
 // The deeper rule-engine semantics live in internal/rules + internal/
 // proxy/composition_test.go; these tests confirm the CLI surface
 // itself doesn't drift.
-package main
+package cli
 
 import (
 	"bytes"
