@@ -1,0 +1,68 @@
+# Preset: incident-response-readonly
+#
+# Stricter sibling of `eks-cluster-survey`. Same broad read posture
+# but ALSO denies pod-log access on namespaces matching `prod-*` so
+# an investigator triaging a non-prod incident doesn't accidentally
+# read prod log streams that may contain customer data.
+#
+# Acknowledges the confidentiality concern that `safe-default`
+# deliberately doesn't address (safe-default is a blast-radius floor,
+# not a confidentiality boundary). The preset is an opt-in extra
+# protection for incident-response shifts.
+name: incident-response-readonly
+description: |
+  Incident-response investigation: broad reads across non-prod
+  resources; denies pod-log + exec access on prod-* namespaces to
+  avoid accidentally surfacing prod-customer data. Stricter than
+  eks-cluster-survey.
+rules:
+  # Prod-namespace confidentiality block FIRST (deny-beats-allow so
+  # placing them first or last doesn't matter, but reading top-down
+  # makes the intent clear).
+  - pattern: "pods:log"
+    effect: deny
+    namespace_scope: "prod-*"
+    note: "incident-response-readonly: no prod log access during non-prod incident"
+  - pattern: "pods:exec"
+    effect: deny
+    namespace_scope: "prod-*"
+    note: "incident-response-readonly: no prod pod access during non-prod incident"
+  - pattern: "secrets:get"
+    effect: deny
+    namespace_scope: "prod-*"
+    note: "incident-response-readonly: prod secret values stay out of reach"
+  - pattern: "secrets:list"
+    effect: deny
+    namespace_scope: "prod-*"
+    note: "incident-response-readonly: prod secret list stays out of reach"
+
+  # Broad reads everywhere else.
+  - pattern: "*:get"
+    effect: allow
+    note: "incident-response-readonly: read any non-prod resource"
+  - pattern: "*:list"
+    effect: allow
+    note: "incident-response-readonly: enumerate any non-prod resource"
+  - pattern: "*:watch"
+    effect: allow
+    note: "incident-response-readonly: subscribe to any non-prod resource"
+  - pattern: "pods:log"
+    effect: allow
+    note: "incident-response-readonly: read non-prod logs"
+
+  # Defensive write denies.
+  - pattern: "*:create"
+    effect: deny
+    note: "incident-response-readonly: investigation only"
+  - pattern: "*:update"
+    effect: deny
+    note: "incident-response-readonly: investigation only"
+  - pattern: "*:patch"
+    effect: deny
+    note: "incident-response-readonly: investigation only"
+  - pattern: "*:delete"
+    effect: deny
+    note: "incident-response-readonly: investigation only"
+  - pattern: "*:deletecollection"
+    effect: deny
+    note: "incident-response-readonly: investigation only"

@@ -222,6 +222,71 @@ func ToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name": "kbounce_recommend_rules",
+			"description": "Synthesize draft rules from observed audit-log " +
+				"traffic. Returns the rules an operator would get from " +
+				"`kbounce rules recommend --since {since}` WITHOUT applying " +
+				"them. Read-only tool — useful for an agent at the end of " +
+				"a session to suggest 'here are the rules that would " +
+				"narrow your future calls.' Per [[cross-product-agent-" +
+				"parity]]: mirrors bouncer_recommend_rules on the AWS " +
+				"side. Per [[scorer-is-ground-truth]] + [[no-nl-" +
+				"synthesis]]: deterministic algorithm; no LLM in the " +
+				"synthesis path.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"since": map[string]any{
+						"type": "string",
+						"description": "Window start. Relative ('1h', '24h', '7d') " +
+							"or absolute ISO-8601 ('2026-05-17T00:00:00Z'). Default: whole log.",
+					},
+					"min_support": map[string]any{
+						"type":    "integer",
+						"default": 3,
+						"minimum": 1,
+					},
+					"include_task_scoped": map[string]any{
+						"type":    "boolean",
+						"default": false,
+						"description": "Include task-scoped decisions in the analysis. Off " +
+							"by default: task-scoped decisions are one-off declared " +
+							"sessions and shouldn't auto-promote to permanent rules.",
+					},
+				},
+			},
+		},
+		{
+			"name": "kbounce_apply_preset",
+			"description": "Apply a curated preset rule pack to the global " +
+				"rules table. Use `kbounce_list_presets` first to see " +
+				"available names. The preset's rules are ADDED (not " +
+				"overwritten) so reapplying produces duplicates — let the " +
+				"operator confirm via `kbounce_list_rules`. Per [[cross-" +
+				"product-agent-parity]]: mirrors bouncer_apply_preset on " +
+				"the AWS side.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Preset name from `kbounce_list_presets`.",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name": "kbounce_list_presets",
+			"description": "List the built-in preset names + descriptions. " +
+				"Read-only. Use to discover what `kbounce_apply_preset` " +
+				"can target.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			"name": "kbounce_tail_decisions",
 			"description": "Inspect the recent decision audit log " +
 				"(every call kbouncer gated). Newest first. Useful for " +

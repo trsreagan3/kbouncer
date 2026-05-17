@@ -1,0 +1,63 @@
+# Preset: gke-developer
+#
+# Developer-investigation pattern: allow get/list on the standard
+# workload-shaped resources (pods, services, deployments) plus
+# logs/exec on pods. Denies writes so a developer using the preset
+# can investigate without accidentally mutating cluster state.
+#
+# Despite the GKE name, the rule shape is cloud-agnostic — `gke-`
+# is in the name as a hint at the common developer-on-GKE workflow
+# this targets.
+name: gke-developer
+description: |
+  Developer dev-environment investigation: allow reads + log streaming
+  on workloads (pods, services, deployments, configmaps); deny writes.
+  Useful when a developer needs to look at what's running without
+  risking a config change.
+rules:
+  # Workload reads.
+  - pattern: "pods:get"
+    effect: allow
+    note: "gke-developer: inspect pod details"
+  - pattern: "pods:list"
+    effect: allow
+    note: "gke-developer: enumerate pods"
+  - pattern: "services:get"
+    effect: allow
+    note: "gke-developer: inspect services"
+  - pattern: "services:list"
+    effect: allow
+    note: "gke-developer: enumerate services"
+  - pattern: "deployments:get"
+    effect: allow
+    note: "gke-developer: inspect deployments"
+  - pattern: "deployments:list"
+    effect: allow
+    note: "gke-developer: enumerate deployments"
+  - pattern: "configmaps:get"
+    effect: allow
+    note: "gke-developer: inspect configmaps"
+  - pattern: "configmaps:list"
+    effect: allow
+    note: "gke-developer: enumerate configmaps"
+
+  # Log streaming — read-only by HTTP semantic; the safe-default
+  # profile already carves logs out of its subresource-write net.
+  - pattern: "pods:log"
+    effect: allow
+    note: "gke-developer: stream pod logs"
+
+  # Defensive denies on the mutating verbs so the preset gives
+  # read-only semantics standalone.
+  - pattern: "*:create"
+    effect: deny
+    note: "gke-developer: no creates — investigation only"
+  - pattern: "*:update"
+    effect: deny
+    note: "gke-developer: no updates — investigation only"
+  - pattern: "*:patch"
+    effect: deny
+    note: "gke-developer: no patches — investigation only"
+  - pattern: "*:delete"
+    effect: deny
+    note: "gke-developer: no deletes — investigation only"

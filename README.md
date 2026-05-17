@@ -194,6 +194,50 @@ audit row links to the pause id), but DENY verdicts no longer return
 - `kbounce pause history [--limit N]` — recent windows for audit
   review.
 
+### `kbounce rules recommend`
+
+Synthesize draft rules from observed audit-log traffic (cross-product
+parity with `ibounce recommend`):
+
+```
+kbounce rules recommend [--since 24h] [--min-support 3] [--limit N]
+                        [--apply] [--apply-only CSV]
+                        [--include-task-scoped]
+                        [--save-as-profile [NAME]]
+                        [--profile-description "..."]
+                        [--db PATH] [--json]
+```
+
+Deterministic — no LLM. Groups ALLOW decisions by (resource, verb),
+thresholds on `--min-support`, applies longest-common-prefix detection
+for namespace + resource-name scopes. `--apply` persists the rules;
+`--save-as-profile [NAME]` writes a NEW local profile. NAME is OPTIONAL
+per `[[profile-auto-naming]]`: with a TTY kbounce prompts with a
+suggested default (`auto-2026-05-17-pods-readonly`); without a TTY it
+auto-generates the name + prints it to stderr.
+
+### `kbounce presets {list, show, apply}`
+
+Curated K8s rule packs — operators (and agents) get starting points
+for common shapes instead of authoring from scratch. Five starter
+presets ship in v1.0:
+
+- `cluster-admin-minus-destructive` — broadly permissive, blocks the
+  highest-blast-radius primitives (deletecollection, pods/exec,
+  pods/portforward, pods/attach, pods/eviction, token-mint, binding)
+- `eks-cluster-survey` — read-only investigation (get/list/watch
+  allow; mutating verbs deny)
+- `argocd-app-controller` — GitOps starter (Argo CD verbs +
+  cross-resource reads)
+- `gke-developer` — dev-environment investigation (reads on workloads
+  + log streaming; deny writes)
+- `incident-response-readonly` — stricter than `eks-cluster-survey`;
+  blocks pod-log + secret reads on `prod-*` namespaces for
+  confidentiality during non-prod investigations
+
+Presets are SEPARATE from the `safe-default` profile (the profile is
+a hard floor; presets are global-rule starters). They compose.
+
 ### `kbounce mcp`
 
 Run the MCP-over-stdio server an agent (Claude Code, Cursor, Codex,
@@ -202,7 +246,8 @@ Devin) connects to. Tool family: `kbounce_active_mode`,
 `kbounce_recommend_mode_for_task`, `kbounce_scope_self_for_task`,
 `kbounce_end_task`, `kbounce_task_review`, `kbounce_list_rules`,
 `kbounce_add_rule`, `kbounce_remove_rule`, `kbounce_decide`,
-`kbounce_tail_decisions`.
+`kbounce_tail_decisions`, `kbounce_recommend_rules`,
+`kbounce_list_presets`, `kbounce_apply_preset`.
 
 The MCP server reads the SAME on-disk state the running proxy uses
 (`--db` + `--profiles-path`). It does NOT start a proxy listener of

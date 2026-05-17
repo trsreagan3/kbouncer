@@ -52,10 +52,13 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/trsreagan3/kbouncer/internal/parser"
+	"github.com/trsreagan3/kbouncer/internal/presets"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
+	"github.com/trsreagan3/kbouncer/internal/recommender"
 	"github.com/trsreagan3/kbouncer/internal/rules"
 	"github.com/trsreagan3/kbouncer/internal/store"
 	"github.com/trsreagan3/kbouncer/internal/tasks"
@@ -238,6 +241,12 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolDecide(args)
 	case "kbounce_tail_decisions":
 		return s.toolTailDecisions(args)
+	case "kbounce_recommend_rules":
+		return s.toolRecommendRules(args)
+	case "kbounce_apply_preset":
+		return s.toolApplyPreset(args)
+	case "kbounce_list_presets":
+		return s.toolListPresets(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }
@@ -657,6 +666,133 @@ func (s *Server) toolTailDecisions(args map[string]any) (map[string]any, error) 
 		"decisions": out,
 		"count":     len(out),
 	}, nil
+}
+
+// ---------------------------------------------------------------------
+// kbounce_recommend_rules — synthesize draft rules from observed
+// traffic. Read-only at the MCP surface: returns recommendations the
+// operator would get from the CLI's `--apply`, WITHOUT applying.
+// audit-cadence (c): an agent can READ via this tool but applying
+// requires the operator-CLI invocation (or kbounce_apply_preset for
+// the curated path).
+// ---------------------------------------------------------------------
+
+func (s *Server) toolRecommendRules(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	since := stringArg(args, "since", "")
+	minSupport := intArg(args, "min_support", recommender.MinSupportDefault)
+	includeTaskScoped := boolArg(args, "include_task_scoped", false)
+
+	decisions, err := s.cfg.Store.RecentDecisions(1000)
+	if err != nil {
+		return nil, err
+	}
+	sinceT := parseSinceArg(since)
+	windowed := recommender.FilterByWindow(decisions, sinceT, time.Time{})
+
+	existing, err := s.cfg.Store.ListRules()
+	if err != nil {
+		return nil, err
+	}
+	existingRules := make([]rules.ProxyRule, 0, len(existing))
+	for _, sr := range existing {
+		existingRules = append(existingRules, sr.Rule)
+	}
+	recs, summary := recommender.Synthesize(windowed, recommender.SynthesizeOptions{
+		MinSupport:        minSupport,
+		IncludeTaskScoped: includeTaskScoped,
+		ExistingRules:     existingRules,
+	})
+	out := make([]map[string]any, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.ToMap())
+	}
+	return map[string]any{
+		"summary":         summary.ToMap(),
+		"recommendations": out,
+		"count":           len(out),
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// kbounce_list_presets / kbounce_apply_preset — curated rule packs.
+// audit-cadence (b): apply ADDS rules to the table; never overwrites.
+// Operator can `kbounce rules remove ID` to undo specific rows.
+// ---------------------------------------------------------------------
+
+func (s *Server) toolListPresets(_ map[string]any) (map[string]any, error) {
+	cat, err := presets.List()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(cat))
+	for _, p := range cat {
+		out = append(out, map[string]any{
+			"name":        p.Name,
+			"description": p.Description,
+			"rule_count":  len(p.Rules),
+		})
+	}
+	return map[string]any{
+		"presets": out,
+		"count":   len(out),
+	}, nil
+}
+
+func (s *Server) toolApplyPreset(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	name := stringArg(args, "name", "")
+	if name == "" {
+		return nil, errors.New("kbounce_apply_preset: `name` required")
+	}
+	p, err := presets.Get(name)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ruleIDs := make([]int64, 0, len(p.Rules))
+	for _, r := range p.Rules {
+		id, err := s.cfg.Store.AddRule(r)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"apply preset %q: failed on rule %q after %d applied: %w",
+				name, r.Pattern, len(ruleIDs), err)
+		}
+		ruleIDs = append(ruleIDs, int64(id))
+	}
+	return map[string]any{
+		"preset":   name,
+		"applied":  len(ruleIDs),
+		"rule_ids": ruleIDs,
+	}, nil
+}
+
+// parseSinceArg accepts a relative ("1h", "24h", "7d") or absolute
+// ISO-8601 timestamp. Returns zero time on empty / unparseable input
+// (same fallback as the CLI's parseRelativeOrAbsolute).
+func parseSinceArg(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	if strings.HasSuffix(s, "d") {
+		num := strings.TrimSuffix(s, "d")
+		if d, err := time.ParseDuration(num + "h"); err == nil {
+			return time.Now().UTC().Add(-d * 24)
+		}
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().UTC().Add(-d)
+	}
+	return time.Time{}
 }
 
 // ---------------------------------------------------------------------

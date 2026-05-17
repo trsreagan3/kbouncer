@@ -5,6 +5,44 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Cross-product agent-parity closure (2026-05-17)
+
+Closes the two pre-launch parity gaps with `ibounce` flagged by
+`[[cross-product-agent-parity]]`:
+
+- **`kbounce rules recommend`** — synthesizes draft rules from
+  observed audit-log traffic. Mirrors `ibounce recommend`'s flag set
+  exactly (`--since` / `--until` / `--min-support` / `--limit` /
+  `--apply` / `--apply-only` / `--include-task-scoped` /
+  `--save-as-profile` / `--profile-description` / `--json`).
+  Deterministic: groups ALLOW decisions by (resource, verb), thresholds
+  on min-support, applies LCP detection for namespace + resource-name
+  scopes (≥50% observable-data fraction floor).
+- **`--save-as-profile` auto-naming** per `[[profile-auto-naming]]`:
+  NAME is OPTIONAL. With a TTY kbounce prompts with a context-
+  suggested default (`auto-YYYY-MM-DD-{top-resources}-readonly`);
+  without a TTY it auto-generates the name + prints it to stderr.
+  Collision-avoid via `-2` / `-3` suffix. Refuses to overwrite an
+  org-sourced profile (read-only invariant from
+  `[[enterprise-profile-distribution]]`).
+- **`kbounce presets {list, show, apply}`** — five curated starter
+  rule packs ship embedded in the binary:
+  `cluster-admin-minus-destructive`, `eks-cluster-survey`,
+  `argocd-app-controller`, `gke-developer`, `incident-response-readonly`.
+  Presets are SEPARATE from the `safe-default` profile (per
+  `[[safe-default-is-readonly-admin-minus]]`): the profile is a hard
+  floor; presets are global-rule starters the operator applies +
+  customizes. They compose.
+- **Three new MCP tools** for agent symmetry:
+  - `kbounce_recommend_rules` — read-only synthesis preview.
+  - `kbounce_list_presets` — discover available curated packs.
+  - `kbounce_apply_preset` — apply a preset to the global rule table.
+
+MCP tool family now stands at 15 — closing the parity gap with
+`ibounce`'s 16 (the missing slot is the future `bouncer_*` tool
+that captures a recommendation directly into a profile via a single
+MCP call; deferred until use-case demand surfaces).
+
 ### Opus readonly-profile audit closure (2026-05-17)
 
 The Opus readonly-profile audit ([#222]) found `readonly` not fit-for-

@@ -1,0 +1,76 @@
+# Preset: cluster-admin-minus-destructive
+#
+# K8s analog of ibounce's `admin-minus-sensitive` baseline. Operator
+# is broadly trusted but the proxy still blocks the highest-blast-
+# radius primitives — bulk deletes, exec/portforward/attach into
+# pods, the eviction subresource, and the credential-minting
+# surfaces (TokenRequest, binding).
+#
+# Per [[safe-default-is-readonly-admin-minus]]: this preset is a
+# STARTER rule set the operator applies + customizes. It does NOT
+# replace the `safe-default` profile (which is a hard floor). They
+# compose: profile denies still fire first; preset rules layer on
+# top via the global rule table.
+#
+# Effect on the rule engine (deny-beats-allow, first-match):
+#   1. Explicit denies on the destructive set fire first.
+#   2. Broad `*:*` allow catches everything else.
+#
+# Pair with `--mode transparent --default-policy deny` for actual
+# enforcement; in cooperative mode the rules are advisory + audit-
+# logged.
+name: cluster-admin-minus-destructive
+description: |
+  Broadly permissive starter pack: allows most operations but blocks
+  destructive primitives (deletecollection, exec, portforward, attach,
+  pods/eviction, token-mint, binding). The K8s analog of ibounce's
+  admin-minus-sensitive baseline.
+rules:
+  # Bulk destructive verbs — cross-resource. The deletecollection verb
+  # is especially dangerous because one call can wipe an entire
+  # namespace's resources.
+  - pattern: "*:deletecollection"
+    effect: deny
+    note: "cluster-admin-minus-destructive: bulk deletes blocked"
+
+  # Exec / portforward / attach into pods are arbitrary-code-execution
+  # vectors. The kbounce safe-default profile already blocks these
+  # under its hard-floor layer; the preset adds redundancy so the
+  # operator who runs the preset WITHOUT safe-default still gets the
+  # protection.
+  - pattern: "pods:exec"
+    effect: deny
+    note: "cluster-admin-minus-destructive: no arbitrary command execution in pods"
+  - pattern: "pods:portforward"
+    effect: deny
+    note: "cluster-admin-minus-destructive: no network tunnels into pods"
+  - pattern: "pods:attach"
+    effect: deny
+    note: "cluster-admin-minus-destructive: no TTY attach into running containers"
+
+  # Pod eviction is "delete by another name" — a request shaped like
+  # POST /pods/{name}/eviction triggers the same shutdown path as
+  # DELETE /pods/{name}. Blocking only `delete` misses this.
+  - pattern: "pods:eviction"
+    effect: deny
+    note: "cluster-admin-minus-destructive: eviction is delete-by-another-name"
+
+  # TokenRequest is credential minting. POST /serviceaccounts/{name}/token
+  # returns a fresh bearer token for the ServiceAccount. Granting an
+  # agent the ability to mint tokens is privilege escalation.
+  - pattern: "serviceaccounts:token"
+    effect: deny
+    note: "cluster-admin-minus-destructive: token-mint surface blocked"
+
+  # Manual scheduling bypass via POST /pods/{name}/binding. Lets the
+  # caller put a pod on any node, bypassing the scheduler's safety
+  # rules.
+  - pattern: "pods:binding"
+    effect: deny
+    note: "cluster-admin-minus-destructive: manual scheduling bypass blocked"
+
+  # Catch-all allow at the end. Deny-beats-allow in the rule engine
+  # so the explicit denies above always win for matching requests.
+  - pattern: "*"
+    effect: allow
+    note: "cluster-admin-minus-destructive: allow everything else"

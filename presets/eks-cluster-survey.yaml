@@ -1,0 +1,46 @@
+# Preset: eks-cluster-survey
+#
+# Read-only investigation pack for an agent surveying a cluster:
+# allows get/list/watch across all standard resources, denies every
+# mutating verb. Useful when an agent is figuring out the shape of
+# an unfamiliar cluster (what's running, what's healthy, what owns
+# what) without any state change.
+#
+# Composes with the `safe-default` profile (the profile's hard-floor
+# deny on mutating verbs already covers the same surface; the preset
+# adds positive `allow` rules so the agent's reads are explicit).
+name: eks-cluster-survey
+description: |
+  Read-only cluster investigation: allows get/list/watch across all
+  resources; denies every mutating verb. Ideal for an agent
+  surveying an unfamiliar cluster without changing any state.
+rules:
+  # Reads of any resource.
+  - pattern: "*:get"
+    effect: allow
+    note: "eks-cluster-survey: read object details"
+  - pattern: "*:list"
+    effect: allow
+    note: "eks-cluster-survey: enumerate resources"
+  - pattern: "*:watch"
+    effect: allow
+    note: "eks-cluster-survey: subscribe to resource changes"
+
+  # Defensive denies on the mutating verbs. Redundant with safe-default
+  # but explicit here so the preset works standalone (operator who
+  # applies the preset under full-user still gets read-only semantics).
+  - pattern: "*:create"
+    effect: deny
+    note: "eks-cluster-survey: read-only — no creates"
+  - pattern: "*:update"
+    effect: deny
+    note: "eks-cluster-survey: read-only — no updates"
+  - pattern: "*:patch"
+    effect: deny
+    note: "eks-cluster-survey: read-only — no patches"
+  - pattern: "*:delete"
+    effect: deny
+    note: "eks-cluster-survey: read-only — no deletes"
+  - pattern: "*:deletecollection"
+    effect: deny
+    note: "eks-cluster-survey: read-only — no bulk deletes"

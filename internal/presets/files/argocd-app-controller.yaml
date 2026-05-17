@@ -1,0 +1,54 @@
+# Preset: argocd-app-controller
+#
+# Starter rule set for environments where an agent works alongside
+# the Argo CD application controller. Allows get/list/watch/patch on
+# the `applications.argoproj.io` resource (the Argo CD CRD shape)
+# plus reads across all standard resources so the agent can observe
+# what the controller is doing.
+#
+# Per [[scorer-is-ground-truth]]: the resource shape here is the
+# canonical Argo CD installation. CRD variants with different group
+# names won't match — operator forks the preset + adjusts.
+name: argocd-app-controller
+description: |
+  GitOps starter pack: allow the Argo CD application controller's
+  typical verb set (get/list/watch/patch on applications) plus broad
+  reads. Useful when an agent is investigating or assisting a Argo
+  CD-managed environment.
+rules:
+  # Argo CD Application CRD verbs — get/list/watch for observation +
+  # patch for the controller-like operations (sync, refresh).
+  - pattern: "applications:get"
+    effect: allow
+    note: "argocd-app-controller: read application state"
+  - pattern: "applications:list"
+    effect: allow
+    note: "argocd-app-controller: enumerate applications"
+  - pattern: "applications:watch"
+    effect: allow
+    note: "argocd-app-controller: subscribe to application changes"
+  - pattern: "applications:patch"
+    effect: allow
+    note: "argocd-app-controller: sync / refresh / status updates"
+
+  # Broad reads so the agent can correlate Argo CD state with the
+  # underlying K8s resources it manages.
+  - pattern: "*:get"
+    effect: allow
+    note: "argocd-app-controller: read any resource for correlation"
+  - pattern: "*:list"
+    effect: allow
+    note: "argocd-app-controller: enumerate any resource for correlation"
+  - pattern: "*:watch"
+    effect: allow
+    note: "argocd-app-controller: subscribe to any resource for correlation"
+
+  # Explicit denies on creation / deletion to keep the preset narrow.
+  # Operator who needs broader Argo CD admin should layer additional
+  # rules.
+  - pattern: "*:delete"
+    effect: deny
+    note: "argocd-app-controller: no deletions — narrow preset"
+  - pattern: "*:deletecollection"
+    effect: deny
+    note: "argocd-app-controller: no bulk deletes — narrow preset"

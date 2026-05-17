@@ -110,6 +110,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPromptsCmd())
 	root.AddCommand(newRulesCmd())
 	root.AddCommand(newTasksCmd())
+	root.AddCommand(newPresetsCmd())
 	root.AddCommand(newInitTLSCmd())
 	root.AddCommand(newMCPCmd())
 	return root

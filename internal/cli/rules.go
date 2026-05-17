@@ -56,6 +56,7 @@ plural ('pods', 'deployments', ...).`,
 	cmd.AddCommand(newRulesAddCmd())
 	cmd.AddCommand(newRulesListCmd())
 	cmd.AddCommand(newRulesRemoveCmd())
+	cmd.AddCommand(newRulesRecommendCmd())
 	return cmd
 }
 
