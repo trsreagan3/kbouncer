@@ -10,13 +10,15 @@
 #
 # Only TWO profiles ship as built-in defaults:
 #
-#   full-user   passthrough (no rules); calls forwarded as-is + audit-
-#               logged. The default when no --profile / KBOUNCER_PROFILE
-#               is set. Opt out into `readonly` for write protection.
-#   readonly    blocks write + destructive verbs (delete, patch, create,
-#               update, deletecollection, exec, portforward, attach).
-#               General-purpose safety net — works in any environment
-#               (not just prod).
+#   full-user     passthrough (no rules); calls forwarded as-is + audit-
+#                 logged. The default when no --profile / KBOUNCER_PROFILE
+#                 is set. Opt out into `safe-default` for write protection.
+#   safe-default  Cross-product safe-by-default — blocks operations whose
+#                 blast radius is high enough that the average operator
+#                 wants them gated. Includes destructive non-writes
+#                 (exec, eviction), state-changers, and privilege
+#                 primitives. NOT a confidentiality boundary — reads of
+#                 sensitive data still pass.
 #
 # Community profiles (dev-only / staging-work / incident-response /
 # sandbox / etc.) ship separately under `community-profiles/` in the
@@ -35,15 +37,50 @@ profiles:
     # synthesizes this profile automatically even if you delete it from
     # this file, so name lookup for "full-user" always succeeds.
 
-  readonly:
-    description: "Read-only safety net — blocks write + destructive verbs in any environment."
+  safe-default:
+    description: "Cross-product safe-by-default — blocks operations whose blast radius is high enough that the average operator wants them gated. Includes destructive non-writes (exec, eviction), state-changers, and privilege primitives. NOT a confidentiality boundary — reads of sensitive data still pass."
+    # Core mutating verbs.
     deny_verbs:
       - delete
       - patch
       - create
       - update
       - deletecollection
-      # Subresource verbs that mutate or escalate:
-      - exec
-      - portforward
-      - attach
+      # Destructive non-writes / state-changers / privilege primitives.
+      # Each verb is the parser-emitted subresource name (parser sets
+      # Verb=Subresource when a subresource is present).
+      - exec               # arbitrary command execution in a pod
+      - portforward        # tunnel to a pod's network
+      - attach             # attach to a running container's TTY
+      - proxy              # Gap-K-1: /pods|services|nodes/{name}/proxy — RBAC bypass tunnel; nodes/proxy = kubelet API arbitrary exec
+      - eviction           # Gap-K-2: pod deletion by another name
+      - scale              # Gap-K-3: replica-count mutation (scale-to-0 DOS; scale-to-large cost attack)
+      - status             # Gap-K-4: controller-state poisoning
+      - finalize           # Gap-K-5: bypass deletion protection
+      - ephemeralcontainers # Gap-K-6: debug-container injection = exec equivalent
+      - token              # Gap-K-7: TokenRequest = credential minting (POST /serviceaccounts/{name}/token)
+      - binding            # Gap-K-12: manual scheduling bypass (POST /pods/{name}/binding)
+    # SSAR / SAR / token-review carve-out (False-positive-K-2): these
+    # are POSTs but the API contract is "tell me what I could do" /
+    # "validate this token"; they don't mutate cluster state. Exempt
+    # them from the verb deny so kubectl auth can-i / token validation
+    # keeps working under safe-default. Match is on full group/resource
+    # so a CRD with the same resource name in a different group is NOT
+    # accidentally exempted.
+    exempt_resources_for_verb_deny:
+      create:
+        - authorization.k8s.io/selfsubjectaccessreviews
+        - authorization.k8s.io/selfsubjectrulesreviews
+        - authorization.k8s.io/subjectaccessreviews
+        - authorization.k8s.io/localsubjectaccessreviews
+        - authentication.k8s.io/tokenreviews
+    # Gap-K-9: deny impersonation by default. Impersonate-User /
+    # Impersonate-Group / Impersonate-Extra-* headers let a caller
+    # masquerade as another principal; under safe-default this is a
+    # hard deny regardless of verb.
+    deny_on_impersonation: true
+    # Gap-K-14: long-tail safety net for CRD-defined mutating sub-
+    # resources not enumerated in deny_verbs. POST/PUT/PATCH/DELETE
+    # on ANY subresource (except log/logs) is denied. log/logs stays
+    # open per False-positive-K-1 (read-only streams).
+    deny_subresource_writes: true

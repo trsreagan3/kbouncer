@@ -17,7 +17,7 @@ The `kbounce` binary embeds only two general-purpose profiles:
 | Profile | Purpose |
 | --- | --- |
 | `full-user` | Passthrough — no rules. The default when no `--profile` / `KBOUNCER_PROFILE` is set. |
-| `readonly` | Blocks write + destructive verbs (delete, patch, create, update, deletecollection, exec, portforward, attach). General-purpose safety net. |
+| `safe-default` | Cross-product safe-by-default deny layer. Blocks mutating verbs + destructive non-writes + privilege primitives + impersonation + CRD-defined mutating subresources. Carves out SSAR/SAR/TokenReview previews and `?dryRun=All` requests. NOT a confidentiality boundary — reads of sensitive data still pass. |
 
 The profiles below are environment-specific or scenario-specific and live
 here so the embedded defaults stay tiny + opinionated:

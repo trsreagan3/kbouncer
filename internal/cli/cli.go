@@ -126,19 +126,29 @@ Two operating modes (the same shape as iam-jit-bouncer):
   transparent   DENY verdicts return 403 to the client; ALLOW verdicts
                 forward unchanged
 
-Profile defaults (2026-05-17 reshape per [[bounce-default-profile-pattern]]):
+Profile defaults (2026-05-17 reshape per [[bounce-default-profile-pattern]] +
+Opus readonly-profile audit closure):
 
   full-user     passthrough (no rules). Default when --profile / KBOUNCER_PROFILE
                 is unset. Calls forwarded as-is + audit-logged.
-  readonly      block write + destructive verbs (delete, patch, create,
-                update, deletecollection, exec, portforward, attach).
-                General-purpose safety net for any environment.
+  safe-default  cross-product safe-by-default. Blocks operations whose blast
+                radius is high enough that the average operator wants them
+                gated: mutating verbs (delete/patch/create/update/
+                deletecollection), destructive non-writes (exec/portforward/
+                attach/eviction), state-changers (status/scale/finalize),
+                privilege primitives (proxy/token/binding/
+                ephemeralcontainers/impersonation), CRD-defined mutating
+                subresources (long-tail safety net). NOT a confidentiality
+                boundary — reads of sensitive data still pass.
 
-Opt into the readonly safety net with --profile readonly OR
-export KBOUNCER_PROFILE=readonly in your shell rc. Environment-specific
+Opt into safe-default with --profile safe-default OR
+export KBOUNCER_PROFILE=safe-default in your shell rc. Environment-specific
 profiles (staging-work, dev-only, incident-response) install via
 ` + "`kbounce profile install --from URL`" + ` (see community-profiles/ in
-the kbounce repo).`
+the kbounce repo).
+
+Legacy aliases (v1.0 backward-compat; removed v1.1): "readonly" →
+"safe-default", "prod-readonly" → "safe-default", "none" → "full-user".`
 
 func newRunCmd() *cobra.Command {
 	var (
@@ -341,8 +351,9 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			if !profileFromFlag && os.Getenv(envProfileVar) == "" {
 				fmt.Fprintln(os.Stderr,
 					"profile: no profile selected; calls forwarded as-is + audit-logged. "+
-						"To block write/destructive verbs, run with --profile readonly "+
-						"OR `export KBOUNCER_PROFILE=readonly` in your shell rc.")
+						"To block write/destructive verbs + privilege primitives, "+
+						"run with --profile safe-default OR "+
+						"`export KBOUNCER_PROFILE=safe-default` in your shell rc.")
 			}
 			fmt.Fprintln(os.Stderr, "Ctrl+C to stop.")
 
@@ -397,11 +408,14 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
 	cmd.Flags().StringVar(&profileName, "profile", "",
 		"Active environment profile. Built-in: 'full-user' (passthrough, "+
-			"default) and 'readonly' (block write/destructive verbs). "+
+			"default) and 'safe-default' (block mutating verbs + destructive "+
+			"non-writes + privilege primitives + impersonation + CRD long-tail). "+
 			"Community profiles install via `kbounce profile install --from URL`. "+
 			"Falls back to "+envProfileVar+" env var; defaults to 'full-user' "+
 			"if neither is set. Profile denies are a hard floor — a permissive "+
-			"task scope CANNOT override them. See `kbounce profile list`.")
+			"task scope CANNOT override them. See `kbounce profile list`. "+
+			"Legacy aliases ('readonly', 'prod-readonly', 'none') still resolve "+
+			"in v1.0 and are removed in v1.1.")
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
 		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml). "+
 			"Honors KBOUNCER_PROFILES_PATH env var if --profiles-path unset.")

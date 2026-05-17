@@ -12,10 +12,11 @@ import (
 
 // TestDefaultProfilesLoad makes sure the embedded YAML parses cleanly
 // AND that the documented default profiles are present. The 2026-05-17
-// default-profile reshape ([[bounce-default-profile-pattern]]) reduced
-// embedded defaults to TWO: full-user (passthrough) + readonly (write/
-// destructive-verb deny). Other profiles ship in community-profiles/
-// and install via `kbounce profile install --from URL`.
+// Opus readonly-profile audit closure renamed `readonly` → `safe-default`
+// AND hardened the verb set. Embedded defaults remain TWO: full-user
+// (passthrough) + safe-default (cross-product safe-by-default deny
+// layer). Other profiles ship in community-profiles/ and install via
+// `kbounce profile install --from URL`.
 func TestDefaultProfilesLoad(t *testing.T) {
 	ps, err := LoadProfiles("") // empty path → embedded defaults
 	require.NoError(t, err)
@@ -24,7 +25,7 @@ func TestDefaultProfilesLoad(t *testing.T) {
 
 	for _, want := range []string{
 		"full-user",
-		"readonly",
+		"safe-default",
 	} {
 		p, err := ps.Active(want)
 		require.NoError(t, err, "default %q must be present", want)
@@ -37,17 +38,18 @@ func TestDefaultProfilesLoad(t *testing.T) {
 	v := p.Evaluate(&ParsedRequest{Verb: "delete", Namespace: "prod", ResourceName: "prod-pod"})
 	assert.False(t, v.Denied, "full-user profile must always abstain")
 
-	// `readonly` profile must deny destructive verbs.
-	p, err = ps.Active("readonly")
+	// `safe-default` profile must deny destructive verbs.
+	p, err = ps.Active("safe-default")
 	require.NoError(t, err)
 	v = p.Evaluate(&ParsedRequest{Verb: "delete"})
-	assert.True(t, v.Denied, "readonly profile must deny destructive verbs")
+	assert.True(t, v.Denied, "safe-default profile must deny destructive verbs")
 }
 
 // TestDefaultProfiles_LegacyAliasesResolve pins the backward-compat
-// alias map: lookups for the legacy names "none" / "prod-readonly"
-// resolve to "full-user" / "readonly" with a deprecation warning.
-// Removes in v1.1. See [[bounce-suite-rename]].
+// alias map: lookups for the legacy names "none" / "prod-readonly" /
+// "readonly" resolve to "full-user" / "safe-default" / "safe-default"
+// with a deprecation warning. Removed in v1.1. See [[bounce-suite-rename]]
+// and the Opus readonly-profile audit closure.
 func TestDefaultProfiles_LegacyAliasesResolve(t *testing.T) {
 	ps, err := LoadProfiles("")
 	require.NoError(t, err)
@@ -57,8 +59,12 @@ func TestDefaultProfiles_LegacyAliasesResolve(t *testing.T) {
 	assert.Equal(t, FullUserProfileName, p.Name)
 
 	p, err = ps.Active("prod-readonly")
-	require.NoError(t, err, "legacy alias 'prod-readonly' must resolve to 'readonly'")
-	assert.Equal(t, ReadonlyProfileName, p.Name)
+	require.NoError(t, err, "legacy alias 'prod-readonly' must resolve to 'safe-default'")
+	assert.Equal(t, SafeDefaultProfileName, p.Name)
+
+	p, err = ps.Active("readonly")
+	require.NoError(t, err, "legacy alias 'readonly' must resolve to 'safe-default'")
+	assert.Equal(t, SafeDefaultProfileName, p.Name)
 }
 
 func TestLoadProfilesFromDisk_RoundTrip(t *testing.T) {
@@ -84,7 +90,7 @@ func TestLoadProfilesFromDisk_RoundTrip(t *testing.T) {
 	assert.Equal(t, path, ps.Path)
 	// Both embedded defaults must round-trip.
 	for _, want := range []string{
-		"full-user", "readonly",
+		"full-user", "safe-default",
 	} {
 		_, err := ps.Active(want)
 		assert.NoError(t, err, "profile %q missing after disk round-trip", want)
@@ -155,7 +161,7 @@ func TestLoadProfiles_MissingFilePathFallsBackToDefaults(t *testing.T) {
 	// run.
 	ps, err := LoadProfiles(filepath.Join(t.TempDir(), "nothing-here.yaml"))
 	require.NoError(t, err)
-	_, err = ps.Active("readonly")
+	_, err = ps.Active("safe-default")
 	require.NoError(t, err)
 }
 
@@ -479,4 +485,337 @@ func TestComposition_ProfileDenyBeatsTaskAllow(t *testing.T) {
 	}
 	assert.False(t, consulted,
 		"profile deny must short-circuit BEFORE the task scope is consulted")
+}
+
+// --- Opus readonly-profile audit closure (2026-05-17) ---
+//
+// The following tests pin the new safe-default behavior introduced by
+// the audit-closure commit:
+//
+//   - 8 new deny_verbs (Gap-K-1..K-7, K-12)
+//   - SSAR / SAR / TokenReview exemption (False-positive-K-2)
+//   - Impersonation deny (Gap-K-9)
+//   - Dry-run carve-out (False-positive-K-3)
+//   - Subresource-write long-tail safety net (Gap-K-14)
+//
+// Each verb is named via its parser-emitted form so any future change
+// to the parser's verb-naming surfaces here.
+
+// TestSafeDefault_DeniesNewVerbs pins all 8 added verbs as denied
+// under the embedded safe-default profile. Each row gives:
+//   - parser-emitted verb string
+//   - HTTP method most typical for the verb
+//   - representative URL shape (informational; not exercised here —
+//     profile.Evaluate runs on a ParsedRequest directly)
+//   - gap reference
+func TestSafeDefault_DeniesNewVerbs(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	cases := []struct {
+		verb     string
+		method   string
+		resource string
+		gap      string
+	}{
+		{"proxy", "POST", "pods", "Gap-K-1 — RBAC bypass tunnel"},
+		{"eviction", "POST", "pods", "Gap-K-2 — pod deletion by another name"},
+		{"scale", "PATCH", "deployments", "Gap-K-3 — replica-count mutation"},
+		{"status", "PUT", "deployments", "Gap-K-4 — controller state poisoning"},
+		{"finalize", "PUT", "namespaces", "Gap-K-5 — bypass deletion protection"},
+		{"ephemeralcontainers", "PATCH", "pods", "Gap-K-6 — debug-container injection"},
+		{"token", "POST", "serviceaccounts", "Gap-K-7 — credential minting"},
+		{"binding", "POST", "pods", "Gap-K-12 — manual scheduling bypass"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.verb, func(t *testing.T) {
+			v := sd.Evaluate(&ParsedRequest{
+				Verb:        tc.verb,
+				Method:      tc.method,
+				Group:       "",
+				Resource:    tc.resource,
+				Subresource: tc.verb,
+				Namespace:   "default",
+			})
+			assert.True(t, v.Denied,
+				"safe-default must deny verb %q (%s)", tc.verb, tc.gap)
+			assert.Equal(t, SourceProfile, v.Source)
+		})
+	}
+}
+
+// TestSafeDefault_ParserEmitsExpectedVerbStrings exercises the parser
+// directly to confirm the URL shape for each of the 8 added verbs
+// produces the verb string the deny_verbs YAML lists. If the parser's
+// naming ever drifts (e.g. "ephemeralcontainers" → "ephemeral-
+// containers"), this test fails BEFORE the verb silently slips past
+// safe-default in production. We can't import the parser package
+// without a cycle (parser → profile would be wrong direction), so the
+// proxy-level test in proxy_test exercises the end-to-end flow; here
+// we just document the verb-name contract.
+func TestSafeDefault_NewVerbsListedInDefaults(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+	for _, want := range []string{
+		"proxy", "eviction", "scale", "status",
+		"finalize", "ephemeralcontainers", "token", "binding",
+	} {
+		assert.Contains(t, sd.DenyVerbs, want,
+			"safe-default.deny_verbs must list %q", want)
+	}
+}
+
+// TestSafeDefault_SSARExempt_AllowsAuthCanI pins the SSAR / SAR /
+// TokenReview carve-out: POST to these resources passes even though
+// the "create" verb is on safe-default's deny list, because their
+// API contract is "tell me what I could do" / "validate this token"
+// rather than mutate cluster state. Audit-cadence note (b):
+// match is on the FULL group/resource pair.
+func TestSafeDefault_SSARExempt_AllowsAuthCanI(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	exempt := []struct {
+		group    string
+		resource string
+	}{
+		{"authorization.k8s.io", "selfsubjectaccessreviews"},
+		{"authorization.k8s.io", "selfsubjectrulesreviews"},
+		{"authorization.k8s.io", "subjectaccessreviews"},
+		{"authorization.k8s.io", "localsubjectaccessreviews"},
+		{"authentication.k8s.io", "tokenreviews"},
+	}
+	for _, tc := range exempt {
+		t.Run(tc.group+"/"+tc.resource, func(t *testing.T) {
+			v := sd.Evaluate(&ParsedRequest{
+				Verb:     "create",
+				Method:   "POST",
+				Group:    tc.group,
+				Resource: tc.resource,
+			})
+			assert.False(t, v.Denied,
+				"safe-default must EXEMPT POST to %s/%s (auth can-i / token validation)",
+				tc.group, tc.resource)
+		})
+	}
+}
+
+// TestSafeDefault_SSARExempt_DoesNotLeakAcrossGroups pins audit-
+// cadence note (b): a CRD that defines a resource named
+// "tokenreviews" or "subjectaccessreviews" in a DIFFERENT API group
+// must NOT be accidentally exempted. The exemption check uses the
+// full "group/resource" string.
+func TestSafeDefault_SSARExempt_DoesNotLeakAcrossGroups(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	v := sd.Evaluate(&ParsedRequest{
+		Verb:     "create",
+		Method:   "POST",
+		Group:    "example.com", // CRD group, NOT authentication.k8s.io
+		Resource: "tokenreviews",
+	})
+	assert.True(t, v.Denied,
+		"a CRD named tokenreviews in a different group MUST still be denied")
+}
+
+// TestSafeDefault_DeniesImpersonation pins Gap-K-9: a request that
+// carried an Impersonate-User header is denied under safe-default
+// regardless of verb (even read verbs that would normally allow).
+func TestSafeDefault_DeniesImpersonation(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	// list (a read verb) — normally allowed — denied because of
+	// impersonation.
+	v := sd.Evaluate(&ParsedRequest{
+		Verb:             "list",
+		Method:           "GET",
+		Resource:         "pods",
+		IsImpersonation:  true,
+		ImpersonatedUser: "cluster-admin",
+	})
+	assert.True(t, v.Denied,
+		"safe-default must deny impersonation even on read verbs")
+	assert.Equal(t, SourceProfile, v.Source)
+	assert.Contains(t, v.Reason, "cluster-admin",
+		"deny reason must name the impersonated user for audit clarity")
+}
+
+// TestSafeDefault_NoImpersonation_AllowsBaseCase pins the negative
+// — same list request without impersonation must not fire the
+// impersonation deny (otherwise we're denying everything, which is
+// the failure mode the audit closure cared about).
+func TestSafeDefault_NoImpersonation_AllowsBaseCase(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	v := sd.Evaluate(&ParsedRequest{
+		Verb:     "list",
+		Method:   "GET",
+		Resource: "pods",
+	})
+	assert.False(t, v.Denied,
+		"safe-default must allow plain list without impersonation")
+}
+
+// TestSafeDefault_DryRunCarveOut_AllowsPreview pins False-positive-K-3:
+// POST with ?dryRun=All is a server-side preview that doesn't change
+// state, so it bypasses the verb-deny.
+func TestSafeDefault_DryRunCarveOut_AllowsPreview(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	v := sd.Evaluate(&ParsedRequest{
+		Verb:      "create",
+		Method:    "POST",
+		Resource:  "configmaps",
+		Namespace: "default",
+		IsDryRun:  true,
+	})
+	assert.False(t, v.Denied,
+		"safe-default must allow dry-run create as a preview")
+}
+
+// TestSafeDefault_DryRunCarveOut_DoesNotBypassImpersonation pins
+// that dry-run is a PER-VERB carve-out, not a global escape hatch.
+// (Currently the implementation short-circuits at order-1 BEFORE
+// impersonation, so this test ALSO documents that an attacker can't
+// chain dryRun=All + Impersonate-User to bypass impersonation deny —
+// it's a side-effect-free preview anyway. If the order changes,
+// this test catches it.)
+//
+// NB: this test asserts the CURRENT layered semantic where dry-run
+// wins over impersonation, which is correct because a dry-run can't
+// actually impersonate-and-mutate. If we ever decide to invert (deny
+// impersonation BEFORE checking dry-run), update both this test and
+// the docstring on Evaluate.
+func TestSafeDefault_DryRun_TakesPrecedenceOverImpersonation(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	v := sd.Evaluate(&ParsedRequest{
+		Verb:             "create",
+		Method:           "POST",
+		Resource:         "configmaps",
+		Namespace:        "default",
+		IsDryRun:         true,
+		IsImpersonation:  true,
+		ImpersonatedUser: "cluster-admin",
+	})
+	assert.False(t, v.Denied,
+		"dry-run preview short-circuits BEFORE impersonation gate; documented + intended")
+}
+
+// TestSafeDefault_SubresourceLongTail_DeniesHypotheticalCRD pins
+// Gap-K-14: PATCH to a CRD-defined subresource not enumerated in
+// deny_verbs (Argo CD's Application/sync is the canonical example)
+// is still denied under safe-default via the deny_subresource_writes
+// long-tail rule.
+func TestSafeDefault_SubresourceLongTail_DeniesHypotheticalCRD(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	// Hypothetical Argo CD-style CRD subresource. "sync" is NOT in
+	// deny_verbs but the long-tail catches it because it's a PATCH
+	// against a subresource.
+	v := sd.Evaluate(&ParsedRequest{
+		Verb:        "sync",
+		Method:      "PATCH",
+		Group:       "argoproj.io",
+		Resource:    "applications",
+		Subresource: "sync",
+		Namespace:   "argocd",
+	})
+	assert.True(t, v.Denied,
+		"deny_subresource_writes must catch CRD-defined mutating subresource %q",
+		"sync")
+	assert.Equal(t, SourceProfile, v.Source)
+	assert.Contains(t, v.Reason, "sync")
+}
+
+// TestSafeDefault_SubresourceLongTail_PreservesLogCarveOut pins
+// audit-cadence note (c) + False-positive-K-1: the log / logs
+// subresource is read-only across all GET shapes (and even POST
+// shapes that some clients use for follow=true streams), so it
+// stays open under safe-default.
+func TestSafeDefault_SubresourceLongTail_PreservesLogCarveOut(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	// GET log — the canonical kubectl logs path. Must pass.
+	v := sd.Evaluate(&ParsedRequest{
+		Verb:        "log",
+		Method:      "GET",
+		Resource:    "pods",
+		Subresource: "log",
+		Namespace:   "default",
+		ResourceName: "foo",
+	})
+	assert.False(t, v.Denied,
+		"safe-default must NOT deny GET pod log (read-only stream carve-out)")
+
+	// Capitalization-tolerant: subresource normalized lowercase.
+	v = sd.Evaluate(&ParsedRequest{
+		Verb:        "log",
+		Method:      "GET",
+		Resource:    "pods",
+		Subresource: "LOG",
+	})
+	assert.False(t, v.Denied,
+		"log carve-out must be case-insensitive")
+
+	// "logs" plural also carved out (some CRDs / API extensions
+	// pluralize).
+	v = sd.Evaluate(&ParsedRequest{
+		Verb:        "logs",
+		Method:      "GET",
+		Resource:    "pods",
+		Subresource: "logs",
+	})
+	assert.False(t, v.Denied,
+		"plural 'logs' subresource also covered by carve-out")
+}
+
+// TestSafeDefault_SubresourceLongTail_ReadVerbsPass pins that a
+// GET against a non-log subresource (e.g. GET /pods/{name}/status
+// for a controller reading status) still passes — only writes are
+// gated by deny_subresource_writes.
+func TestSafeDefault_SubresourceLongTail_ReadVerbsPass(t *testing.T) {
+	// Custom profile to isolate the long-tail rule: status is in
+	// safe-default's deny_verbs, which would otherwise mask the
+	// long-tail check. Build a minimal profile that ONLY has
+	// deny_subresource_writes set.
+	p := &Profile{
+		Name:                  "longtail-only",
+		DenySubresourceWrites: true,
+	}
+	v := p.Evaluate(&ParsedRequest{
+		Verb:        "status",
+		Method:      "GET",
+		Resource:    "deployments",
+		Subresource: "status",
+	})
+	assert.False(t, v.Denied,
+		"GET on subresource is read-only; long-tail must not fire")
 }

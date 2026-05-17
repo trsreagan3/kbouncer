@@ -119,6 +119,37 @@ type ParsedRequest struct {
 	// authoritative.
 	BearerTokenPresent bool
 
+	// IsImpersonation is true when ANY of the kube-apiserver
+	// impersonation header family was present:
+	//
+	//   - Impersonate-User              (canonical principal)
+	//   - Impersonate-Group             (multi-value)
+	//   - Impersonate-Uid               (canonical user UID)
+	//   - Impersonate-Extra-*           (operator-defined attributes)
+	//
+	// The "Impersonate-Extra-*" family uses a header-name prefix,
+	// NOT a fixed name — every distinct attribute lives under its
+	// own Impersonate-Extra-{attr-name} header. We scan ALL header
+	// names for the prefix (case-insensitive) so a request that
+	// only carries Impersonate-Extra-scopes (no Impersonate-User /
+	// -Group) is still flagged. Closes Gap-K-9 from the Opus
+	// readonly-profile audit + the audit-cadence note (a) in the
+	// commit body that landed it.
+	IsImpersonation bool
+
+	// ImpersonatedUser is the value of the Impersonate-User header
+	// when present, else "". Carried into the audit reason string
+	// so reviewers can see who the caller tried to masquerade as
+	// without having to consult the raw header dump.
+	ImpersonatedUser string
+
+	// ImpersonatedGroups is the slice of Impersonate-Group header
+	// values (the header can appear multiple times — apiserver
+	// concatenates them as a multi-value header). Empty when none
+	// were present. Kept for the audit row's structured field;
+	// not currently used in the deny reason.
+	ImpersonatedGroups []string
+
 	// IsStream is true when the URL shape itself indicates a streaming
 	// subresource (exec / attach / portforward) OR ?watch=true /
 	// ?follow=true is set. URL-derived; the proxy may also set this
@@ -158,10 +189,14 @@ func Parse(r *http.Request) (*ParsedRequest, error) {
 		rawPath = path + "?" + r.URL.RawQuery
 	}
 
+	imp, impUser, impGroups := parseImpersonation(r.Header)
 	out := &ParsedRequest{
 		Method:             method,
 		RawPath:            rawPath,
 		BearerTokenPresent: hasBearerToken(r.Header),
+		IsImpersonation:    imp,
+		ImpersonatedUser:   impUser,
+		ImpersonatedGroups: impGroups,
 	}
 
 	// Routing: /api/v1/... (core) vs /apis/{group}/{version}/... (named).
@@ -358,6 +393,53 @@ func hasBearerToken(h http.Header) bool {
 		}
 	}
 	return false
+}
+
+// parseImpersonation scans the kube-apiserver impersonation header
+// family and returns (any-present, Impersonate-User value, all
+// Impersonate-Group values).
+//
+// Headers consulted:
+//
+//   - Impersonate-User              (single value)
+//   - Impersonate-Group             (multi-value)
+//   - Impersonate-Uid               (single value)
+//   - Impersonate-Extra-{anything}  (header-name prefix; per-attribute)
+//
+// The Extra-* family uses a name PREFIX (not a fixed header name),
+// so we iterate every header in the map and compare the (canonical-
+// case) prefix. Go's net/http canonicalizes header names to
+// "Impersonate-Extra-Foo" on insert, so MIME-canonical prefix match
+// is the right check. Closes Gap-K-9 + addresses audit-cadence
+// note (a): a request that carries ONLY Impersonate-Extra-scopes
+// (no -User / -Group) is still flagged.
+func parseImpersonation(h http.Header) (bool, string, []string) {
+	const extraPrefix = "Impersonate-Extra-"
+
+	any := false
+	user := h.Get("Impersonate-User")
+	if user != "" {
+		any = true
+	}
+	groups := h.Values("Impersonate-Group")
+	if len(groups) > 0 {
+		any = true
+	}
+	if h.Get("Impersonate-Uid") != "" {
+		any = true
+	}
+	if !any {
+		// Only scan all header names if the cheap canonical lookups
+		// didn't already flip the flag. CanonicalMIMEHeaderKey ensures
+		// the inbound headers match the prefix's canonical case.
+		for name := range h {
+			if strings.HasPrefix(name, extraPrefix) {
+				any = true
+				break
+			}
+		}
+	}
+	return any, user, groups
 }
 
 // isTruthy treats "true", "1", and "True" as true. Anything else is

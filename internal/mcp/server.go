@@ -562,9 +562,16 @@ func (s *Server) toolDecide(args map[string]any) (map[string]any, error) {
 	// Profile evaluation (read-only; same engine the proxy uses).
 	if s.cfg.ActiveProfile != nil {
 		pv := s.cfg.ActiveProfile.Evaluate(&profile.ParsedRequest{
-			Verb:         parsed.Verb,
-			Namespace:    parsed.Namespace,
-			ResourceName: parsed.Name,
+			Verb:             parsed.Verb,
+			Method:           parsed.Method,
+			Group:            parsed.Group,
+			Resource:         parsed.Resource,
+			Subresource:      parsed.Subresource,
+			Namespace:        parsed.Namespace,
+			ResourceName:     parsed.Name,
+			IsDryRun:         parsed.IsDryRun,
+			IsImpersonation:  parsed.IsImpersonation,
+			ImpersonatedUser: parsed.ImpersonatedUser,
 		})
 		if pv.Denied {
 			return map[string]any{

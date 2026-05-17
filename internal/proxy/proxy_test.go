@@ -411,19 +411,19 @@ func TestEvaluateRequestWithProfile_DenyVerbsBlockMutation(t *testing.T) {
 	st := freshStore(t)
 	ps, err := profile.LoadProfiles("")
 	require.NoError(t, err)
-	ro, err := ps.Active("readonly")
+	sd, err := ps.Active("safe-default")
 	require.NoError(t, err)
 
-	// delete is in the readonly deny_verbs list.
+	// delete is in the safe-default deny_verbs list.
 	req := parser.MustParseTestURL(http.MethodDelete, "/api/v1/namespaces/default/pods/foo")
-	obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, ro, "")
+	obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, sd, "")
 	assert.Equal(t, VerdictDeny, obs.DecisionVerdict)
 	assert.Equal(t, SourceProfile, obs.DecisionSource)
 	assert.Contains(t, obs.DecisionReason, "delete")
 
 	// get is read-only; allowed (falls to default policy = allow).
 	req = parser.MustParseTestURL(http.MethodGet, "/api/v1/namespaces/default/pods/foo")
-	obs = EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, ro, "")
+	obs = EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, sd, "")
 	assert.Equal(t, VerdictAllow, obs.DecisionVerdict)
 }
 

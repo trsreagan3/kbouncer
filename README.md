@@ -24,13 +24,13 @@ with a one-line deprecation warning + is removed in v1.1.
 go build ./cmd/kbounce
 
 # Default run: cooperative mode, no profile (passthrough), audit-only.
-# Banner reminds you about --profile readonly for the write-blocking layer.
+# Banner reminds you about --profile safe-default for the deny layer.
 ./kbounce run
 
-# Opt into the readonly safety net:
-./kbounce run --profile readonly
+# Opt into the safe-default safety net:
+./kbounce run --profile safe-default
 # Or, persistent for your shell:
-export KBOUNCER_PROFILE=readonly
+export KBOUNCER_PROFILE=safe-default
 ./kbounce run
 ```
 
@@ -61,11 +61,11 @@ Built-in defaults (only two, intentionally):
 | Profile | What it does |
 | --- | --- |
 | `full-user` | Passthrough; no rules. Calls forwarded as-is + audit-logged. **Default** when `--profile` / `KBOUNCER_PROFILE` is unset. |
-| `readonly` | Blocks write + destructive verbs (`delete`, `patch`, `create`, `update`, `deletecollection`, `exec`, `portforward`, `attach`). General-purpose safety net for any environment. |
+| `safe-default` | Cross-product safe-by-default. Blocks operations whose blast radius is high enough that the average operator wants them gated: mutating verbs (`delete`/`patch`/`create`/`update`/`deletecollection`), destructive non-writes (`exec`/`portforward`/`attach`/`eviction`), state-changers (`status`/`scale`/`finalize`), privilege primitives (`proxy`/`token`/`binding`/`ephemeralcontainers` + impersonation headers), and CRD-defined mutating subresources (long-tail safety net). Carves out SSAR/SAR/TokenReview previews and `?dryRun=All` requests. NOT a confidentiality boundary — reads of sensitive data still pass. |
 
 Activate with `--profile NAME` or `KBOUNCER_PROFILE=NAME`. When neither
 is set, `kbounce run` prints a one-line banner reminding you you're in
-passthrough mode + the two ways to opt into `readonly`.
+passthrough mode + the two ways to opt into `safe-default`.
 
 ### Backward-compat aliases
 
@@ -75,7 +75,8 @@ one-line deprecation notice. v1.1 removes the aliases.
 | Legacy | Canonical |
 | --- | --- |
 | `none` | `full-user` |
-| `prod-readonly` | `readonly` |
+| `prod-readonly` | `safe-default` |
+| `readonly` | `safe-default` |
 
 ### Community profiles
 
@@ -255,7 +256,7 @@ kbouncer/
 ├── community-profiles/           # opt-in profiles installed via `kbounce profile install`
 ├── internal/cli/                 # all cobra command wiring; shared by both binaries
 ├── internal/parser/              # kube-apiserver URL → ParsedRequest
-├── internal/profile/             # environment profiles (full-user, readonly, + custom)
+├── internal/profile/             # environment profiles (full-user, safe-default, + custom)
 ├── internal/proxy/               # Mode + Config + Server + EvaluateRequest
 ├── internal/rules/               # global rule table
 ├── internal/store/               # SQLite-backed audit + rules + tasks + prompts + pauses

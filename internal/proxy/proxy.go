@@ -466,10 +466,17 @@ func EvaluateRequestFull(
 	// header surface SourceProfile.
 	if activeProfile != nil {
 		pv := activeProfile.Evaluate(&profile.ParsedRequest{
-			Verb:         parsed.Verb,
-			Namespace:    parsed.Namespace,
-			ResourceName: parsed.Name,
-			Cluster:      cluster,
+			Verb:             parsed.Verb,
+			Method:           parsed.Method,
+			Group:            parsed.Group,
+			Resource:         parsed.Resource,
+			Subresource:      parsed.Subresource,
+			Namespace:        parsed.Namespace,
+			ResourceName:     parsed.Name,
+			Cluster:          cluster,
+			IsDryRun:         parsed.IsDryRun,
+			IsImpersonation:  parsed.IsImpersonation,
+			ImpersonatedUser: parsed.ImpersonatedUser,
 		})
 		if pv.Denied {
 			obs.DecisionVerdict = VerdictDeny

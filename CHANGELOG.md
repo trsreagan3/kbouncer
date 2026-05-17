@@ -5,6 +5,87 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Opus readonly-profile audit closure (2026-05-17)
+
+The Opus readonly-profile audit ([#222]) found `readonly` not fit-for-
+purpose as a launch safety opt-in. The name oversold the guarantee
+(reads of sensitive data still pass), the verb list missed eight
+high-blast-radius primitives, and the parser ignored impersonation
+headers entirely. This change renames + hardens.
+
+**Rename: `readonly` → `safe-default`**
+
+- Canonical built-in defaults are now `full-user` (passthrough) +
+  `safe-default` (cross-product safe-by-default deny layer).
+- Description rewritten to name what the layer actually is: a blast-
+  radius floor, NOT a confidentiality boundary.
+- Aliases that still resolve in v1.0 (one-line deprecation banner;
+  removed v1.1):
+  - `none` → `full-user`
+  - `prod-readonly` → `safe-default`
+  - `readonly` → `safe-default`  **(NEW alias from this change)**
+
+**Hardened `safe-default.deny_verbs` (Gap-K-1..K-7, K-12)**
+
+Adds 8 verbs to the existing 8:
+
+| Verb | Gap | Why |
+| --- | --- | --- |
+| `proxy` | Gap-K-1 | `/pods\|services\|nodes/{name}/proxy` — RBAC bypass tunnel; nodes/proxy = kubelet API arbitrary exec |
+| `eviction` | Gap-K-2 | Pod deletion by another name |
+| `scale` | Gap-K-3 | Replica-count mutation (scale-to-0 DoS; scale-to-large cost attack) |
+| `status` | Gap-K-4 | Controller-state poisoning |
+| `finalize` | Gap-K-5 | Bypass deletion protection |
+| `ephemeralcontainers` | Gap-K-6 | Debug-container injection = exec equivalent |
+| `token` | Gap-K-7 | TokenRequest = credential minting (POST `/serviceaccounts/{name}/token`) |
+| `binding` | Gap-K-12 | Manual scheduling bypass (POST `/pods/{name}/binding`) |
+
+**New Profile schema fields**
+
+- `exempt_resources_for_verb_deny: {verb: [group/resource, ...]}` —
+  carves SSAR / SAR / TokenReview / SelfSubjectRulesReview out of
+  the `create` verb deny so `kubectl auth can-i` keeps working.
+  Match is on the FULL `group/resource` pair so a CRD with a
+  colliding resource name in a different group is NOT exempted.
+- `deny_on_impersonation: bool` — when true, requests carrying any
+  of the `Impersonate-User` / `Impersonate-Group` / `Impersonate-Uid`
+  / `Impersonate-Extra-*` header family are denied regardless of
+  verb (Gap-K-9). Default true under `safe-default`.
+- `deny_subresource_writes: bool` — long-tail safety net for CRD-
+  defined mutating subresources not enumerated in `deny_verbs`.
+  POST/PUT/PATCH/DELETE against ANY subresource (except `log` /
+  `logs` per False-positive-K-1) is denied (Gap-K-14). Default true
+  under `safe-default`.
+
+**Parser: impersonation header parsing**
+
+`parser.ParsedRequest` gains `IsImpersonation`, `ImpersonatedUser`,
+`ImpersonatedGroups`. The `Impersonate-Extra-*` family uses a
+header-name PREFIX (not a fixed name); the parser scans all header
+names for the prefix so an Extra-* prefix-only request is still
+flagged.
+
+**Profile evaluator: dry-run carve-out**
+
+`?dryRun=All` requests (which the apiserver returns as previews
+without persisting state) short-circuit profile evaluation at
+order-1, bypassing `deny_verbs` so `kubectl apply --dry-run` +
+agent plan-capture flows keep working (False-positive-K-3).
+
+**Audit-cadence self-check (per `feedback_audit_cadence_discipline`)**
+
+- (a) `Impersonate-Extra-*` family: the parser iterates all header
+  names with the canonical prefix and flips `IsImpersonation` even
+  when only Extra-* is present. Pinned by parser test
+  `Impersonate-Extra-* prefix only`.
+- (b) SSAR exemption check uses the FULL `group/resource` string,
+  not just resource name. A CRD shipping `example.com/tokenreviews`
+  is still denied. Pinned by profile test
+  `TestSafeDefault_SSARExempt_DoesNotLeakAcrossGroups`.
+- (c) The `log` / `logs` subresource carve-out is case-insensitive
+  and covers both singular + plural across GET/POST shapes. Pinned
+  by `TestSafeDefault_SubresourceLongTail_PreservesLogCarveOut`.
+
 ### Bounce-suite rename (2026-05-17)
 
 Renamed `kbouncer` → `kbounce` as part of the Bounce-suite rename

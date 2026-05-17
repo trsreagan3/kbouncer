@@ -347,3 +347,71 @@ func TestParse_RawPathPreservesQuery(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/api/v1/pods?watch=true&timeoutSeconds=60", got.RawPath)
 }
+
+// TestParse_ImpersonationHeaderFamily closes Gap-K-9 from the Opus
+// readonly-profile audit. The parser must flag IsImpersonation true
+// when ANY of the impersonation header family is present —
+// Impersonate-User / Impersonate-Group / Impersonate-Uid /
+// Impersonate-Extra-* (the last is a NAME PREFIX, not a fixed
+// header). Audit-cadence note (a): a request that carries only
+// Impersonate-Extra-scopes must still flip the flag.
+func TestParse_ImpersonationHeaderFamily(t *testing.T) {
+	t.Run("none present", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.False(t, got.IsImpersonation)
+		assert.Empty(t, got.ImpersonatedUser)
+		assert.Empty(t, got.ImpersonatedGroups)
+	})
+
+	t.Run("Impersonate-User", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Set("Impersonate-User", "cluster-admin")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.True(t, got.IsImpersonation)
+		assert.Equal(t, "cluster-admin", got.ImpersonatedUser)
+	})
+
+	t.Run("Impersonate-Group multi-value", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Add("Impersonate-Group", "system:masters")
+		req.Header.Add("Impersonate-Group", "system:authenticated")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.True(t, got.IsImpersonation)
+		assert.Equal(t, []string{"system:masters", "system:authenticated"}, got.ImpersonatedGroups)
+	})
+
+	t.Run("Impersonate-Uid alone", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Set("Impersonate-Uid", "abc-123")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.True(t, got.IsImpersonation,
+			"Impersonate-Uid alone must flip the flag")
+	})
+
+	t.Run("Impersonate-Extra-* prefix only", func(t *testing.T) {
+		// Audit-cadence note (a): only Extra-* present (no User /
+		// Group / Uid) must still flag the request. The Extra-*
+		// family uses a header-name prefix, not a fixed name.
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Set("Impersonate-Extra-Scopes", "view")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.True(t, got.IsImpersonation,
+			"Impersonate-Extra-* prefix-only request must flip the flag")
+	})
+
+	t.Run("Impersonate-Extra-* + Impersonate-User together", func(t *testing.T) {
+		req := MustParseTestURL(http.MethodGet, "/api/v1/pods")
+		req.Header.Set("Impersonate-User", "ci-runner")
+		req.Header.Set("Impersonate-Extra-Tenant", "team-alpha")
+		got, err := Parse(req)
+		require.NoError(t, err)
+		assert.True(t, got.IsImpersonation)
+		assert.Equal(t, "ci-runner", got.ImpersonatedUser)
+	})
+}

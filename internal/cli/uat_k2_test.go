@@ -57,30 +57,33 @@ func TestAuditTail_AcceptsValidLimit(t *testing.T) {
 // previously-missing `kbounce profile show NAME` subcommand now exists
 // and prints the full record, or exits 1 if the profile is missing.
 //
-// Found case asserts on the built-in `readonly` profile from defaults.
+// Found case asserts on the built-in `safe-default` profile from
+// defaults (renamed from `readonly` 2026-05-17 per the Opus audit
+// closure).
 func TestProfileShow_Found(t *testing.T) {
 	// Point profiles-path at an empty tempdir so LoadProfiles falls
-	// back to embedded defaults (which include readonly + full-user).
+	// back to embedded defaults (which include safe-default +
+	// full-user).
 	pfPath := filepath.Join(t.TempDir(), "profiles.yaml")
 	root := newRootCmd()
 	var stdout, stderr bytes.Buffer
 	root.SetOut(&stdout)
 	root.SetErr(&stderr)
-	root.SetArgs([]string{"profile", "show", "readonly", "--profiles-path", pfPath})
+	root.SetArgs([]string{"profile", "show", "safe-default", "--profiles-path", pfPath})
 	require.NoError(t, root.Execute())
 
 	out := stdout.String()
 	assert.Contains(t, out, "name:")
-	assert.Contains(t, out, "readonly")
+	assert.Contains(t, out, "safe-default")
 	assert.Contains(t, out, "deny_verbs:")
 	assert.Contains(t, out, "delete")
 }
 
 // TestProfileShow_AliasResolvesToCanonical pins that legacy profile
-// names (`none`, `prod-readonly`) resolve to their canonical
-// replacement when shown. The deprecation warning goes to OS stderr,
-// not cobra's stderr buffer, so we don't assert on its presence here
-// (covered by profile package tests).
+// names (`none`, `prod-readonly`, `readonly`) resolve to their
+// canonical replacement when shown. The deprecation warning goes
+// to OS stderr, not cobra's stderr buffer, so we don't assert on
+// its presence here (covered by profile package tests).
 func TestProfileShow_AliasResolvesToCanonical(t *testing.T) {
 	pfPath := filepath.Join(t.TempDir(), "profiles.yaml")
 	root := newRootCmd()
@@ -91,8 +94,24 @@ func TestProfileShow_AliasResolvesToCanonical(t *testing.T) {
 	require.NoError(t, root.Execute())
 
 	out := stdout.String()
-	// Resolves to the canonical "readonly" record.
-	assert.Contains(t, out, "name:         readonly")
+	// Resolves to the canonical "safe-default" record.
+	assert.Contains(t, out, "name:         safe-default")
+}
+
+// TestProfileShow_ReadonlyAliasResolvesToSafeDefault pins the new
+// alias added by the Opus readonly-profile audit closure:
+// `readonly` is now a legacy alias for `safe-default`. v1.1 removes.
+func TestProfileShow_ReadonlyAliasResolvesToSafeDefault(t *testing.T) {
+	pfPath := filepath.Join(t.TempDir(), "profiles.yaml")
+	root := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"profile", "show", "readonly", "--profiles-path", pfPath})
+	require.NoError(t, root.Execute())
+
+	out := stdout.String()
+	assert.Contains(t, out, "name:         safe-default")
 }
 
 // TestVersionString_FormatHIGHK206 closes UAT-K2 HIGH-K2-06: the

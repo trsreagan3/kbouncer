@@ -5,7 +5,7 @@
 // engine. When active, a profile's denies are a HARD FLOOR — they fire
 // even if a task scope or global rule would have allowed the call. This
 // is the property SecOps teams need to approve the install: "if I say
-// 'readonly', the agent CAN NOT mutate anything regardless of which
+// 'safe-default', the agent CAN NOT mutate anything regardless of which
 // other rules are loaded."
 //
 // Profiles are symmetric across kbounce (this package) and the Python
@@ -14,12 +14,16 @@
 //
 // Composition order (LOAD-BEARING — do not reorder):
 //
-//  1. Profile deny_keywords match (and not in exceptions) → DENY (source=profile)
-//  2. Profile only_clusters mismatch                       → DENY (source=profile)
-//  3. Profile deny_verbs match                             → DENY (source=profile)
-//  4. Active task-scope deny                               → DENY (source=task)
-//  5. Active task-scope allow                              → ALLOW (source=task)
-//  6. Global rules                                         → standard match flow
+//  1. Profile dry-run carve-out (req.IsDryRun=true)        → ABSTAIN
+//  2. Profile impersonation deny (req.IsImpersonation +
+//     profile.DenyOnImpersonation)                         → DENY (source=profile)
+//  3. Profile deny_keywords match (and not in exceptions)  → DENY (source=profile)
+//  4. Profile only_clusters mismatch                       → DENY (source=profile)
+//  5. Profile deny_verbs match (less exempt_resources)     → DENY (source=profile)
+//  6. Profile deny_subresource_writes long-tail net        → DENY (source=profile)
+//  7. Active task-scope deny                               → DENY (source=task)
+//  8. Active task-scope allow                              → ALLOW (source=task)
+//  9. Global rules                                         → standard match flow
 //
 // Profile rules fire BEFORE task / global rules. A permissive task scope
 // CANNOT override a profile deny. See [[safety-mode-two-modes]] and
@@ -27,17 +31,25 @@
 //
 // Embedded default profiles (only two, intentionally):
 //
-//   - full-user — passthrough sentinel (zero rules). Default when no
+//   - full-user    — passthrough sentinel (zero rules). Default when no
 //     --profile / KBOUNCER_PROFILE is selected.
-//   - readonly  — blocks write + destructive verbs (delete, patch,
-//     create, update, deletecollection, exec, portforward, attach).
-//     General-purpose safety net; works in any environment.
+//   - safe-default — cross-product safe-by-default: blocks operations
+//     whose blast radius is high enough that the average operator wants
+//     them gated (mutating verbs + destructive non-writes + state-
+//     changers + privilege primitives + impersonation + subresource
+//     long-tail). NOT a confidentiality boundary — reads of sensitive
+//     data still pass. General-purpose safety net; works in any
+//     environment.
 //
 // Backward-compat aliases (mapped to new names at lookup; deprecation-
 // warned in v1.0, removed in v1.1):
 //
 //   - "none"          → "full-user"
-//   - "prod-readonly" → "readonly"
+//   - "prod-readonly" → "safe-default"
+//   - "readonly"      → "safe-default"  (renamed 2026-05-17 — the
+//     prior name oversold the guarantee; the safe-default rule set
+//     blocks much more than reads, and reads of sensitive data still
+//     pass. See the Opus readonly-profile audit closure.)
 //
 // Other environment-specific profiles (staging-work, dev-only,
 // incident-response) ship in the kbounce repo's `community-profiles/`
@@ -123,6 +135,27 @@ type ParsedRequest struct {
 	// URL targets a subresource (exec, log, ...).
 	Verb string
 
+	// Method is the upper-case HTTP method, used by the subresource-
+	// write long-tail safety net (deny_subresource_writes) to decide
+	// whether a subresource call is mutating.
+	Method string
+
+	// Group is the K8s API group ("apps", "rbac.authorization.k8s.io",
+	// "" for core). Used by exempt_resources_for_verb_deny to match
+	// the full group/resource pair so a CRD with a colliding resource
+	// name in a different group is NOT accidentally exempted.
+	Group string
+
+	// Resource is the plural lowercase resource name ("pods",
+	// "deployments"). Used by exempt_resources_for_verb_deny along
+	// with Group.
+	Resource string
+
+	// Subresource is the trailing path segment when present ("exec",
+	// "status", "scale", "log", ...). Used by the subresource-write
+	// long-tail safety net.
+	Subresource string
+
 	// Namespace is the namespace from the URL or "" for cluster-scoped.
 	Namespace string
 
@@ -134,6 +167,24 @@ type ParsedRequest struct {
 	// determine it; "" otherwise. Used for only_clusters matching and
 	// for the "cluster" keyword target.
 	Cluster string
+
+	// IsDryRun is true when ?dryRun=All was on the inbound URL. dry-run
+	// requests are a server-side preview — they return what WOULD have
+	// happened without persisting state. safe-default permits them so
+	// kubectl apply --dry-run + agent plan-capture flows keep working.
+	IsDryRun bool
+
+	// IsImpersonation is true when the inbound request carried any of
+	// the Impersonate-User / Impersonate-Group / Impersonate-Extra-*
+	// headers. The header family is parsed by package parser; the
+	// proxy mirrors the flag here so profile.Evaluate can deny under
+	// safe-default without a parser-package dependency.
+	IsImpersonation bool
+
+	// ImpersonatedUser is the value of the Impersonate-User header
+	// when present. Used only for the deny-reason string so the audit
+	// row shows who the caller tried to impersonate.
+	ImpersonatedUser string
 }
 
 // ProfileAllowRule is one allow rule embedded in a profile. Profile-
@@ -195,6 +246,40 @@ type Profile struct {
 	// the parsed request's Verb, cause a deny. Useful for "read-only"
 	// profiles (deny delete/patch/create/update).
 	DenyVerbs []string `yaml:"deny_verbs,omitempty"`
+
+	// ExemptResourcesForVerbDeny carves specific group/resource pairs
+	// out of DenyVerbs on a per-verb basis. Map shape: verb → list of
+	// "group/resource" strings (group is "" for core API resources,
+	// matching parser.ParsedRequest.Group).
+	//
+	// Use case: SSAR / SAR / TokenReview / SelfSubjectRulesReview are
+	// POSTs but the API contract is "tell me what I could do" — they
+	// don't mutate cluster state. Exempting them keeps kubectl
+	// `auth can-i` and Helm preflight working under safe-default.
+	//
+	// Match is on the FULL group/resource pair so a CRD with the same
+	// resource name in a different group (e.g. example.com/tokenreviews
+	// vs authentication.k8s.io/tokenreviews) is NOT accidentally
+	// exempted. Strings are lower-cased on both sides at match time.
+	ExemptResourcesForVerbDeny map[string][]string `yaml:"exempt_resources_for_verb_deny,omitempty"`
+
+	// DenyOnImpersonation, when true, causes any request that carried
+	// an Impersonate-User / Impersonate-Group / Impersonate-Extra-*
+	// header to be denied — regardless of verb. Closes Gap-K-9 from
+	// the Opus readonly audit: impersonation lets a caller cross into
+	// another principal's permission set, which is a privilege-
+	// primitive (independent of the verb being executed).
+	DenyOnImpersonation bool `yaml:"deny_on_impersonation,omitempty"`
+
+	// DenySubresourceWrites, when true, denies POST/PUT/PATCH/DELETE
+	// against ANY subresource (with a hardcoded carve-out for log /
+	// logs which are read-only streams per False-positive-K-1).
+	//
+	// Long-tail safety net for CRD-defined mutating subresources not
+	// enumerated in DenyVerbs — e.g. argoproj.io's Application/sync,
+	// Argo CD rollouts. Without this, a CRD shipping a /sync or
+	// /restart subresource silently slips through safe-default.
+	DenySubresourceWrites bool `yaml:"deny_subresource_writes,omitempty"`
 
 	// Exceptions is a false-positive allowlist. If any exception string
 	// appears as a substring of any keyword target field, the keyword
@@ -285,19 +370,34 @@ const FullUserProfileName = "full-user"
 // Deprecated: use FullUserProfileName.
 const NoneProfileName = "none"
 
-// ReadonlyProfileName is the reserved profile name for the general-
-// purpose read-only safety net. Renamed from "prod-readonly" in the
-// 2026-05-17 default-profile reshape (the rule set isn't prod-specific —
-// it's "block write + destructive verbs in ANY environment").
+// SafeDefaultProfileName is the reserved profile name for the cross-
+// product safe-by-default deny layer. Renamed from "readonly" on
+// 2026-05-17 (Opus readonly-profile audit closure): the prior name
+// oversold the guarantee — the rule set blocks much more than reads
+// AND reads of sensitive data still pass, so "readonly" mis-described
+// both halves. "safe-default" names what the layer actually is: a
+// blast-radius floor most operators want on by default.
+const SafeDefaultProfileName = "safe-default"
+
+// ReadonlyProfileName is the legacy alias for SafeDefaultProfileName,
+// preserved for backward-compat at the lookup surface (one-line
+// deprecation banner on resolution). v1.1 removes the alias.
+//
+// Deprecated: use SafeDefaultProfileName.
 const ReadonlyProfileName = "readonly"
 
 // profileAliases maps legacy profile names to their canonical
 // replacement. Lookups that hit an alias emit a one-shot deprecation
 // warning + transparently resolve to the canonical name. v1.1 removes
 // this map.
+//
+// "readonly" was itself a canonical name in the prior release; it's
+// now an alias for "safe-default" to follow the same pattern that
+// landed "prod-readonly" → "readonly" in the bounce-suite rename.
 var profileAliases = map[string]string{
 	"none":          FullUserProfileName,
-	"prod-readonly": ReadonlyProfileName,
+	"prod-readonly": SafeDefaultProfileName,
+	"readonly":      SafeDefaultProfileName,
 }
 
 // resolveProfileAlias returns the canonical profile name for an alias,
@@ -404,11 +504,12 @@ func (p *Profile) validate() error {
 // back to the default. Silent fallback hides typos and would let the
 // operator think they're protected when they're not.
 //
-// Backward-compat: legacy profile names ("none", "prod-readonly")
-// resolve to their canonical replacements ("full-user", "readonly")
-// with a one-line deprecation notice printed to stderr. v1.1 removes
-// the alias path entirely. End-user invocations are the only consumers
-// of aliases; internal callers use the canonical names directly.
+// Backward-compat: legacy profile names ("none", "prod-readonly",
+// "readonly") resolve to their canonical replacements ("full-user",
+// "safe-default", "safe-default") with a one-line deprecation notice
+// printed to stderr. v1.1 removes the alias path entirely. End-user
+// invocations are the only consumers of aliases; internal callers use
+// the canonical names directly.
 func (ps *Profiles) Active(name string) (*Profile, error) {
 	if ps == nil {
 		return nil, ErrUnknownProfile
@@ -459,7 +560,42 @@ func (p *Profile) Evaluate(req *ParsedRequest) Verdict {
 		return Verdict{}
 	}
 
-	// Order 1: deny_keywords (with exceptions allowlist).
+	// Order 1: dry-run carve-out (False-positive-K-3).
+	// ?dryRun=All asks the apiserver to return what WOULD have happened
+	// without persisting state. safe-default treats these as previews
+	// and abstains so kubectl apply --dry-run + agent plan-capture
+	// flows keep working. The carve-out is unconditional under any
+	// profile because the semantic ("no state change") is the same.
+	// deny_keywords / only_clusters still need to be allowed to fire
+	// AFTER this short-circuit returns — but a dry-run by definition
+	// doesn't reach state, so we exit here. (If a future profile wants
+	// to gate dry-runs too — e.g. don't leak resource existence — it
+	// can gain its own opt-in field.)
+	if req.IsDryRun {
+		return Verdict{}
+	}
+
+	// Order 2: impersonation deny (Gap-K-9).
+	// Impersonation lets the caller cross into another principal's
+	// permission set; under safe-default this is denied regardless of
+	// verb because it's a privilege primitive, not a per-action risk.
+	if p.DenyOnImpersonation && req.IsImpersonation {
+		who := req.ImpersonatedUser
+		if who == "" {
+			who = "<unset>"
+		}
+		return Verdict{
+			Denied: true,
+			Reason: fmt.Sprintf(
+				"profile %q: impersonation requested via Impersonate-User=%q header; "+
+					"safe-default denies impersonation by default",
+				p.Name, who),
+			Source:      SourceProfile,
+			ProfileName: p.Name,
+		}
+	}
+
+	// Order 3: deny_keywords (with exceptions allowlist).
 	if len(p.DenyKeywords) > 0 {
 		mode := p.KeywordMatch
 		if mode == "" {
@@ -485,7 +621,7 @@ func (p *Profile) Evaluate(req *ParsedRequest) Verdict {
 		}
 	}
 
-	// Order 2: only_clusters mismatch.
+	// Order 4: only_clusters mismatch.
 	if len(p.OnlyClusters) > 0 {
 		if !containsFold(p.OnlyClusters, req.Cluster) {
 			cl := req.Cluster
@@ -501,12 +637,35 @@ func (p *Profile) Evaluate(req *ParsedRequest) Verdict {
 		}
 	}
 
-	// Order 3: deny_verbs match.
+	// Order 5: deny_verbs match — with per-verb resource exemptions.
 	if len(p.DenyVerbs) > 0 && req.Verb != "" {
 		if containsFold(p.DenyVerbs, req.Verb) {
+			if !p.isExemptResourceForVerb(req) {
+				return Verdict{
+					Denied:      true,
+					Reason:      fmt.Sprintf("profile %q: verb %q in deny_verbs", p.Name, req.Verb),
+					Source:      SourceProfile,
+					ProfileName: p.Name,
+				}
+			}
+			// Exempt — fall through to abstain.
+		}
+	}
+
+	// Order 6: deny_subresource_writes long-tail safety net (Gap-K-14).
+	// Catches CRD-defined mutating subresources not enumerated in
+	// deny_verbs. POST/PUT/PATCH/DELETE on ANY subresource is denied,
+	// EXCEPT the log/logs read-only stream carve-out (False-positive-K-1).
+	if p.DenySubresourceWrites && req.Subresource != "" {
+		if isWriteMethod(req.Method) && !isLogSubresource(req.Subresource) {
 			return Verdict{
-				Denied:      true,
-				Reason:      fmt.Sprintf("profile %q: verb %q in deny_verbs", p.Name, req.Verb),
+				Denied: true,
+				Reason: fmt.Sprintf(
+					"profile %q: %s on subresource %q (resource %q); "+
+						"safe-default's deny_subresource_writes rule catches "+
+						"CRD-defined mutating subresources not in the static "+
+						"deny_verbs list",
+					p.Name, req.Method, req.Subresource, req.Resource),
 				Source:      SourceProfile,
 				ProfileName: p.Name,
 			}
@@ -515,6 +674,56 @@ func (p *Profile) Evaluate(req *ParsedRequest) Verdict {
 
 	// No profile rule fired; defer to the next layer.
 	return Verdict{}
+}
+
+// isExemptResourceForVerb returns true when the request's (verb,
+// group/resource) is listed in p.ExemptResourcesForVerbDeny — i.e.
+// the verb is on the deny list but this specific resource carved out.
+// Match is on the FULL group/resource pair (audit-cadence note (b)
+// in the commit body: a CRD with the same resource name in a different
+// group MUST NOT be accidentally exempted).
+func (p *Profile) isExemptResourceForVerb(req *ParsedRequest) bool {
+	if len(p.ExemptResourcesForVerbDeny) == 0 {
+		return false
+	}
+	if req.Resource == "" {
+		return false
+	}
+	verb := strings.ToLower(req.Verb)
+	exempts, ok := p.ExemptResourcesForVerbDeny[verb]
+	if !ok {
+		return false
+	}
+	want := strings.ToLower(req.Group + "/" + req.Resource)
+	for _, e := range exempts {
+		if strings.EqualFold(strings.TrimSpace(e), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// isWriteMethod returns true for HTTP methods that mutate state on
+// kube-apiserver. GET/HEAD/OPTIONS/CONNECT/TRACE are read-only by
+// HTTP semantic; POST/PUT/PATCH/DELETE mutate.
+func isWriteMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case "POST", "PUT", "PATCH", "DELETE":
+		return true
+	}
+	return false
+}
+
+// isLogSubresource carves "log" / "logs" out of the subresource-write
+// long-tail safety net (audit-cadence note (c) in the commit body:
+// the carve-out applies across all GET/POST shapes because log is
+// always read-only — the only "POST /log" path on kube-apiserver
+// would be a CRD redefining the subresource, which is rare enough
+// that we accept the small leak in exchange for guaranteed kubectl
+// logs / follow=true compatibility).
+func isLogSubresource(sub string) bool {
+	s := strings.ToLower(sub)
+	return s == "log" || s == "logs"
 }
 
 // collectCandidates pulls the candidate strings for the configured
