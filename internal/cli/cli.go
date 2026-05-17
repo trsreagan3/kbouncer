@@ -28,6 +28,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/trsreagan3/kbouncer/internal/mcp"
+	"github.com/trsreagan3/kbouncer/internal/mcpinstall"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
 	"github.com/trsreagan3/kbouncer/internal/store"
@@ -945,22 +946,42 @@ func newAuditTailCmd() *cobra.Command {
 	return cmd
 }
 
-// newMCPCmd implements `kbounce mcp` — the MCP-over-stdio server an
-// agent (Claude Code, Cursor, Codex, Devin) connects to so it can
-// introspect + scope itself via the kbounce_* tool family.
+// newMCPCmd implements `kbounce mcp` — a command group for the
+// MCP-over-stdio server an agent (Claude Code, Cursor, Codex, Devin)
+// connects to so it can introspect + scope itself via the kbounce_*
+// tool family.
 //
-// Configuration mirrors `kbounce run` so the MCP server speaks for
-// the same live state the proxy enforces:
+// Subcommands:
 //
-//   --db / KBOUNCER_DB          audit store
-//   --profile / KBOUNCER_PROFILE active profile
-//   --profiles-path             path to profiles.yaml
-//   --mode / --default-policy   so kbounce_active_mode returns truth
-//   --owner                     task-owner slot
+//	kbounce mcp serve                 — start the JSON-RPC stdio server
+//	kbounce mcp install-claude-code   — wire kbounce into Claude Code / Desktop
+//	kbounce mcp install-cursor        — wire kbounce into Cursor
+//	kbounce mcp install-codex         — wire kbounce into Codex (manual snippet)
+//	kbounce mcp show-config           — print the canonical JSON snippet
+//	kbounce mcp list-tools            — print the tool list (name + summary)
 //
-// stdin/stdout are reserved for the JSON-RPC stream; the CLI banner
-// goes to stderr so it doesn't poison the wire.
+// Backward compatibility (per #229): `kbounce mcp` with no subcommand
+// still starts the server (same as `kbounce mcp serve`). The install-*
+// commands generate configs that point at `kbounce mcp serve` (NOT
+// bare `kbounce mcp`) so the generated configs don't depend on the
+// back-compat bare-default shape — if we ever change that default
+// later, configs already written to operator laptops keep working.
+//
+// Server-config flags (--db, --profile, --profiles-path, --mode,
+// --default-policy, --owner, --actor) live on the `serve` subcommand
+// and are mirrored on bare `kbounce mcp` so existing scripts that
+// invoke `kbounce mcp --db ...` keep working.
+//
+// Cross-product agent parity (per [[cross-product-agent-parity]]):
+// these subcommands match the shape of `ibounce mcp install-*` on
+// the iam-jit side — same flag names (--path, --force), same path-
+// detection logic, same atomic-write pattern, same show-config /
+// list-tools output structure. The MCP server entrypoint command +
+// tool-name prefix differ (kbounce vs ibounce; kbounce_* vs
+// ibounce_*); everything else is the same shape.
 func newMCPCmd() *cobra.Command {
+	// Shared serve flag values, bound on both the parent (back-compat
+	// for `kbounce mcp --db ...`) and the `serve` subcommand.
 	var (
 		dbPath        string
 		profileName   string
@@ -970,16 +991,95 @@ func newMCPCmd() *cobra.Command {
 		owner         string
 		actor         string
 	)
-	cmd := &cobra.Command{
-		Use:   "mcp",
-		Short: "Run the MCP-over-stdio server for agent clients",
-		Long: `Run the kbounce MCP server on stdin/stdout.
 
-Agents (Claude Code, Cursor, Codex, Devin) connect to this command via
-their MCP transport config + discover tools via JSON-RPC 2.0
-` + "`tools/list`" + `. The tool family mirrors iam-jit-bouncer's
-` + "`bouncer_*`" + ` shape so agents that learned one product
-understand the other.
+	runServe := func(cmd *cobra.Command, args []string) error {
+		mode, err := proxy.ParseMode(modeStr)
+		if err != nil {
+			return err
+		}
+		defaultPol, err := proxy.ParseDefaultPolicy(defaultPolStr)
+		if err != nil {
+			return err
+		}
+		st, err := store.Open(dbPath)
+		if err != nil {
+			return fmt.Errorf("open store: %w", err)
+		}
+		defer st.Close()
+
+		if profileName == "" {
+			profileName = os.Getenv(envProfileVar)
+		}
+		resolvedProfilesPath := profilesPath
+		if resolvedProfilesPath == "" {
+			resolvedProfilesPath, err = profile.DefaultProfilesPath()
+			if err != nil {
+				return fmt.Errorf("resolve profiles path: %w", err)
+			}
+		}
+		profiles, err := profile.LoadProfiles(resolvedProfilesPath)
+		if err != nil {
+			return fmt.Errorf("load profiles: %w", err)
+		}
+		activeProfile, _ := profiles.Active(profileName) // err on unknown; we still want to serve
+
+		srv := mcp.NewServer(mcp.Config{
+			Store:         st,
+			ActiveProfile: activeProfile,
+			ProfilesPath:  resolvedProfilesPath,
+			Mode:          mode,
+			DefaultPolicy: defaultPol,
+			TaskOwner:     owner,
+			Actor:         actor,
+		})
+
+		fmt.Fprintf(os.Stderr,
+			"kbounce mcp serving on stdio (mode=%s, profile=%s, db=%s)\n",
+			mode, profileName, st.Path())
+		fmt.Fprintln(os.Stderr, "Press Ctrl+D / close stdin to stop.")
+
+		return srv.Serve(os.Stdin, os.Stdout)
+	}
+
+	addServeFlags := func(cmd *cobra.Command) {
+		cmd.Flags().StringVar(&dbPath, "db", "",
+			"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env). "+
+				"MUST match the path the running proxy uses for live audit-log "+
+				"access via kbounce_tail_decisions.")
+		cmd.Flags().StringVar(&profileName, "profile", "",
+			"Active environment profile name (mirror of `kbounce run --profile`). "+
+				"Surfaced by kbounce_active_profile.")
+		cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+			"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
+		cmd.Flags().StringVar(&modeStr, "mode", "cooperative",
+			"Mode the running proxy is in (cooperative | transparent). "+
+				"Returned by kbounce_active_mode.")
+		cmd.Flags().StringVar(&defaultPolStr, "default-policy", "deny",
+			"Default policy the running proxy is in (allow | deny).")
+		cmd.Flags().StringVar(&owner, "owner", "",
+			"Task-owner slot. Empty = default-owner slot (single-laptop).")
+		cmd.Flags().StringVar(&actor, "actor", "",
+			"Actor name recorded in audit rows when MCP-initiated mutations land "+
+				"(default: 'kbounce-mcp').")
+	}
+
+	parent := &cobra.Command{
+		Use:   "mcp",
+		Short: "MCP-over-stdio server + agent-client install helpers",
+		Long: `MCP-over-stdio server + install helpers for the common agent
+clients (Claude Code, Cursor, Codex).
+
+Subcommands:
+
+  kbounce mcp serve                 start the JSON-RPC stdio server
+  kbounce mcp install-claude-code   wire kbounce into Claude Code / Desktop
+  kbounce mcp install-cursor        wire kbounce into Cursor
+  kbounce mcp install-codex         print Codex TOML snippet (manual install)
+  kbounce mcp show-config           print the canonical JSON / YAML snippet
+  kbounce mcp list-tools            print the kbounce_* tool list
+
+For backward compatibility ` + "`kbounce mcp`" + ` with no subcommand
+still starts the server (same as ` + "`kbounce mcp serve`" + `).
 
 The MCP server reads the SAME on-disk state the running proxy uses
 (--db + --profiles-path). It does NOT start a proxy listener of its
@@ -988,75 +1088,220 @@ layer.
 
 stdin/stdout are reserved for the JSON-RPC stream; logs + banner go
 to stderr so they don't poison the wire.`,
+		Args: cobra.ArbitraryArgs,
+		// Back-compat: bare `kbounce mcp` starts the server. cobra will
+		// route to subcommands when args[0] matches a known sub.
+		RunE: runServe,
+	}
+	addServeFlags(parent)
+
+	// Canonical `mcp serve` subcommand. install-* commands point at this
+	// in the generated MCP config so the config isn't pinned to the
+	// back-compat bare-default shape.
+	serveCmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Run the MCP-over-stdio server (canonical name)",
+		Long: `Run the kbounce MCP server on stdin/stdout (canonical name;
+` + "`kbounce mcp`" + ` with no subcommand still works for back-compat).
+
+This is the command the install-* subcommands generate config for —
+the agent spawns ` + "`kbounce mcp serve`" + ` and speaks JSON-RPC 2.0
+on stdin/stdout.`,
+		Args: cobra.NoArgs,
+		RunE: runServe,
+	}
+	addServeFlags(serveCmd)
+	parent.AddCommand(serveCmd)
+
+	parent.AddCommand(newMCPInstallClaudeCodeCmd())
+	parent.AddCommand(newMCPInstallCursorCmd())
+	parent.AddCommand(newMCPInstallCodexCmd())
+	parent.AddCommand(newMCPShowConfigCmd())
+	parent.AddCommand(newMCPListToolsCmd())
+	return parent
+}
+
+// newMCPInstallClaudeCodeCmd implements `kbounce mcp install-claude-code`.
+func newMCPInstallClaudeCodeCmd() *cobra.Command {
+	var (
+		path  string
+		force bool
+	)
+	cmd := &cobra.Command{
+		Use:   "install-claude-code",
+		Short: "Install kbounce as an MCP server in Claude Code / Claude Desktop",
+		Long: `Add (or update) the ` + "`kbounce`" + ` MCP server entry in your
+Claude Code / Claude Desktop MCP config file.
+
+Default config path detection (first that exists wins; otherwise the
+first candidate is used as a fresh-install target):
+
+  macOS    ~/Library/Application Support/Claude/claude_desktop_config.json
+           ~/.config/claude-code/mcp.json
+           ~/.claude.json
+  Linux    ~/.config/Claude/claude_desktop_config.json
+           ~/.config/claude-code/mcp.json
+           ~/.claude.json
+  Windows  %APPDATA%/Claude/claude_desktop_config.json
+           ~/.claude.json
+
+Override with --path. The merge preserves any OTHER mcpServers
+entries; the kbounce entry is REPLACED (not appended) so re-running
+is idempotent. --force overrides a malformed-existing-config refusal.
+
+After install, restart your MCP client so it re-reads the config.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mode, err := proxy.ParseMode(modeStr)
-			if err != nil {
-				return err
-			}
-			defaultPol, err := proxy.ParseDefaultPolicy(defaultPolStr)
-			if err != nil {
-				return err
-			}
-			st, err := store.Open(dbPath)
-			if err != nil {
-				return fmt.Errorf("open store: %w", err)
-			}
-			defer st.Close()
-
-			if profileName == "" {
-				profileName = os.Getenv(envProfileVar)
-			}
-			resolvedProfilesPath := profilesPath
-			if resolvedProfilesPath == "" {
-				resolvedProfilesPath, err = profile.DefaultProfilesPath()
-				if err != nil {
-					return fmt.Errorf("resolve profiles path: %w", err)
-				}
-			}
-			profiles, err := profile.LoadProfiles(resolvedProfilesPath)
-			if err != nil {
-				return fmt.Errorf("load profiles: %w", err)
-			}
-			activeProfile, _ := profiles.Active(profileName) // err on unknown; we still want to serve
-
-			srv := mcp.NewServer(mcp.Config{
-				Store:         st,
-				ActiveProfile: activeProfile,
-				ProfilesPath:  resolvedProfilesPath,
-				Mode:          mode,
-				DefaultPolicy: defaultPol,
-				TaskOwner:     owner,
-				Actor:         actor,
+			_, err := mcpinstall.InstallClaudeCode(mcpinstall.Options{
+				Path:   path,
+				Force:  force,
+				Out:    cmd.OutOrStdout(),
+				Stderr: cmd.ErrOrStderr(),
 			})
-
-			fmt.Fprintf(os.Stderr,
-				"kbounce mcp serving on stdio (mode=%s, profile=%s, db=%s)\n",
-				mode, profileName, st.Path())
-			fmt.Fprintln(os.Stderr, "Press Ctrl+D / close stdin to stop.")
-
-			return srv.Serve(os.Stdin, os.Stdout)
+			return err
 		},
 	}
-	cmd.Flags().StringVar(&dbPath, "db", "",
-		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env). "+
-			"MUST match the path the running proxy uses for live audit-log "+
-			"access via kbounce_tail_decisions.")
-	cmd.Flags().StringVar(&profileName, "profile", "",
-		"Active environment profile name (mirror of `kbounce run --profile`). "+
-			"Surfaced by kbounce_active_profile.")
-	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
-		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
-	cmd.Flags().StringVar(&modeStr, "mode", "cooperative",
-		"Mode the running proxy is in (cooperative | transparent). "+
-			"Returned by kbounce_active_mode.")
-	cmd.Flags().StringVar(&defaultPolStr, "default-policy", "deny",
-		"Default policy the running proxy is in (allow | deny).")
-	cmd.Flags().StringVar(&owner, "owner", "",
-		"Task-owner slot. Empty = default-owner slot (single-laptop).")
-	cmd.Flags().StringVar(&actor, "actor", "",
-		"Actor name recorded in audit rows when MCP-initiated mutations land "+
-			"(default: 'kbounce-mcp').")
+	cmd.Flags().StringVar(&path, "path", "",
+		"Override the auto-detected config path.")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Overwrite malformed existing config without prompting. The merge "+
+			"never overwrites OTHER mcpServers entries regardless of this flag.")
+	return cmd
+}
+
+// newMCPInstallCursorCmd implements `kbounce mcp install-cursor`.
+func newMCPInstallCursorCmd() *cobra.Command {
+	var (
+		path  string
+		force bool
+	)
+	cmd := &cobra.Command{
+		Use:   "install-cursor",
+		Short: "Install kbounce as an MCP server in Cursor",
+		Long: `Add (or update) the ` + "`kbounce`" + ` MCP server entry in your
+Cursor MCP config.
+
+Default config path: ~/.cursor/mcp.json (global). Pass --path to
+target a workspace-local .cursor/mcp.json instead.
+
+The merge preserves any OTHER mcpServers entries; the kbounce entry
+is REPLACED (not appended) so re-running is idempotent.
+
+After install, restart Cursor so it re-reads the config.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := mcpinstall.InstallCursor(mcpinstall.Options{
+				Path:   path,
+				Force:  force,
+				Out:    cmd.OutOrStdout(),
+				Stderr: cmd.ErrOrStderr(),
+			})
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&path, "path", "",
+		"Override the auto-detected config path (default: ~/.cursor/mcp.json).")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Overwrite malformed existing config without prompting.")
+	return cmd
+}
+
+// newMCPInstallCodexCmd implements `kbounce mcp install-codex`.
+func newMCPInstallCodexCmd() *cobra.Command {
+	var (
+		path  string
+		force bool
+	)
+	cmd := &cobra.Command{
+		Use:   "install-codex",
+		Short: "Print the Codex MCP server snippet (manual install)",
+		Long: `Codex stores MCP config in TOML (~/.codex/config.toml). To avoid
+corrupting unrelated keys in the operator's TOML config, kbounce
+refuses to edit the TOML file in place + instead prints a snippet
+the operator pastes into their Codex config.
+
+If you maintain a JSON-shaped Codex config elsewhere, pass
+--path /full/path/to/file.json — kbounce installs into JSON files
+the same way it does for Claude Code / Cursor.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := mcpinstall.InstallCodex(mcpinstall.Options{
+				Path:   path,
+				Force:  force,
+				Out:    cmd.OutOrStdout(),
+				Stderr: cmd.ErrOrStderr(),
+			})
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&path, "path", "",
+		"Override the default Codex config path. Pass a .json path to "+
+			"install into a JSON-shaped Codex MCP config; .toml paths "+
+			"are not edited in place.")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Overwrite malformed existing JSON config without prompting "+
+			"(no effect on the TOML manual-snippet path).")
+	return cmd
+}
+
+// newMCPShowConfigCmd implements `kbounce mcp show-config`.
+func newMCPShowConfigCmd() *cobra.Command {
+	var shape string
+	cmd := &cobra.Command{
+		Use:   "show-config",
+		Short: "Print the canonical MCP server config snippet",
+		Long: `Print the JSON (or YAML, with --shape yaml) snippet for any
+custom MCP client. Vendor-neutral — paste into any MCP-compatible
+agent's config.
+
+For the common MCP clients, use the install-* subcommands which
+detect the right config path + merge into the existing config
+preserving other mcpServers entries:
+
+  kbounce mcp install-claude-code
+  kbounce mcp install-cursor
+  kbounce mcp install-codex`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return mcpinstall.ShowConfig(cmd.OutOrStdout(), mcpinstall.Shape(shape))
+		},
+	}
+	cmd.Flags().StringVar(&shape, "shape", string(mcpinstall.ShapeJSON),
+		"Output shape: json | yaml.")
+	return cmd
+}
+
+// newMCPListToolsCmd implements `kbounce mcp list-tools`.
+//
+// Reads the live tool list from internal/mcp.ToolDescriptors() so the
+// output matches what an agent would see via `tools/list`. Useful for
+// operators verifying their install worked + for cross-product parity
+// audits.
+func newMCPListToolsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "list-tools",
+		Short: "Print the kbounce_* MCP tool list (name + 1-line summary)",
+		Long: `Print the tool descriptors served by the kbounce MCP server
+as a 2-column table (name + 1-line summary).
+
+The list is the same one ` + "`tools/list`" + ` returns to an agent client,
+so an operator who ran ` + "`kbounce mcp install-claude-code`" + ` can
+verify their install worked without restarting their agent.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			descriptors := mcp.ToolDescriptors()
+			entries := make([]mcpinstall.ToolListEntry, 0, len(descriptors))
+			for _, d := range descriptors {
+				name, _ := d["name"].(string)
+				desc, _ := d["description"].(string)
+				entries = append(entries, mcpinstall.ToolListEntry{
+					Name:        name,
+					Description: desc,
+				})
+			}
+			return mcpinstall.FormatToolList(cmd.OutOrStdout(), entries)
+		},
+	}
 	return cmd
 }
 
