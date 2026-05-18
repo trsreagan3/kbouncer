@@ -228,6 +228,15 @@ type Config struct {
 	// writeDecisionForTask is still the canonical source of truth
 	// regardless.
 	AuditEmitter audit.Emitter
+
+	// AgentRegistry, when non-nil, is the in-process map of
+	// MCP-session-id → AgentInfo populated by the MCP server's
+	// initialize handler. Proxy hot-path reads it on each inbound
+	// request that carries the X-Kbouncer-Session-Id header so the
+	// resulting audit event inherits the bound agent identity. Per
+	// [[agent-identity-in-audit]] Feature 2. nil disables the lookup
+	// (audit row still emits a User-Agent-derived agent block).
+	AgentRegistry *audit.Registry
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -437,7 +446,29 @@ type EvalOptions struct {
 	// `kbounce profile install --from URL`. The proxy server populates
 	// it from Config.ActiveProfile.Source.
 	AuditProfileSource string
+
+	// AgentRegistry, when non-nil, is consulted to resolve an MCP
+	// session-id header on the inbound request into a registered
+	// AgentInfo (per [[agent-identity-in-audit]] Feature 2). When the
+	// header is absent (e.g. raw kubectl call) the evaluator falls back
+	// to User-Agent fingerprinting; both sources land in the OCSF
+	// unmapped.iam_jit.agent block. Pure-evaluator callers leave it
+	// nil — the audit row still emits a default {name:"unknown",
+	// detected_from:"unknown"} block.
+	AgentRegistry *audit.Registry
 }
+
+// SessionHeaderName is the inbound HTTP header an MCP-aware client can
+// set to bind a proxied SDK call to an MCP session ID. The proxy
+// looks this up in opts.AgentRegistry to inherit the session's bound
+// agent fingerprint. Lowercase per Go's HTTP header normalization;
+// kept distinct from the bouncer's response headers (x-kbouncer-*).
+//
+// Per [[agent-identity-in-audit]] Don't list: session IDs are UUID v7
+// (random) so an inbound header value that doesn't match a registered
+// session is recorded as-is (best-effort) but NEVER trusted to inherit
+// another session's agent identity.
+const SessionHeaderName = "X-Kbouncer-Session-Id"
 
 // EvaluateRequestWithProfile is the K-Slice 7 evaluator. It runs the
 // composition order documented on the profile package:
@@ -483,6 +514,13 @@ func EvaluateRequestFull(
 	now := time.Now().UTC()
 	mode = normalizeMode(mode)
 	defaultPolicy = normalizeDefaultPolicy(defaultPolicy)
+
+	// Resolve the per-request agent-identity record once at the top
+	// of the evaluator so every emitAuditEvent branch carries the
+	// SAME agent block. Per [[agent-identity-in-audit]] the priority
+	// is: registered MCP session-id header > User-Agent fingerprint
+	// > empty (audit defaults to "unknown" / "unknown").
+	agentInfo := resolveAgentInfo(opts, r)
 
 	// #6a — timed bypass / "pause." If an operator-initiated pause is
 	// active, the proxy demotes effective behavior to COOPERATIVE for
@@ -538,7 +576,7 @@ func EvaluateRequestFull(
 			StreamKind:      opts.StreamKind,
 		}
 		decisionID := writeDecision(st, obs, activePause)
-		emitAuditEvent(opts, obs, parsed, "", activePause)
+		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -587,7 +625,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceProfile
 			obs.Enforced = effectiveMode == ModeTransparent
 			decisionID := writeDecision(st, obs, activePause)
-			emitAuditEvent(opts, obs, parsed, "", activePause)
+			emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -634,7 +672,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceTask
 			obs.Enforced = effectiveMode == ModeTransparent
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-			emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
+			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -668,7 +706,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = effectiveMode == ModeTransparent
 		decisionID := writeDecisionForTaskMaybe(st, obs, activePause, activeTask)
-		emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask), activePause)
+		emitAuditEvent(opts, agentInfo, obs, parsed, activeTaskID(activeTask), activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -685,7 +723,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceTask
 			obs.Enforced = false
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-			emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
+			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -704,7 +742,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceGlobal
 			obs.Enforced = false
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-			emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
+			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -715,7 +753,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceTask
 		obs.Enforced = effectiveMode == ModeTransparent
 		decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-		emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
+		emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -728,7 +766,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = false
 		decisionID := writeDecision(st, obs, activePause)
-		emitAuditEvent(opts, obs, parsed, "", activePause)
+		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -746,7 +784,7 @@ func EvaluateRequestFull(
 	obs.Enforced = effectiveMode == ModeTransparent && verdict == VerdictDeny
 
 	decisionID := writeDecision(st, obs, activePause)
-	emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask), activePause)
+	emitAuditEvent(opts, agentInfo, obs, parsed, activeTaskID(activeTask), activePause)
 	maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 	return obs
 }
@@ -771,7 +809,13 @@ func activeTaskID(t *tasks.Scope) string {
 // non-blocking by contract (bounded chans + drop-on-overflow on
 // each consumer), so the proxy hot-path never waits on disk or
 // network here.
-func emitAuditEvent(opts EvalOptions, obs *RequestObservation, parsed *parser.ParsedRequest, taskID string, activePause *store.PauseRow) {
+//
+// Per [[agent-identity-in-audit]]: the request's User-Agent + (when
+// set) X-Kbouncer-Session-Id header populate the OCSF agent block.
+// MCP-bound sessions (resolved via opts.AgentRegistry) take priority
+// over UA fingerprinting since the clientInfo handshake is higher-
+// fidelity than UA parsing.
+func emitAuditEvent(opts EvalOptions, agent audit.AgentInfo, obs *RequestObservation, parsed *parser.ParsedRequest, taskID string, activePause *store.PauseRow) {
 	if opts.AuditEmitter == nil {
 		return
 	}
@@ -792,6 +836,7 @@ func emitAuditEvent(opts EvalOptions, obs *RequestObservation, parsed *parser.Pa
 		TaskID:         taskID,
 		ProfileSource:  opts.AuditProfileSource,
 		AdminFallback:  activePause != nil,
+		Agent:          agent,
 	}
 	if parsed != nil {
 		in.ParsedVerb = parsed.Verb
@@ -806,6 +851,44 @@ func emitAuditEvent(opts EvalOptions, obs *RequestObservation, parsed *parser.Pa
 	}
 	ev := audit.FromDecision(in)
 	opts.AuditEmitter.Emit(context.Background(), ev)
+}
+
+// resolveAgentInfo derives the per-request AgentInfo from (in
+// priority order, per [[agent-identity-in-audit]]):
+//
+//  1. X-Kbouncer-Session-Id header → AgentRegistry lookup. The MCP
+//     server registers its clientInfo + session-id at handshake; a
+//     proxied SDK call that carries the header inherits the bound
+//     agent identity.
+//  2. User-Agent header → audit.FingerprintFromUserAgent. kubectl /
+//     client-go / helm / k9s / etc. all carry distinctive UA strings.
+//  3. nil request → empty AgentInfo (audit emits the default
+//     {name:"unknown", detected_from:"unknown"} block).
+//
+// Process-tree fingerprinting is NOT performed here — the proxy
+// sees an inbound TCP connection but not the client PID (would
+// require platform-specific /proc/net/tcp lookups for inode → pid
+// resolution, which is fragile + Linux-only). The MCP server does
+// process-tree detection at handshake-time when stdio gives a clean
+// parent-PID anchor.
+func resolveAgentInfo(opts EvalOptions, r *http.Request) audit.AgentInfo {
+	if r == nil {
+		return audit.AgentInfo{}
+	}
+	if opts.AgentRegistry != nil {
+		if sid := r.Header.Get(SessionHeaderName); sid != "" {
+			info := opts.AgentRegistry.Lookup(sid)
+			if info.Name != "" {
+				return info
+			}
+			// Header set but not registered → record the session id
+			// untrusted (best-effort) + still derive name from UA.
+			ua := audit.FingerprintFromUserAgent(r.Header.Get("User-Agent"))
+			ua.SessionID = sid
+			return ua
+		}
+	}
+	return audit.FingerprintFromUserAgent(r.Header.Get("User-Agent"))
 }
 
 // maybeEnqueuePrompt writes a pending_prompts row when ALL of:
@@ -1179,6 +1262,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			AuditHost:          net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
 			AuditUpstream:      upstreamLabel,
 			AuditProfileSource: profileSource,
+			AgentRegistry:      s.cfg.AgentRegistry,
 		},
 	)
 

@@ -111,6 +111,14 @@ const (
 	// "violation" / "infraction" / "unauthorized" — so a security-team
 	// reader sees an observation, not an accusation.
 	EventTypeSecurityAlert EventType = "ANOMALY_DETECTED"
+
+	// EventTypeSessionEnded is the synthetic marker emitted when an MCP
+	// agent session closes (Feature 2 of [[agent-identity-in-audit]]).
+	// Surfaces as OCSF activity_id=99 / activity_name="session_ended"
+	// with unmapped.iam_jit.event_type=SESSION_ENDED + the bound
+	// session's agent block. Lets analysts close their "all events
+	// from session X" queries with both bookends.
+	EventTypeSessionEnded EventType = "SESSION_ENDED"
 )
 
 // OCSF activity_id enum (class 6003 / API Activity).
@@ -218,6 +226,33 @@ type OCSFUnmapped struct {
 	IAMJIT IAMJITExt `json:"iam_jit"`
 }
 
+// OCSFAgent is the iam-jit-native agent-identity block under
+// unmapped.iam_jit.agent (per [[agent-identity-in-audit]]). All
+// fields except Name + DetectedFrom are optional; the wire shape
+// guarantees Name (defaults to "unknown") + DetectedFrom (defaults
+// to "unknown") are always present so an analyst can filter on
+// "show me events where the agent block fell back to unknown" as a
+// first-class signal.
+//
+// Cross-product invariant: ibounce / kbounce / dbounce all populate
+// the same struct shape (different products may detect different
+// agents, but the SIEM-side query is identical).
+//
+// Process-tree fields (ProcessExe / ParentExe) are SENSITIVE per
+// [[security-team-positioning-safety-not-surveillance]] — stripped
+// from the HTTPS webhook body by default (operator opts in). The
+// local JSONL log + SQLite still carry them so the operator owns
+// the full trail on their own machine.
+type OCSFAgent struct {
+	Name         string `json:"name"`
+	Version      string `json:"version,omitempty"`
+	SessionID    string `json:"session_id,omitempty"`
+	DetectedFrom string `json:"detected_from"`
+	ProcessExe   string `json:"process_exe,omitempty"`
+	ParentExe    string `json:"parent_exe,omitempty"`
+	RawUserAgent string `json:"user_agent_raw,omitempty"`
+}
+
 // IAMJITExt is the iam-jit vendor extension under unmapped.iam_jit.
 // Common fields (mode/profile/verdict/decision_id/enforced) match
 // across the Bounce suite; product-specific fields live under Ext.
@@ -245,6 +280,15 @@ type IAMJITExt struct {
 	WindowSeconds     int    `json:"window_seconds,omitempty"`
 	MatchedEventCount int    `json:"matched_event_count,omitempty"`
 	Suggestion        string `json:"suggestion,omitempty"`
+
+	// Agent is the iam-jit-native agent-identity block populated per
+	// [[agent-identity-in-audit]]. Always non-nil for events emitted
+	// by FromDecision (defaults to {name:"unknown", detected_from:
+	// "unknown"} when no detection source fired) so a SIEM query on
+	// unmapped.iam_jit.agent.name = "unknown" surfaces the unattributed
+	// traffic as a first-class signal. Synthetic events (AUDIT_DROPPED,
+	// security alerts) leave it nil — those aren't bound to any agent.
+	Agent *OCSFAgent `json:"agent,omitempty"`
 }
 
 // Event is the OCSF v1.1.0 class 6003 (API Activity) wire shape.
@@ -350,6 +394,15 @@ type DecisionInput struct {
 	// (single source of truth); this is the in-event signal so the
 	// rule engine can stay decoupled from store reads.
 	AdminFallback bool
+
+	// Agent carries the per-call agent-identity record per
+	// [[agent-identity-in-audit]]. Populated by the proxy hot-path
+	// from the inbound User-Agent + (when available) the registered
+	// MCP session via audit.Registry. Empty AgentInfo → FromDecision
+	// emits the default {name:"unknown", detected_from:"unknown"}
+	// block so the wire shape always carries a queryable agent
+	// object.
+	Agent AgentInfo
 }
 
 // FromDecision builds an OCSF class 6003 (API Activity) Event from a
@@ -439,11 +492,49 @@ func FromDecision(in DecisionInput) Event {
 				DecisionID: in.DecisionID,
 				Enforced:   in.Enforced,
 				Ext:        ext,
+				Agent:      in.Agent.ToOCSFAgent(),
 			},
 		},
 		DecisionID: in.DecisionID,
 		EventType:  EventTypeDecision,
 	}
+}
+
+// nowUnixMilli returns time.Now().UTC().UnixMilli(). Centralized so
+// the synthetic event builders (NewDroppedMarker, NewSessionEndedEvent)
+// share one clock source — tests can override behavior at the call
+// site by passing a fixed time through DecisionInput.At instead.
+func nowUnixMilli() int64 {
+	return time.Now().UTC().UnixMilli()
+}
+
+// RedactForWebhook returns a defensive copy of ev with SENSITIVE
+// agent-identity fields stripped per
+// [[security-team-positioning-safety-not-surveillance]]: process_exe
+// + parent_exe reveal the operator's local tooling, so the HTTPS
+// webhook body MUST NOT carry them unless the operator opted in.
+//
+// The local JSONL log + SQLite still carry the unredacted event —
+// the operator owns those, the redaction only applies to the
+// outbound-to-third-party transport.
+//
+// includeProcessTree=true is the operator opt-in (set via the CLI
+// flag --audit-webhook-include-process-tree); false (the default)
+// strips the sensitive fields.
+//
+// Cheap copy — the only mutation is replacing the Agent pointer.
+func (ev Event) RedactForWebhook(includeProcessTree bool) Event {
+	if includeProcessTree {
+		return ev
+	}
+	if ev.Unmapped.IAMJIT.Agent == nil {
+		return ev
+	}
+	a := *ev.Unmapped.IAMJIT.Agent
+	a.ProcessExe = ""
+	a.ParentExe = ""
+	ev.Unmapped.IAMJIT.Agent = &a
+	return ev
 }
 
 // NewDroppedMarker builds an OCSF-shaped synthetic event the webhook

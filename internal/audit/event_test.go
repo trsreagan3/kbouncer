@@ -445,6 +445,19 @@ func validateOCSFAPIActivity(t *testing.T, m map[string]any) {
 	// extension carries non-trivial signal.
 	hasSig := jit["verdict"] != nil || jit["event_type"] != nil
 	require.True(t, hasSig, "unmapped.iam_jit needs verdict OR event_type")
+
+	// Per [[agent-identity-in-audit]]: decision events (those carrying
+	// verdict) MUST always carry a populated agent block with name +
+	// detected_from set (defaults to unknown/unknown) so SIEM queries
+	// can filter on unmapped.iam_jit.agent.* without missing-field
+	// noise. Synthetic markers (event_type set, no verdict) are
+	// exempt — they're not bound to any agent.
+	if jit["verdict"] != nil {
+		agent, ok := jit["agent"].(map[string]any)
+		require.True(t, ok, "decision events MUST carry an agent block")
+		assertString(t, agent, "name")
+		assertString(t, agent, "detected_from")
+	}
 }
 
 func assertString(t *testing.T, m map[string]any, key string) {

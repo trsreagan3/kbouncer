@@ -2,15 +2,18 @@ package mcp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
 	"github.com/trsreagan3/kbouncer/internal/rules"
@@ -399,3 +402,189 @@ func TestStorelessConfig_TailDecisionsReturnsClearError(t *testing.T) {
 // Suppress unused-warning for rules import which is needed by other test
 // helpers if added later.
 var _ = rules.EffectAllow
+
+// ---------------------------------------------------------------------
+// [[agent-identity-in-audit]] — clientInfo capture + session-id mint +
+// SESSION_ENDED emission
+// ---------------------------------------------------------------------
+
+// captureEmitter is a minimal audit.Emitter that records every event
+// in-memory so tests can assert on what the MCP server published.
+// Lives in this test file (rather than shared) so the package import
+// graph doesn't leak test helpers.
+type captureEmitter struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (c *captureEmitter) Emit(_ context.Context, ev audit.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, ev)
+}
+
+func (c *captureEmitter) Status() audit.Status { return audit.Status{} }
+
+func (c *captureEmitter) snapshot() []audit.Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]audit.Event, len(c.events))
+	copy(out, c.events)
+	return out
+}
+
+// TestNewServer_MintsSessionIDWhenRegistryConfigured covers Feature 2
+// of [[agent-identity-in-audit]]: every MCP connection with an
+// AgentRegistry configured gets a persistent UUID v7 minted at
+// construction so the proxy hot-path can correlate.
+func TestNewServer_MintsSessionIDWhenRegistryConfigured(t *testing.T) {
+	reg := audit.NewRegistry()
+	srv := NewServer(Config{AgentRegistry: reg})
+	sid := srv.SessionID()
+	assert.NotEmpty(t, sid, "session ID must be minted when registry is configured")
+	// Placeholder AgentInfo is registered so a pre-init proxy lookup
+	// still resolves (just to {unknown, unknown}).
+	info := reg.Lookup(sid)
+	assert.Equal(t, audit.AgentNameUnknown, info.Name)
+	assert.Equal(t, sid, info.SessionID)
+	assert.EqualValues(t, 1, reg.ActiveCount())
+}
+
+// TestNewServer_NoRegistryNoSessionID covers the no-registry path —
+// the MCP server still works (the audit pipeline just falls back to
+// User-Agent fingerprinting on the proxy side).
+func TestNewServer_NoRegistryNoSessionID(t *testing.T) {
+	srv := NewServer(Config{})
+	assert.Empty(t, srv.SessionID(),
+		"no registry → no session id minted (back-compat)")
+}
+
+// TestInitialize_CapturesClientInfo_BindsToRegistry pins Feature 1:
+// the MCP `initialize` request's clientInfo populates the bound
+// AgentInfo + re-registers it under the session id so a proxied SDK
+// call inherits the identity. The Server's AgentInfo() snapshot is
+// the test surface (the registry is forgotten on Serve teardown so
+// we read the in-memory bind on the server itself).
+func TestInitialize_CapturesClientInfo_BindsToRegistry(t *testing.T) {
+	reg := audit.NewRegistry()
+	srv := NewServer(Config{AgentRegistry: reg})
+	sid := srv.SessionID()
+
+	// Drive initialize via the dispatch path directly (rpcRoundTrip
+	// invokes Serve which would Forget on EOF; we want to observe
+	// the live-session state).
+	srv.dispatch(rawRequest{Method: "initialize", Params: rawMessage(t, map[string]any{
+		"clientInfo": map[string]any{"name": "claude-code", "version": "1.2.3"},
+	})})
+
+	got := srv.AgentInfo()
+	assert.Equal(t, "claude-code", got.Name,
+		"clientInfo must overwrite the placeholder")
+	assert.Equal(t, "1.2.3", got.Version)
+	assert.Equal(t, audit.DetectionSourceMCPClientInfo, got.DetectedFrom)
+	assert.Equal(t, sid, got.SessionID)
+
+	// Registry mirrors the bind — proxy hot-path lookup sees the
+	// SAME identity (this is the load-bearing cross-component glue).
+	regInfo := reg.Lookup(sid)
+	assert.Equal(t, "claude-code", regInfo.Name)
+}
+
+// rawMessage marshals v to json.RawMessage; test helper for driving
+// dispatch directly with structured params.
+func rawMessage(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}
+
+// TestInitialize_AliasNormalization confirms alternate clientInfo
+// spellings (Claude-Code / claude_code / @anthropic/claude-code) all
+// canonicalize to the SAME bound name so customer SIEM queries on
+// agent.name = "claude-code" return all traffic, not just one alias.
+func TestInitialize_AliasNormalization(t *testing.T) {
+	cases := []string{"Claude-Code", "claude_code", "@anthropic/claude-code"}
+	for _, alias := range cases {
+		t.Run(alias, func(t *testing.T) {
+			reg := audit.NewRegistry()
+			srv := NewServer(Config{AgentRegistry: reg})
+			srv.dispatch(rawRequest{Method: "initialize", Params: rawMessage(t, map[string]any{
+				"clientInfo": map[string]any{"name": alias},
+			})})
+			got := srv.AgentInfo()
+			assert.Equal(t, "claude-code", got.Name,
+				"alias %q must canonicalize to claude-code", alias)
+		})
+	}
+}
+
+// TestInitialize_BareInitNoClientInfoKeepsPlaceholder covers the
+// spec-compliant-but-sparse case — a client that sends initialize
+// with no clientInfo block. The session stays bound to the
+// placeholder {unknown, unknown} record so SESSION_ENDED still
+// carries a session_id.
+func TestInitialize_BareInitNoClientInfoKeepsPlaceholder(t *testing.T) {
+	reg := audit.NewRegistry()
+	srv := NewServer(Config{AgentRegistry: reg})
+	srv.dispatch(rawRequest{Method: "initialize", Params: rawMessage(t, map[string]any{
+		"protocolVersion": "2024-11-05",
+	})})
+	got := srv.AgentInfo()
+	assert.Equal(t, audit.AgentNameUnknown, got.Name)
+	assert.Equal(t, audit.DetectionSourceUnknown, got.DetectedFrom)
+}
+
+// TestServe_EmitsSessionEndedOnClose pins Feature 2's bookend: when
+// the MCP stdin closes (Serve returns), the bound session is
+// forgotten + a SESSION_ENDED audit event lands on the configured
+// AuditEmitter so analysts see both ends of the agent session.
+func TestServe_EmitsSessionEndedOnClose(t *testing.T) {
+	reg := audit.NewRegistry()
+	cap := &captureEmitter{}
+	srv := NewServer(Config{
+		AgentRegistry: reg,
+		AuditEmitter:  cap,
+	})
+	sid := srv.SessionID()
+
+	// Drive an initialize + close the stdin (empty buffer = immediate
+	// EOF after one request).
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"clientInfo": map[string]any{"name": "cursor", "version": "0.45"},
+		},
+	}
+	in := bytes.NewBuffer(nil)
+	require.NoError(t, json.NewEncoder(in).Encode(req))
+	out := &bytes.Buffer{}
+	require.NoError(t, srv.Serve(in, out))
+
+	// Registry forgot the session.
+	assert.EqualValues(t, 0, reg.ActiveCount(),
+		"Serve teardown must Forget the session")
+
+	// And SESSION_ENDED was emitted with the bound agent fingerprint.
+	events := cap.snapshot()
+	require.Len(t, events, 1, "exactly one SESSION_ENDED event must be emitted")
+	ev := events[0]
+	assert.Equal(t, audit.EventTypeSessionEnded, ev.EventType)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	assert.Equal(t, "cursor", ev.Unmapped.IAMJIT.Agent.Name,
+		"SESSION_ENDED must carry the bound agent fingerprint, not just unknown")
+	assert.Equal(t, sid, ev.Unmapped.IAMJIT.Agent.SessionID)
+}
+
+// TestServe_NoRegistryNoSessionEndedEvent covers the back-compat
+// path — a Server constructed without a registry must NOT emit
+// spurious SESSION_ENDED events (the feature is opt-in).
+func TestServe_NoRegistryNoSessionEndedEvent(t *testing.T) {
+	cap := &captureEmitter{}
+	srv := NewServer(Config{AuditEmitter: cap})
+	require.NoError(t, srv.Serve(strings.NewReader(""), &bytes.Buffer{}))
+	assert.Empty(t, cap.snapshot(),
+		"no AgentRegistry → no SESSION_ENDED bookend (feature is opt-in)")
+}

@@ -46,10 +46,12 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -118,21 +120,107 @@ type Config struct {
 	// in-flight) for the security-team audit-export feature
 	// (Slice 1 of #252). nil → status tool reports "not configured."
 	AuditEmitter audit.Emitter
+
+	// AgentRegistry, when non-nil, is the cross-component map of MCP
+	// session-id → AgentInfo populated on `initialize` (Feature 2 of
+	// [[agent-identity-in-audit]]). The proxy hot-path consults the
+	// same registry so a proxied SDK call from this agent inherits
+	// the session's bound identity. nil → session-id minting is
+	// disabled (the MCP server still works; audit events fall back to
+	// User-Agent fingerprinting on the proxy side).
+	AgentRegistry *audit.Registry
+
+	// ProcessTreeFingerprint, when true, enables the SENSITIVE
+	// process-tree fallback (parent-PID walk) on MCP initialize. Per
+	// [[security-team-positioning-safety-not-surveillance]] this is
+	// OFF by default — the captured process_exe / parent_exe paths
+	// reveal the operator's local tooling. When on the data still
+	// lands in the local audit only (webhook strips by default; see
+	// audit.WebhookOptions.IncludeProcessTree).
+	ProcessTreeFingerprint bool
 }
 
 // Server is the MCP-over-stdio server. Construct one via NewServer,
 // then call Serve(stdin, stdout) — Serve blocks until stdin closes.
+//
+// Per [[agent-identity-in-audit]] Feature 2: each Server holds a
+// persistent session ID minted at construction (UUID v7) + records
+// the client's clientInfo on `initialize`. The session ID is bound
+// to the same Registry the proxy hot-path reads, so a proxied SDK
+// call from the same agent inherits this session's identity. The
+// session is forgotten + a SESSION_ENDED event emitted when Serve
+// returns (stdin closed).
 type Server struct {
 	cfg Config
 	mu  sync.Mutex // serializes audit writes that share a sql.DB conn
+
+	// sessionID is the per-connection UUID v7 minted at NewServer.
+	// Bound across every audit event emitted under this connection.
+	// Empty string when cfg.AgentRegistry is nil (session-id minting
+	// is opt-in via the registry presence).
+	sessionID string
+
+	// agent is the AgentInfo bound to this session. Defaults to
+	// {DetectedFrom: "unknown"} at construction; replaced when the
+	// client's `initialize` request carries clientInfo. Mutex-
+	// protected because tool-call goroutines + the initialize
+	// handler can both read it concurrently (though stdio framing
+	// makes this rare in practice — defensive).
+	agentMu sync.RWMutex
+	agent   audit.AgentInfo
 }
 
 // NewServer constructs an MCP server from the given config.
+//
+// When cfg.AgentRegistry is non-nil, mints a persistent UUID v7
+// session ID + pre-registers a placeholder AgentInfo so a proxied
+// SDK call that arrives BEFORE `initialize` (rare; stdio framing
+// usually delivers initialize first) still resolves the session id.
+// The placeholder is replaced when initialize's clientInfo lands.
 func NewServer(cfg Config) *Server {
 	if cfg.Actor == "" {
 		cfg.Actor = "kbounce-mcp"
 	}
-	return &Server{cfg: cfg}
+	s := &Server{cfg: cfg}
+	if cfg.AgentRegistry != nil {
+		s.sessionID = audit.NewSessionID()
+		s.agent = audit.AgentInfo{
+			Name:         audit.AgentNameUnknown,
+			DetectedFrom: audit.DetectionSourceUnknown,
+			SessionID:    s.sessionID,
+		}
+		cfg.AgentRegistry.Register(s.sessionID, s.agent)
+	}
+	return s
+}
+
+// SessionID returns the per-connection session UUID v7 (or empty
+// string when no AgentRegistry was configured). Exposed for tests +
+// for the CLI to print "MCP session id: <id>" at startup so a
+// human reviewer can correlate the printout with later audit rows.
+func (s *Server) SessionID() string {
+	return s.sessionID
+}
+
+// AgentInfo returns a snapshot of the current bound AgentInfo for
+// this session. Lock-free safe for read.
+func (s *Server) AgentInfo() audit.AgentInfo {
+	s.agentMu.RLock()
+	defer s.agentMu.RUnlock()
+	return s.agent
+}
+
+// setAgent overwrites the bound AgentInfo + re-registers it in the
+// Registry so the proxy hot-path sees the updated identity. Called
+// from the `initialize` handler when clientInfo lands.
+func (s *Server) setAgent(info audit.AgentInfo) {
+	info.SessionID = s.sessionID
+	s.agentMu.Lock()
+	s.agent = info
+	s.agentMu.Unlock()
+	if s.cfg.AgentRegistry != nil && s.sessionID != "" {
+		s.cfg.AgentRegistry.Register(s.sessionID, info)
+	}
 }
 
 // Serve runs the JSON-RPC loop. One request per line on `in`; one
@@ -141,7 +229,13 @@ func NewServer(cfg Config) *Server {
 // The MCP stdio transport is line-delimited JSON per the spec; no
 // Content-Length framing. Parse errors yield a JSON-RPC parse-error
 // response with id=null per JSON-RPC 2.0 §5.1.
+//
+// Per [[agent-identity-in-audit]] Feature 2: on stdin close, the
+// bound session is forgotten + a SESSION_ENDED event is emitted via
+// the configured AuditEmitter so analysts see the bookend of an
+// agent session.
 func (s *Server) Serve(in io.Reader, out io.Writer) error {
+	defer s.endSession()
 	scanner := bufio.NewScanner(in)
 	// Bump the buffer cap to handle large `tools/list` responses + the
 	// occasional big rule patch. Default is 64KB; we go to 4MB to be
@@ -170,6 +264,21 @@ func (s *Server) Serve(in io.Reader, out io.Writer) error {
 	return scanner.Err()
 }
 
+// endSession removes the bound session from the AgentRegistry + emits
+// the SESSION_ENDED audit event. Idempotent — safe to call from a
+// deferred Serve teardown even when no session was ever minted (the
+// no-AgentRegistry case is a no-op).
+func (s *Server) endSession() {
+	if s.cfg.AgentRegistry == nil || s.sessionID == "" {
+		return
+	}
+	info := s.cfg.AgentRegistry.Forget(s.sessionID)
+	if s.cfg.AuditEmitter != nil {
+		ev := audit.NewSessionEndedEvent(info)
+		s.cfg.AuditEmitter.Emit(context.Background(), ev)
+	}
+}
+
 // rawRequest is the on-the-wire JSON-RPC 2.0 request shape.
 type rawRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -182,6 +291,13 @@ type rawRequest struct {
 func (s *Server) dispatch(req rawRequest) any {
 	switch req.Method {
 	case "initialize":
+		// Per [[agent-identity-in-audit]] Feature 1: capture the
+		// MCP clientInfo handshake into the bound AgentInfo. The
+		// optional process-tree fallback (ProcessTreeFingerprint=true)
+		// fills ProcessExe / ParentExe from the parent PID — SENSITIVE
+		// so OFF by default per [[security-team-positioning-safety-
+		// not-surveillance]].
+		s.handleInitialize(req.Params)
 		return okResponse(req.ID, map[string]any{
 			"protocolVersion": ProtocolVersion,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
@@ -219,6 +335,64 @@ func (s *Server) dispatch(req rawRequest) any {
 		return nil
 	}
 	return errResponse(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
+}
+
+// handleInitialize extracts the MCP `clientInfo` object from an
+// `initialize` request's params + binds the resulting AgentInfo to
+// this session (per [[agent-identity-in-audit]] Feature 1, priority
+// source #1). On a bare init (no clientInfo) the session stays bound
+// to its placeholder {unknown, unknown} record so the SESSION_ENDED
+// event still carries a session_id.
+//
+// Per [[security-team-positioning-safety-not-surveillance]]: the
+// process-tree fallback (parent-PID walk) is only consulted when
+// cfg.ProcessTreeFingerprint is true — the captured exe paths reveal
+// the operator's local tooling + are SENSITIVE.
+//
+// No-op when cfg.AgentRegistry is nil (session-id minting disabled).
+func (s *Server) handleInitialize(params json.RawMessage) {
+	if s.cfg.AgentRegistry == nil || s.sessionID == "" {
+		return
+	}
+	// Parse the clientInfo block. MCP spec §lifecycle/initialize:
+	//   { "protocolVersion": ..., "capabilities": {...},
+	//     "clientInfo": {"name": "claude-code", "version": "1.2.3"} }
+	var p struct {
+		ClientInfo struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"clientInfo"`
+	}
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &p)
+	}
+
+	var info audit.AgentInfo
+	if p.ClientInfo.Name != "" {
+		info = audit.FingerprintFromMCPClientInfo(p.ClientInfo.Name, p.ClientInfo.Version)
+	} else {
+		info = audit.AgentInfo{
+			Name:         audit.AgentNameUnknown,
+			DetectedFrom: audit.DetectionSourceUnknown,
+		}
+	}
+
+	if s.cfg.ProcessTreeFingerprint {
+		// Walk from the parent PID — the MCP server's parent IS the
+		// agent process (Claude Code, Cursor, etc.) since stdio MCP
+		// is launched as a child of the IDE / agent runtime.
+		if pt := audit.FingerprintFromProcessTree(os.Getppid()); pt.ProcessExe != "" || pt.ParentExe != "" {
+			info.ProcessExe = pt.ProcessExe
+			info.ParentExe = pt.ParentExe
+			// Don't overwrite the higher-fidelity clientInfo name; only
+			// use the process-tree-derived name as a fallback.
+			if info.Name == audit.AgentNameUnknown && pt.Name != audit.AgentNameUnknown {
+				info.Name = pt.Name
+			}
+		}
+	}
+
+	s.setAgent(info)
 }
 
 // callTool dispatches the named tool against the given args.

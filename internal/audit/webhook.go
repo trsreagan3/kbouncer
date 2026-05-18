@@ -36,6 +36,16 @@ type WebhookPusher struct {
 	batchSize     int
 	client        *http.Client
 
+	// includeProcessTree, when true, opts the webhook IN to including
+	// the SENSITIVE process-tree fields (unmapped.iam_jit.agent
+	// .process_exe / .parent_exe) in the outgoing body. Default false
+	// per [[security-team-positioning-safety-not-surveillance]] — the
+	// fields reveal the operator's local tooling, so the OUTBOUND-
+	// to-third-party transport strips them unless the operator
+	// explicitly opted in. The local JSONL log + SQLite always carry
+	// the unredacted event (operator owns those).
+	includeProcessTree bool
+
 	// preset selects the per-vendor adapter that builds the outgoing
 	// (url, headers, body) tuple. Generic = backward-compat Bearer +
 	// JSON-array body, byte-identical to the Slice 1 shape.
@@ -75,6 +85,12 @@ type WebhookOptions struct {
 	// SentinelTable names the Log Analytics custom-log table for the
 	// sentinel preset. Defaults to SentinelDefaultTable when unset.
 	SentinelTable string
+	// IncludeProcessTree opts the webhook IN to including the
+	// SENSITIVE agent process-tree fields (process_exe / parent_exe)
+	// in the outgoing body. Default false per
+	// [[security-team-positioning-safety-not-surveillance]]. The CLI
+	// surfaces this as --audit-webhook-include-process-tree.
+	IncludeProcessTree bool
 	// HTTPClient lets tests inject a custom transport (httptest.Server).
 	// Production callers leave nil → a sensible default with bounded
 	// timeouts.
@@ -151,17 +167,18 @@ func NewWebhookPusher(ctx context.Context, opts WebhookOptions) (*WebhookPusher,
 		return nil, err
 	}
 	wp := &WebhookPusher{
-		url:           opts.URL,
-		maskedURL:     maskURL(opts.URL),
-		token:         opts.Token,
-		allowInternal: opts.AllowInternal,
-		batchSize:     batch,
-		client:        client,
-		preset:        preset,
-		tags:          opts.Tags,
-		sentinelTable: opts.SentinelTable,
-		queue:         make(chan Event, depth),
-		done:          make(chan struct{}),
+		url:                opts.URL,
+		maskedURL:          maskURL(opts.URL),
+		token:              opts.Token,
+		allowInternal:      opts.AllowInternal,
+		batchSize:          batch,
+		client:             client,
+		preset:             preset,
+		tags:               opts.Tags,
+		sentinelTable:      opts.SentinelTable,
+		includeProcessTree: opts.IncludeProcessTree,
+		queue:              make(chan Event, depth),
+		done:               make(chan struct{}),
 	}
 	wp.lastErr.Store("")
 	wp.wg.Add(1)
@@ -225,6 +242,11 @@ func (wp *WebhookPusher) run(ctx context.Context) {
 func (wp *WebhookPusher) deliver(ctx context.Context, ev Event) {
 	wp.inFlight.Add(1)
 	defer wp.inFlight.Add(-1)
+	// Strip SENSITIVE process-tree fields from the outbound body
+	// unless the operator opted in. RedactForWebhook returns a copy
+	// when it mutates so concurrent consumers of the same Event
+	// (local JSONL log writer) see the unredacted shape.
+	ev = ev.RedactForWebhook(wp.includeProcessTree)
 	cfg := PresetConfig{
 		URL:           wp.url,
 		Token:         wp.token,

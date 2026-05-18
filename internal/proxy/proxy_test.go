@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/parser"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/store"
@@ -585,4 +587,244 @@ func TestServer_Healthz_DoesNotShadowProxyEvaluation(t *testing.T) {
 	_, hasObservation := probe["proxy_observation"]
 	assert.True(t, hasObservation,
 		"/healthzzz/... must route to proxy handler, not /healthz")
+}
+
+// ---------------------------------------------------------------------
+// [[agent-identity-in-audit]] — User-Agent capture + session-id
+// propagation from the proxy hot-path into the OCSF audit event
+// ---------------------------------------------------------------------
+
+// proxyCaptureEmitter is a minimal audit.Emitter for proxy tests —
+// records every event so we can assert the agent block was populated
+// correctly from the inbound request. Local to this file so the
+// import graph stays clean.
+type proxyCaptureEmitter struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (c *proxyCaptureEmitter) Emit(_ context.Context, ev audit.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, ev)
+}
+
+func (c *proxyCaptureEmitter) Status() audit.Status { return audit.Status{} }
+
+func (c *proxyCaptureEmitter) lastDecision(t *testing.T) audit.Event {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	require.NotEmpty(t, c.events, "no audit events captured")
+	for i := len(c.events) - 1; i >= 0; i-- {
+		if c.events[i].EventType == audit.EventTypeDecision {
+			return c.events[i]
+		}
+	}
+	t.Fatalf("no DECISION event found among %d emitted events", len(c.events))
+	return audit.Event{}
+}
+
+// TestProxy_AgentBlock_UserAgentFingerprintsKubectl covers the
+// proxy-side User-Agent priority source (per [[agent-identity-in-
+// audit]]): a kubectl call to the proxy lands an audit event whose
+// agent block records name=kubectl + version + detected_from=
+// user_agent — without any MCP session.
+func TestProxy_AgentBlock_UserAgentFingerprintsKubectl(t *testing.T) {
+	st := freshStore(t)
+	cap := &proxyCaptureEmitter{}
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		AuditEmitter:  cap,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/namespaces/default/pods", nil)
+	require.NoError(t, err)
+	req.Header.Set("User-Agent", "kubectl/v1.30.0 (darwin/arm64) kubernetes/abc1234")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	ev := cap.lastDecision(t)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent,
+		"every decision event MUST carry an agent block")
+	a := ev.Unmapped.IAMJIT.Agent
+	assert.Equal(t, "kubectl", a.Name, "kubectl UA must fingerprint as kubectl")
+	assert.Equal(t, "v1.30.0", a.Version)
+	assert.Equal(t, audit.DetectionSourceUserAgent, a.DetectedFrom)
+}
+
+// TestProxy_AgentBlock_ClientGoUserAgent covers the K8s client-go UA
+// shape — agents using the client-go library (custom controllers,
+// MCP-bound K8s tools) land as agent.name=client-go with the version
+// captured.
+func TestProxy_AgentBlock_ClientGoUserAgent(t *testing.T) {
+	st := freshStore(t)
+	cap := &proxyCaptureEmitter{}
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		AuditEmitter:  cap,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/pods", nil)
+	require.NoError(t, err)
+	req.Header.Set("User-Agent", "kubernetes/v1.28.0 (linux/amd64) kubernetes/abc123")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	ev := cap.lastDecision(t)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	assert.Equal(t, "client-go", ev.Unmapped.IAMJIT.Agent.Name)
+	assert.Equal(t, "v1.28.0", ev.Unmapped.IAMJIT.Agent.Version)
+}
+
+// TestProxy_AgentBlock_SessionIDInheritsRegisteredFingerprint covers
+// Feature 2's cross-component glue: an inbound request carrying the
+// X-Kbouncer-Session-Id header inherits the registered AgentInfo
+// (priority source #1: MCP clientInfo > User-Agent). Mirrors the
+// "MCP-connected agent → proxied SDK call gets the same identity"
+// flow that lets customers query "all events from session X" with
+// one filter.
+func TestProxy_AgentBlock_SessionIDInheritsRegisteredFingerprint(t *testing.T) {
+	st := freshStore(t)
+	cap := &proxyCaptureEmitter{}
+	reg := audit.NewRegistry()
+	sid := audit.NewSessionID()
+	reg.Register(sid, audit.AgentInfo{
+		Name:         "claude-code",
+		Version:      "1.2.3",
+		DetectedFrom: audit.DetectionSourceMCPClientInfo,
+	})
+
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		AuditEmitter:  cap,
+		AgentRegistry: reg,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/namespaces/default/pods", nil)
+	require.NoError(t, err)
+	// Carry both the session id AND a kubectl UA — the session id
+	// must WIN (higher-fidelity source).
+	req.Header.Set(SessionHeaderName, sid)
+	req.Header.Set("User-Agent", "kubectl/v1.30.0 (darwin/arm64) kubernetes/abc1234")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	ev := cap.lastDecision(t)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	a := ev.Unmapped.IAMJIT.Agent
+	assert.Equal(t, "claude-code", a.Name,
+		"registered session id MUST take priority over UA fingerprinting")
+	assert.Equal(t, audit.DetectionSourceMCPClientInfo, a.DetectedFrom)
+	assert.Equal(t, sid, a.SessionID)
+}
+
+// TestProxy_AgentBlock_StaleSessionIDHeaderRecordedUntrusted covers
+// the per-[[agent-identity-in-audit]] safety check: an inbound
+// session-id header that doesn't match a registered session is
+// recorded AS-IS (best-effort) but the agent NAME is still derived
+// from User-Agent — we never trust an unregistered id to forge
+// identity.
+func TestProxy_AgentBlock_StaleSessionIDHeaderRecordedUntrusted(t *testing.T) {
+	st := freshStore(t)
+	cap := &proxyCaptureEmitter{}
+	reg := audit.NewRegistry() // empty — no sessions registered
+
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		AuditEmitter:  cap,
+		AgentRegistry: reg,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	staleSID := audit.NewSessionID()
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/pods", nil)
+	require.NoError(t, err)
+	req.Header.Set(SessionHeaderName, staleSID)
+	req.Header.Set("User-Agent", "kubectl/v1.30.0 (linux/amd64) kubernetes/abc")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	ev := cap.lastDecision(t)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	a := ev.Unmapped.IAMJIT.Agent
+	assert.Equal(t, "kubectl", a.Name,
+		"stale session id MUST NOT inherit a fake fingerprint; name comes from UA")
+	assert.Equal(t, staleSID, a.SessionID,
+		"session id is recorded as-is for analyst correlation, just not trusted")
+}
+
+// TestProxy_AgentBlock_UnknownUAYieldsUnknown covers the honest-best-
+// effort path per [[scorer-is-ground-truth]] — a UA we don't have a
+// rule for surfaces as name=unknown, raw UA preserved for analyst
+// custom filtering.
+func TestProxy_AgentBlock_UnknownUAYieldsUnknown(t *testing.T) {
+	st := freshStore(t)
+	cap := &proxyCaptureEmitter{}
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		AuditEmitter:  cap,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/pods", nil)
+	require.NoError(t, err)
+	req.Header.Set("User-Agent", "MyCustomController/9.9")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	ev := cap.lastDecision(t)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	a := ev.Unmapped.IAMJIT.Agent
+	assert.Equal(t, audit.AgentNameUnknown, a.Name)
+	assert.Equal(t, audit.DetectionSourceUserAgent, a.DetectedFrom)
+	assert.Equal(t, "MyCustomController/9.9", a.RawUserAgent,
+		"raw UA preserved so analysts can build a custom filter")
+}
+
+// TestProxy_AgentBlock_NoUAFallsThroughToUnknown covers the no-UA
+// case (scripted call, debug session): the agent block still lands
+// with the safe defaults rather than being missing.
+func TestProxy_AgentBlock_NoUAFallsThroughToUnknown(t *testing.T) {
+	st := freshStore(t)
+	cap := &proxyCaptureEmitter{}
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		AuditEmitter:  cap,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	// http.Client sets a default UA — set it explicitly to empty.
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/pods", nil)
+	require.NoError(t, err)
+	req.Header.Set("User-Agent", "")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	ev := cap.lastDecision(t)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent,
+		"agent block MUST be present even with no UA")
+	assert.Equal(t, audit.AgentNameUnknown, ev.Unmapped.IAMJIT.Agent.Name)
+	assert.Equal(t, audit.DetectionSourceUnknown, ev.Unmapped.IAMJIT.Agent.DetectedFrom)
 }
