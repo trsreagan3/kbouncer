@@ -542,6 +542,77 @@ func (e *RuleEngine) BindHeartbeater(hb *Heartbeater) {
 	}
 }
 
+// ObserveAdminFallbackGrant builds + emits the synthetic
+// EventTypeAdminFallbackGrant event through the engine. The event lands
+// in the JSONL log + HTTPS webhook alongside per-decision events AND
+// runs through the rule pipeline (the admin_fallback_burst rule
+// observes ext.admin_fallback=true on this event as its first in-window
+// fallback observation). Thin wrapper so call sites in the proxy /
+// CLI don't repeat the MakeAdminFallbackGrantEvent + Emit boilerplate.
+// Safe to call on a nil receiver: no-op.
+func (e *RuleEngine) ObserveAdminFallbackGrant(ctx context.Context, pauseID int64, reason, startedBy string, endsAtUnixMilli int64) {
+	if e == nil {
+		return
+	}
+	e.Emit(ctx, MakeAdminFallbackGrantEvent(pauseID, reason, startedBy, endsAtUnixMilli))
+}
+
+// ObservePauseEnd builds + emits the synthetic EventTypePauseEnd
+// event. The pause_end event is NOT itself a fallback decision so the
+// admin_fallback_burst rule's isAdminFallbackEvent predicate returns
+// false — what the rule needs is the BOOKEND for SIEM-side join, not
+// another in-window fallback count. Safe to call on a nil receiver.
+func (e *RuleEngine) ObservePauseEnd(ctx context.Context, pauseID int64, endKind, endedBy string) {
+	if e == nil {
+		return
+	}
+	e.Emit(ctx, MakePauseEndEvent(pauseID, endKind, endedBy))
+}
+
+// ObserveProfileInstall builds + emits the synthetic
+// EventTypeProfileInstall event. The non_org_profile_install rule's
+// existing predicate (profile_source ext + Profile field) fires on
+// this event at install-time when the source URL is non-empty AND not
+// in the operator's approved-URL allowlist. Safe to call on a nil
+// receiver.
+func (e *RuleEngine) ObserveProfileInstall(ctx context.Context, profileNames []string, source, sha256 string, verified bool) {
+	if e == nil {
+		return
+	}
+	e.Emit(ctx, MakeProfileInstallEvent(profileNames, source, sha256, verified))
+}
+
+// EmitAdminFallbackGrant is the Emitter-interface-level convenience
+// for call sites that hold only an Emitter (not a concrete
+// *RuleEngine). Lets the proxy + CLI fire the synthetic event without
+// type-asserting; when the operator hasn't wired the rule engine, the
+// event still reaches the JSONL log + HTTPS webhook through the bare
+// *Manager. Nil emitter → no-op.
+func EmitAdminFallbackGrant(ctx context.Context, e Emitter, pauseID int64, reason, startedBy string, endsAtUnixMilli int64) {
+	if e == nil {
+		return
+	}
+	e.Emit(ctx, MakeAdminFallbackGrantEvent(pauseID, reason, startedBy, endsAtUnixMilli))
+}
+
+// EmitPauseEnd is the Emitter-interface-level convenience for
+// MakePauseEndEvent. See EmitAdminFallbackGrant for the rationale.
+func EmitPauseEnd(ctx context.Context, e Emitter, pauseID int64, endKind, endedBy string) {
+	if e == nil {
+		return
+	}
+	e.Emit(ctx, MakePauseEndEvent(pauseID, endKind, endedBy))
+}
+
+// EmitProfileInstall is the Emitter-interface-level convenience for
+// MakeProfileInstallEvent. See EmitAdminFallbackGrant for the rationale.
+func EmitProfileInstall(ctx context.Context, e Emitter, profileNames []string, source, sha256 string, verified bool) {
+	if e == nil {
+		return
+	}
+	e.Emit(ctx, MakeProfileInstallEvent(profileNames, source, sha256, verified))
+}
+
 // RuleNames returns the registered rule names in stable order.
 // Surfaced by MCP + banner output.
 func (e *RuleEngine) RuleNames() []string {

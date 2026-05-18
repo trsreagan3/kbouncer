@@ -42,6 +42,7 @@
 package audit
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -138,6 +139,61 @@ const (
 	// product names in metadata.product) so a single SIEM dashboard
 	// rule catches gaps across the suite.
 	EventTypeHeartbeat EventType = "HEARTBEAT"
+
+	// EventTypeAdminFallbackGrant is the synthetic marker emitted ONCE
+	// when an operator opens a pause window — the explicit "the escape
+	// hatch was opened" bookend. The per-decision DECISION events emitted
+	// while the window is active still carry ext.admin_fallback=true
+	// (the Slice 2 admin_fallback_burst rule counts those); this synthetic
+	// event gives a SIEM a single high-signal row pinned to the window's
+	// open edge so an analyst can answer "when did the pause start, who
+	// opened it, why?" without scanning the per-decision stream. Surfaces
+	// as OCSF activity_id=99 / activity_name="admin_fallback_grant" with
+	// unmapped.iam_jit.event_type=ADMIN_FALLBACK_GRANT.
+	//
+	// Per [[security-team-audit-export]] + [[safety-mode-lean-permissive]]:
+	// the audit trail does the work; the synthetic open-edge event is the
+	// load-bearing piece that lets a SIEM rule fire INSTANTLY on pause-
+	// open rather than after the per-decision burst threshold trips. Also
+	// carries ext.admin_fallback=true so the existing admin_fallback_burst
+	// rule observes it as its FIRST in-window event without the rule code
+	// needing a synthetic-event-aware branch.
+	EventTypeAdminFallbackGrant EventType = "ADMIN_FALLBACK_GRANT"
+
+	// EventTypePauseEnd is the synthetic marker emitted ONCE when a
+	// pause window closes — the explicit "the escape hatch was closed"
+	// bookend that pairs with EventTypeAdminFallbackGrant. Carries
+	// ext.pause_end_kind = "resumed_early" | "expired" so a SIEM rule
+	// can distinguish operator-initiated closure from auto-revert.
+	// Surfaces as OCSF activity_id=99 / activity_name="pause_end" with
+	// unmapped.iam_jit.event_type=PAUSE_END.
+	//
+	// Per [[security-team-audit-export]]: paired bookends let a SIEM
+	// computation "duration = pause_end.time - admin_fallback_grant.time
+	// where pause_id matches" run as a single join across two events
+	// rather than scanning the per-decision stream for first/last bypass
+	// timestamps. Closes the window for the pause_long rule's analyst
+	// pivot.
+	EventTypePauseEnd EventType = "PAUSE_END"
+
+	// EventTypeProfileInstall is the synthetic marker emitted ONCE per
+	// successful `kbounce profile install --from URL` invocation. Carries
+	// the source URL, computed sha256, and the names of the installed
+	// profiles under unmapped.iam_jit.ext so the Slice 2
+	// non_org_profile_install rule fires AT INSTALL TIME (rather than
+	// only when the first decision under the installed profile lands).
+	// Surfaces as OCSF activity_id=99 / activity_name="profile_install"
+	// with unmapped.iam_jit.event_type=PROFILE_INSTALL.
+	//
+	// Per [[security-team-audit-export]]: install-time alerting is the
+	// difference between catching a rogue URL within seconds of the
+	// command running vs catching it only after the first proxied call
+	// (which may be hours later for a profile installed during off-hours
+	// onboarding). The synthetic event also populates the same Profile +
+	// profile_source ext fields the decision-event path uses so the
+	// existing non_org_profile_install rule predicate fires without
+	// branch-on-event-type logic.
+	EventTypeProfileInstall EventType = "PROFILE_INSTALL"
 )
 
 // OCSF activity_id enum (class 6003 / API Activity).
@@ -666,6 +722,207 @@ func NewHeartbeatEvent(seq int64, intervalSeconds int) Event {
 			},
 		},
 		EventType: EventTypeHeartbeat,
+	}
+}
+
+// MakeAdminFallbackGrantEvent builds the synthetic OCSF Event a proxy
+// emits ONCE when an operator opens a pause window (the "escape hatch
+// was opened" bookend). pauseID is the SQLite pause_events row id;
+// reason + startedBy are free-form audit context the operator passed
+// to `kbouncer pause start --reason ... --by ...`; endsAtUnixMilli is
+// the wall-clock at which the pause window will auto-revert (the
+// proxy may emit EventTypePauseEnd earlier if `pause stop` runs first).
+//
+// Carries ext.admin_fallback=true so the Slice 2 admin_fallback_burst
+// + pause_long rules observe it as a first-class fallback event without
+// the rule predicates needing a synthetic-event-aware branch (their
+// isAdminFallbackEvent check is the single source of truth). Per
+// [[security-team-positioning-safety-not-surveillance]] the status
+// detail is NEUTRAL — names the action, never frames the operator.
+func MakeAdminFallbackGrantEvent(pauseID int64, reason, startedBy string, endsAtUnixMilli int64) Event {
+	ext := map[string]any{
+		"admin_fallback":  true,
+		"pause_id":        pauseID,
+		"pause_started_by": startedBy,
+		"pause_reason":    reason,
+	}
+	if endsAtUnixMilli > 0 {
+		ext["pause_ends_at_unix_milli"] = endsAtUnixMilli
+	}
+	var actor *OCSFActor
+	if startedBy != "" {
+		actor = &OCSFActor{User: &OCSFUser{Name: startedBy}}
+	}
+	return Event{
+		Metadata: OCSFMetadata{
+			Version: OCSFSchemaVersion,
+			Product: OCSFProduct{
+				Name:       ProductName,
+				VendorName: VendorName,
+				Version:    buildVersion,
+			},
+		},
+		Time:         nowUnixMilli(),
+		ClassUID:     ClassUID,
+		ClassName:    ClassName,
+		CategoryUID:  CategoryUID,
+		CategoryName: CategoryName,
+		ActivityID:   ActivityOther,
+		ActivityName: "admin_fallback_grant",
+		TypeUID:      ClassUID*100 + ActivityOther,
+		TypeName:     typeNameForActivity(ActivityOther),
+		SeverityID:   SeverityInformational,
+		Severity:     "Informational",
+		StatusID:     StatusSuccess,
+		Status:       "Success",
+		StatusDetail: fmt.Sprintf(
+			"pause window opened (pause_id=%d) — proxy is COOPERATIVE until pause closes",
+			pauseID),
+		Actor: actor,
+		API: OCSFAPI{
+			Service: OCSFAPIService{Name: "kubernetes"},
+			Request: OCSFAPIRequest{},
+		},
+		Resources: []OCSFResource{},
+		Unmapped: OCSFUnmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeAdminFallbackGrant),
+				Ext:       ext,
+			},
+		},
+		EventType: EventTypeAdminFallbackGrant,
+	}
+}
+
+// MakePauseEndEvent builds the synthetic OCSF Event a proxy emits
+// ONCE when a pause window closes — paired bookend to
+// MakeAdminFallbackGrantEvent. endKind is the pause_events.end_kind
+// column: "resumed_early" (operator ran `kbounce pause stop`) or
+// "expired" (auto-revert at ends_at). endedBy is the actor associated
+// with the closure when known (the CLI sets it on resumed_early;
+// expired closures carry "auto").
+//
+// Per [[security-team-audit-export]]: the bookend lets a SIEM compute
+// pause-window duration with a single join (pause_end.time minus
+// admin_fallback_grant.time keyed on pause_id) rather than scanning
+// the per-decision stream for first/last bypass timestamps.
+func MakePauseEndEvent(pauseID int64, endKind, endedBy string) Event {
+	ext := map[string]any{
+		"pause_id":       pauseID,
+		"pause_end_kind": endKind,
+	}
+	if endedBy != "" {
+		ext["pause_ended_by"] = endedBy
+	}
+	var actor *OCSFActor
+	if endedBy != "" {
+		actor = &OCSFActor{User: &OCSFUser{Name: endedBy}}
+	}
+	return Event{
+		Metadata: OCSFMetadata{
+			Version: OCSFSchemaVersion,
+			Product: OCSFProduct{
+				Name:       ProductName,
+				VendorName: VendorName,
+				Version:    buildVersion,
+			},
+		},
+		Time:         nowUnixMilli(),
+		ClassUID:     ClassUID,
+		ClassName:    ClassName,
+		CategoryUID:  CategoryUID,
+		CategoryName: CategoryName,
+		ActivityID:   ActivityOther,
+		ActivityName: "pause_end",
+		TypeUID:      ClassUID*100 + ActivityOther,
+		TypeName:     typeNameForActivity(ActivityOther),
+		SeverityID:   SeverityInformational,
+		Severity:     "Informational",
+		StatusID:     StatusSuccess,
+		Status:       "Success",
+		StatusDetail: fmt.Sprintf(
+			"pause window closed (pause_id=%d, end_kind=%s)", pauseID, endKind),
+		Actor: actor,
+		API: OCSFAPI{
+			Service: OCSFAPIService{Name: "kubernetes"},
+			Request: OCSFAPIRequest{},
+		},
+		Resources: []OCSFResource{},
+		Unmapped: OCSFUnmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypePauseEnd),
+				Ext:       ext,
+			},
+		},
+		EventType: EventTypePauseEnd,
+	}
+}
+
+// MakeProfileInstallEvent builds the synthetic OCSF Event the
+// profile-install path emits ONCE after a successful
+// `kbounce profile install --from URL`. profileNames is the alphabetic-
+// ordered list of profile names the install bundle contained; source is
+// the fetch URL (forced onto every profile's Source field by the
+// installer); sha256 is the hex digest of the fetched bytes; verified
+// reports whether the operator passed --sha256 and the digest matched.
+//
+// Populates IAMJITExt.Profile (the first installed profile name; for
+// single-profile bundles this is THE name) and ext.profile_source (the
+// fetch URL) so the Slice 2 non_org_profile_install rule's existing
+// predicate (profileSource() + ev.Unmapped.IAMJIT.Profile) fires at
+// install-time without needing a synthetic-event branch. Multi-profile
+// bundles emit ONE event whose ext.installed_profiles array carries the
+// full list — the rule fires once per (firstName, source) pair, the
+// analyst pivots into the array for the rest.
+func MakeProfileInstallEvent(profileNames []string, source, sha256 string, verified bool) Event {
+	first := ""
+	if len(profileNames) > 0 {
+		first = profileNames[0]
+	}
+	ext := map[string]any{
+		"profile_source":      source,
+		"installed_profiles":  profileNames,
+		"installed_count":     len(profileNames),
+		"installed_sha256":    sha256,
+		"installed_sha256_verified": verified,
+	}
+	return Event{
+		Metadata: OCSFMetadata{
+			Version: OCSFSchemaVersion,
+			Product: OCSFProduct{
+				Name:       ProductName,
+				VendorName: VendorName,
+				Version:    buildVersion,
+			},
+		},
+		Time:         nowUnixMilli(),
+		ClassUID:     ClassUID,
+		ClassName:    ClassName,
+		CategoryUID:  CategoryUID,
+		CategoryName: CategoryName,
+		ActivityID:   ActivityOther,
+		ActivityName: "profile_install",
+		TypeUID:      ClassUID*100 + ActivityOther,
+		TypeName:     typeNameForActivity(ActivityOther),
+		SeverityID:   SeverityInformational,
+		Severity:     "Informational",
+		StatusID:     StatusSuccess,
+		Status:       "Success",
+		StatusDetail: fmt.Sprintf(
+			"installed %d profile(s) from %s", len(profileNames), source),
+		API: OCSFAPI{
+			Service: OCSFAPIService{Name: "kubernetes"},
+			Request: OCSFAPIRequest{},
+		},
+		Resources: []OCSFResource{},
+		Unmapped: OCSFUnmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeProfileInstall),
+				Profile:   first,
+				Ext:       ext,
+			},
+		},
+		EventType: EventTypeProfileInstall,
 	}
 }
 

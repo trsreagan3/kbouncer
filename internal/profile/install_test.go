@@ -13,6 +13,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/trsreagan3/kbouncer/internal/audit"
 )
 
 // startTLSPayloadServer returns an httptest.NewTLSServer that responds
@@ -446,6 +448,102 @@ profiles:
 	org, err := ps.Active("org-profile")
 	require.NoError(t, err)
 	assert.Equal(t, srv.URL, org.Source)
+}
+
+// captureInstallEmitter is a test-only audit.Emitter implementation
+// (sat next to the test it serves so we don't grow an exported test
+// helper out of the audit package just for one consumer).
+type captureInstallEmitter struct {
+	events []audit.Event
+}
+
+func (c *captureInstallEmitter) Emit(_ context.Context, ev audit.Event) {
+	c.events = append(c.events, ev)
+}
+
+func (c *captureInstallEmitter) Status() audit.Status { return audit.Status{} }
+
+// TestInstall_EmitsSyntheticProfileInstallEvent confirms a successful
+// install fires the EventTypeProfileInstall synthetic event through
+// the wired emitter — the install-time alerting wire per
+// [[security-team-audit-export]] + #270. Per
+// [[deliberate-feature-completion]] the wiring is verified end-to-end
+// (real HTTPS fetch + real on-disk write + emit) rather than via a
+// unit on the builder alone (which is covered separately in
+// internal/audit/synthetic_events_test.go).
+func TestInstall_EmitsSyntheticProfileInstallEvent(t *testing.T) {
+	payload := []byte(`
+profiles:
+  org-readonly:
+    description: "org-distributed read-only profile"
+    deny_verbs: ["delete", "patch"]
+`)
+	srv := startTLSPayloadServer(t, payload)
+	target := tmpProfilesPath(t)
+	emitter := &captureInstallEmitter{}
+
+	res, err := Install(context.Background(), InstallOptions{
+		From:         srv.URL,
+		HTTPClient:   InsecureTLSClientForTests(),
+		ProfilesPath: target,
+		AuditEmitter: emitter,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	require.Len(t, emitter.events, 1,
+		"successful install must emit exactly one synthetic install event")
+	ev := emitter.events[0]
+	assert.Equal(t, audit.EventTypeProfileInstall, ev.EventType,
+		"synthetic event must use the install-specific event type")
+	assert.Equal(t, "org-readonly", ev.Unmapped.IAMJIT.Profile)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Ext)
+	assert.Equal(t, srv.URL, ev.Unmapped.IAMJIT.Ext["profile_source"],
+		"event must carry the fetch URL so the non_org rule's allowlist gate works")
+	assert.Equal(t, []string{"org-readonly"}, ev.Unmapped.IAMJIT.Ext["installed_profiles"])
+}
+
+// TestInstall_NilEmitterStillSucceeds confirms the AuditEmitter field
+// is optional — operators who haven't wired audit export still get a
+// working install. Mirrors the default CLI path.
+func TestInstall_NilEmitterStillSucceeds(t *testing.T) {
+	payload := []byte(`
+profiles:
+  org-readonly:
+    description: "no emitter wired"
+`)
+	srv := startTLSPayloadServer(t, payload)
+	target := tmpProfilesPath(t)
+	res, err := Install(context.Background(), InstallOptions{
+		From:         srv.URL,
+		HTTPClient:   InsecureTLSClientForTests(),
+		ProfilesPath: target,
+		// AuditEmitter intentionally unset
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+}
+
+// TestInstall_FailedInstallDoesNotEmit guards the "emit only on
+// success" invariant — a sha256 mismatch must NOT produce a synthetic
+// event (the audit trail would lie about an install that didn't
+// happen).
+func TestInstall_FailedInstallDoesNotEmit(t *testing.T) {
+	payload := []byte("profiles:\n  x:\n    description: ok\n")
+	srv := startTLSPayloadServer(t, payload)
+	target := tmpProfilesPath(t)
+	emitter := &captureInstallEmitter{}
+
+	_, err := Install(context.Background(), InstallOptions{
+		From:           srv.URL,
+		ExpectedSHA256: "deadbeef" + strings.Repeat("0", 56), // 64 hex chars; wrong
+		HTTPClient:     InsecureTLSClientForTests(),
+		ProfilesPath:   target,
+		AuditEmitter:   emitter,
+	})
+	require.Error(t, err)
+	assert.Empty(t, emitter.events,
+		"failed install must not emit a synthetic event")
 }
 
 // TestInstall_AllowRulesRoundTrip — allow_rules in the payload survive

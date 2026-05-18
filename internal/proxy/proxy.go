@@ -487,6 +487,21 @@ type EvalOptions struct {
 	// + the sync-prompt path leave it nil (sync-flow waiters do their
 	// own UX; bulk-answer's target is the async per-call queue).
 	BurstDetector *BurstDetector
+
+	// OnPauseLookup, when non-nil, is invoked once per
+	// EvaluateRequestFull call with the result of the proxy's
+	// store.GetActivePause() lookup (nil when no pause is active).
+	// Lets the Server hook the pause-lookup so it can detect
+	// open-edge / close-edge transitions across requests + emit the
+	// synthetic EventTypeAdminFallbackGrant + EventTypePauseEnd events
+	// without the evaluator itself owning audit-event semantics. Per
+	// [[security-team-audit-export]] the proxy hot-path is the single
+	// observer wired to the audit emitter, so even pause state
+	// mutations from one-shot CLI commands (`pause start` / `pause
+	// stop`) get audit-exported through here on the next inbound
+	// request. nil = no-op (test callers + the
+	// EvaluateRequestWithProfile thin wrapper leave it unset).
+	OnPauseLookup func(active *store.PauseRow)
 }
 
 // SessionHeaderName is the inbound HTTP header an MCP-aware client can
@@ -573,6 +588,15 @@ func EvaluateRequestFull(
 		} else {
 			activePause = ap
 		}
+	}
+	// Hook the lookup so the Server can detect pause open/close
+	// transitions across requests + emit the synthetic
+	// EventTypeAdminFallbackGrant + EventTypePauseEnd events. Fires
+	// BEFORE the decision flow so the open-edge event lands in the
+	// audit log ahead of the first per-decision DECISION event the
+	// pause window enables (preserves SIEM-side time ordering).
+	if opts.OnPauseLookup != nil {
+		opts.OnPauseLookup(activePause)
 	}
 	effectiveMode := mode
 	if activePause != nil && mode == ModeTransparent {
@@ -827,6 +851,105 @@ func activeTaskID(t *tasks.Scope) string {
 		return ""
 	}
 	return t.TaskID
+}
+
+// observePauseTransition is the OnPauseLookup callback the Server
+// passes into EvaluateRequestFull. Detects open-edge / close-edge
+// pause transitions across consecutive requests + emits the synthetic
+// EventTypeAdminFallbackGrant / EventTypePauseEnd events through the
+// audit emitter. No-op when no audit emitter is wired (the synthetic
+// events have nowhere to land).
+//
+// Atomicity: the lastSeenPauseID atomic carries the previously-
+// observed id; the compare-and-swap-shaped update (Load + Store) is
+// safe under concurrent inbound requests because we only emit on a
+// detected delta + we tolerate at-most-once-per-request emit cadence
+// (occasional duplicate grant events for a single window are
+// acceptable; a SIEM dedupes by pause_id + activity_name anyway).
+//
+// End-kind lookup: on a close-edge (prevID != 0 && current == nil),
+// query the store for the closed pause's end_kind so the synthetic
+// event accurately distinguishes "resumed_early" from "expired".
+// Lookup failure is non-fatal — we still emit the event with an
+// "unknown" kind so an analyst sees the closure (better partial
+// information than silence).
+func (s *Server) observePauseTransition(active *store.PauseRow) {
+	if s == nil || s.cfg.AuditEmitter == nil {
+		return
+	}
+	curID := int64(0)
+	if active != nil {
+		curID = active.ID
+	}
+	prevID := s.lastSeenPauseID.Swap(curID)
+	if prevID == curID {
+		return
+	}
+	ctx := context.Background()
+	// Close-edge first so SIEM-side time ordering shows the prior
+	// window's close before the new window's open in the N → M case.
+	if prevID != 0 {
+		endKind, endedBy := s.lookupClosedPauseKind(prevID)
+		audit.EmitPauseEnd(ctx, s.cfg.AuditEmitter, prevID, endKind, endedBy)
+	}
+	if curID != 0 && active != nil {
+		endsAtMilli := parseStorePauseTimeMilli(active.EndsAt)
+		audit.EmitAdminFallbackGrant(ctx, s.cfg.AuditEmitter,
+			curID, active.Reason, active.StartedBy, endsAtMilli)
+	}
+}
+
+// lookupClosedPauseKind queries the store for a previously-active
+// pause's end_kind ("resumed_early" / "expired") so the synthetic
+// pause-end event accurately distinguishes operator-initiated closure
+// from auto-revert. Returns ("unknown", "") on lookup failure / row-
+// not-found — the synthetic event still fires so a SIEM sees the
+// closure (better partial information than silence).
+func (s *Server) lookupClosedPauseKind(pauseID int64) (kind, endedBy string) {
+	if s == nil || s.store == nil || pauseID <= 0 {
+		return "unknown", ""
+	}
+	rows, err := s.store.ListRecentPauses(50)
+	if err != nil {
+		recordLookupError(err, "kbounce: pause-end-kind lookup failed")
+		return "unknown", ""
+	}
+	for _, r := range rows {
+		if r.ID != pauseID {
+			continue
+		}
+		kind = r.EndKind
+		if kind == "" {
+			kind = "unknown"
+		}
+		// pause_events.started_by is the open-edge actor; the store
+		// doesn't track a separate ended_by (per the EndPause docstring
+		// the column is future work). Pass the opener as the best
+		// available actor for the closure event so an analyst at least
+		// sees WHO owns the window when the closure record itself
+		// lacks an actor; "expired" closures legitimately have no
+		// human actor (the store auto-reverted), so an empty endedBy
+		// is fine on that path too.
+		endedBy = r.StartedBy
+		return kind, endedBy
+	}
+	return "unknown", ""
+}
+
+// parseStorePauseTimeMilli converts the store's RFC3339-ish
+// "2006-01-02T15:04:05Z" timestamp string into Unix milliseconds for
+// embedding in the synthetic event's ext block. Returns 0 on parse
+// failure so the builder omits the field (per the event's omitempty-
+// shaped contract — a missing ends_at is more honest than a wrong one).
+func parseStorePauseTimeMilli(ts string) int64 {
+	if ts == "" {
+		return 0
+	}
+	t, err := time.Parse("2006-01-02T15:04:05Z", ts)
+	if err != nil {
+		return 0
+	}
+	return t.UTC().UnixMilli()
 }
 
 // emitAuditEvent fans the canonical DecisionInput off to the
@@ -1131,6 +1254,27 @@ type Server struct {
 	// sweeper (cosmetic counter; rules are filtered at LoadRuleSet
 	// time regardless). nil when no sweeper was launched.
 	expiredRulesSweepStop chan struct{}
+
+	// lastSeenPauseID tracks the most recently observed active pause id
+	// (0 = no pause active). The proxy hot-path's pause-lookup
+	// observes transitions from this value to detect:
+	//   0 → N: operator opened a pause window → emit synthetic
+	//          EventTypeAdminFallbackGrant ONCE so a SIEM sees the
+	//          window's open edge as a single high-signal row.
+	//   N → 0: the previously-active pause is gone (auto-expired by
+	//          the store's lazy GC inside GetActivePause, OR resumed
+	//          early via `kbounce pause stop`) → emit synthetic
+	//          EventTypePauseEnd ONCE with the persisted end_kind so a
+	//          SIEM can pair it with the open-edge event.
+	//   N → M (N != 0, M != 0, N != M): unusual but possible if the
+	//          operator stops one pause + starts another between two
+	//          requests → emit pause-end for N then grant for M.
+	// Per [[security-team-audit-export]]: the proxy hot-path is the
+	// single observer with the audit emitter wired, so even pause
+	// state mutations from one-shot CLI commands (`pause start` /
+	// `pause stop`) get audit-exported through the proxy on the next
+	// inbound request — no separate CLI-side emitter wiring needed.
+	lastSeenPauseID atomic.Int64
 }
 
 // lookupErrorsCounter is a process-wide counter of lookup-class
@@ -1630,6 +1774,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			AuditProfileSource: profileSource,
 			AgentRegistry:      s.cfg.AgentRegistry,
 			BurstDetector:      s.burstDetector,
+			OnPauseLookup:      s.observePauseTransition,
 		},
 	)
 

@@ -56,6 +56,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/trsreagan3/kbouncer/internal/audit"
 )
 
 // InstallExitCode is the exit code an `os.Exit` caller should use for
@@ -151,6 +153,22 @@ type InstallOptions struct {
 	// resolve via DefaultProfilesPath (~/.kbouncer/profiles.yaml or
 	// KBOUNCER_PROFILES_PATH env).
 	ProfilesPath string
+
+	// AuditEmitter, when non-nil, receives a synthetic
+	// EventTypeProfileInstall event after a successful install. The
+	// event carries the fetch URL + computed sha256 + installed
+	// profile names so the Slice 2 non_org_profile_install rule fires
+	// AT INSTALL TIME rather than waiting for the first proxied
+	// decision under the installed profile to land. Nil disables the
+	// emit (CLI default — `kbounce profile install` runs as a one-
+	// shot command without an audit emitter; operators who want
+	// install-time SIEM alerts wire one explicitly via the future
+	// `--audit-log` flag on the install subcommand). Per
+	// [[security-team-audit-export]] the synthetic event uses NEUTRAL
+	// language + lands in the same JSONL log + HTTPS webhook the
+	// per-decision events use, so a SIEM dashboard sees the install
+	// as a first-class row.
+	AuditEmitter audit.Emitter
 }
 
 // InstallResult summarizes a successful install. Returned by Install
@@ -328,6 +346,18 @@ func InstallFromBytes(payload []byte, opts InstallOptions) (*InstallResult, erro
 		return nil, installErrWrap(InstallExitPayload,
 			fmt.Sprintf("write profiles: %v", err), err)
 	}
+
+	// Emit the synthetic EventTypeProfileInstall event AFTER the
+	// on-disk write succeeds so the audit trail reflects "the profile
+	// was installed" rather than "we tried to install and may have
+	// failed at the last step". The Slice 2 non_org_profile_install
+	// rule picks this up at install-time when its approved-URL gate
+	// rejects the source. No-op when AuditEmitter is nil (the CLI's
+	// default — the `kbounce profile install` one-shot command runs
+	// without an audit emitter unless the operator wires one
+	// explicitly).
+	audit.EmitProfileInstall(context.Background(), opts.AuditEmitter,
+		names, opts.From, actualHex, verified)
 
 	return &InstallResult{
 		SourceURL:      opts.From,
