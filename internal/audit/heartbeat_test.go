@@ -270,7 +270,7 @@ func TestHeartbeatGapRule_RecoversOnInBandTick(t *testing.T) {
 // heartbeat_gap rule is one of the five built-ins in stable order.
 func TestHeartbeatGapRule_AppearsInBuiltInRules(t *testing.T) {
 	rules := BuildBuiltinRules(nil)
-	require.Len(t, rules, 5)
+	require.Len(t, rules, 6)
 	assert.Equal(t, "heartbeat_gap", rules[4].Name())
 	assert.Equal(t, SeverityHigh, rules[4].Severity(),
 		"per [[prompt-injection-disable-bouncer-threat]] heartbeat_gap is High severity")
@@ -285,6 +285,13 @@ func TestHeartbeatGapRule_ConfigOverrides(t *testing.T) {
 	rules := BuildBuiltinRules(cfg)
 	hg := rules[4].(*heartbeatGapRule)
 	assert.Equal(t, 5, hg.missedThreshold)
+	// The 6th rule is audit_export_degraded (per Slice 8 of #252,
+	// [[audit-export-failure-visibility]]) — pin its position so a
+	// future re-order doesn't silently shift indices the engine
+	// bindings rely on.
+	aed := rules[5].(*auditExportDegradedRule)
+	assert.Equal(t, DefaultAuditExportDegradedConsecFailureThreshold,
+		aed.consecFailureThreshold)
 }
 
 // TestRuleEngine_HeartbeatEndToEnd asserts the full Slice 7 contract:

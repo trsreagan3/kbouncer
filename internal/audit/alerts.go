@@ -26,6 +26,7 @@ package audit
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -55,6 +56,14 @@ const (
 	// channel has actually gone quiet and the operator wants to know.
 	DefaultHeartbeatGapMissedThreshold = 2
 )
+
+// DefaultAuditExportDegradedConsecFailureThreshold mirrors the
+// Manager-side AuditExportConsecutiveFailureThreshold (3) for the
+// audit_export_degraded rule. Exposed separately so a YAML override
+// can tune the rule's gate independently of /healthz when an
+// operator wants the alert to fire EARLIER than /healthz (e.g.
+// alert at 1 failure, only flip /healthz at 3).
+const DefaultAuditExportDegradedConsecFailureThreshold = AuditExportConsecutiveFailureThreshold
 
 // DefaultK8sHighRiskSubresources is the built-in set of K8s
 // subresources whose DENY in transparent mode triggers the
@@ -116,6 +125,12 @@ const (
 		"reachability, and the --heartbeat-interval flag); the " +
 		"alert is the canary for prompt-injection-disable threats " +
 		"per [[prompt-injection-disable-bouncer-threat]]"
+	SuggestionAuditExportDegraded = "investigate the audit-export " +
+		"channel state (disk space + permissions on the JSONL log " +
+		"path, downstream webhook collector reachability, queue " +
+		"saturation); /healthz reports 503 + the audit_export_degraded " +
+		"alert fires when writes_ok=false, consecutive_failures > 3, " +
+		"or no successful write has landed in the last 5 minutes"
 )
 
 // AlertRule is the interface every built-in (and future operator-
@@ -175,6 +190,18 @@ type RulesConfig struct {
 	NonOrgProfileInstall  *NonOrgProfileInstallConfig  `yaml:"non_org_profile_install,omitempty"`
 	UnusualHighRiskAction *UnusualHighRiskActionConfig `yaml:"unusual_high_risk_action,omitempty"`
 	HeartbeatGap          *HeartbeatGapConfig          `yaml:"heartbeat_gap,omitempty"`
+	AuditExportDegraded   *AuditExportDegradedConfig   `yaml:"audit_export_degraded,omitempty"`
+}
+
+// AuditExportDegradedConfig tunes the audit_export_degraded rule.
+// ConsecFailureThreshold overrides the default 3-consecutive-failures
+// gate; an operator can lower it (alert earlier than /healthz flips)
+// or raise it (only alert on sustained outages). The 5-minute
+// stale-success window is not currently overridable from the YAML
+// — operators who want a different staleness gate can run with
+// --heartbeat-interval instead.
+type AuditExportDegradedConfig struct {
+	ConsecFailureThreshold int `yaml:"consec_failure_threshold,omitempty"`
 }
 
 // AdminFallbackBurstConfig tunes the admin_fallback_burst rule. A
@@ -300,7 +327,14 @@ func BuildBuiltinRules(cfg *RulesConfig) []AlertRule {
 		hg.missedThreshold = cfg.HeartbeatGap.MissedThreshold
 	}
 
-	return []AlertRule{afb, pl, npi, uhr, hg}
+	aed := &auditExportDegradedRule{
+		consecFailureThreshold: DefaultAuditExportDegradedConsecFailureThreshold,
+	}
+	if cfg.AuditExportDegraded != nil && cfg.AuditExportDegraded.ConsecFailureThreshold > 0 {
+		aed.consecFailureThreshold = cfg.AuditExportDegraded.ConsecFailureThreshold
+	}
+
+	return []AlertRule{afb, pl, npi, uhr, hg, aed}
 }
 
 // stringSet is a tiny helper to turn a slice into a lookup map for
@@ -424,7 +458,8 @@ type firedAlert struct {
 // fired, what was the last pattern" in one shot.
 func (e *RuleEngine) Status() Status {
 	if e == nil {
-		return Status{}
+		return Status{AuditExportHealthy: true, HeartbeatHealthy: true,
+			LogWritesOK: true, WebhookWritesOK: true}
 	}
 	s := e.emitter.Status()
 	s.AlertsEnabled = true
@@ -444,7 +479,45 @@ func (e *RuleEngine) Status() Status {
 		// Disabled → healthy by definition (no expectation to fail).
 		s.HeartbeatHealthy = true
 	}
+	// Recompute the aggregate audit-export health verdict after
+	// applying the engine-bound heartbeat overlay so the engine path
+	// + the bare-Manager path return the same AuditExportHealthy
+	// shape for the same underlying state. Pure function over the
+	// snapshot — no extra atomic loads.
+	s.AuditExportHealthy, s.AuditExportDegradedReason = computeAuditExportHealth(s, time.Now().UTC())
 	return s
+}
+
+// BindStatusSource wires the channel-health snapshot source into the
+// audit_export_degraded rule (if present in the registered rule set)
+// so the rule can fire on /healthz-equivalent degradation signals.
+// No-op when no audit_export_degraded rule is registered.
+//
+// Per [[audit-export-failure-visibility]]: the rule reads
+// channel health via this closure (not a direct Manager pointer) so
+// the rule stays unit-testable + so the engine doesn't acquire a
+// cyclic dependency on the Manager (Manager wraps engine wraps
+// rule).
+func (e *RuleEngine) BindStatusSource(fn func() Status) {
+	if e == nil || fn == nil {
+		return
+	}
+	for _, r := range e.rules {
+		if aed, ok := r.(*auditExportDegradedRule); ok {
+			aed.bindStatusFn(fn)
+			// Default the stderr fallback writer to os.Stderr when
+			// the engine wires the status source — the CLI's "audit
+			// export channel itself may be the failure source"
+			// fallback path needs an actual writer wired even when
+			// the operator hasn't called setStderrWriter manually
+			// (tests override via setStderrWriter directly).
+			aed.stderrMu.Lock()
+			if aed.stderrWriter == nil {
+				aed.stderrWriter = os.Stderr
+			}
+			aed.stderrMu.Unlock()
+		}
+	}
 }
 
 // BindHeartbeater wires the given Heartbeater into the heartbeat_gap
@@ -935,6 +1008,203 @@ func (r *heartbeatGapRule) Observe(ev Event, _ time.Time) (AlertFire, bool) {
 			"observed_local_fallback_path": "stderr_and_healthz_503",
 		},
 	}, true
+}
+
+// auditExportDegradedRule fires when the underlying export channel's
+// health predicate trips per [[audit-export-failure-visibility]]'s
+// 503 trigger conditions: log_writes_ok=false OR consecutive_failures
+// > threshold OR last_success > 5min. Severity Medium (3) — degraded
+// audit-export is operator-actionable but not the same severity as a
+// silenced channel (heartbeat_gap is High for that reason).
+//
+// Edge-triggered: fires ONCE per healthy → degraded transition + once
+// per degraded → healthy recovery, never on every event observed in a
+// degraded state. Operators see one alert per outage window, not one
+// per decision.
+//
+// Per [[audit-export-failure-visibility]] the rule ALSO writes a
+// one-line notice to stderr (independent of the audit-export channel
+// itself, which may be the failure source) so an operator monitoring
+// the kbounce container logs sees the alert even when the JSONL log +
+// HTTPS webhook are both down. The /healthz handler reads the same
+// computeAuditExportHealth predicate via the AuditHealthCheck wiring,
+// so the two surfaces stay in lockstep.
+//
+// State source: the rule reads channel health via a statusFn closure
+// the engine wires through bindStatusFn — no direct dependency on
+// the Manager type (keeps the rule unit-testable with a stubbed
+// status source).
+type auditExportDegradedRule struct {
+	consecFailureThreshold int
+
+	// statusFn returns the current Status snapshot used to evaluate
+	// the degradation predicate. nil → the rule is a no-op (the
+	// engine's bindStatusFn must be called for the rule to fire).
+	statusFn func() Status
+
+	// degraded tracks the most-recently-observed state so the rule
+	// can edge-trigger (fire on transitions, not continuously). A
+	// fresh rule starts in the healthy state; the first observation
+	// that trips the predicate fires + flips degraded to true.
+	degraded bool
+
+	// stderrWriter is the io.Writer the rule writes the operator-
+	// facing notice to. Defaults to os.Stderr; overridable for
+	// tests. Per [[audit-export-failure-visibility]] this is the
+	// independent fallback surface — when the audit-export channel
+	// itself is the failure source the alert event would not land,
+	// but the stderr line still reaches the operator.
+	stderrMu     sync.Mutex
+	stderrWriter io.Writer
+}
+
+func (r *auditExportDegradedRule) Name() string {
+	return "audit_export_degraded"
+}
+func (r *auditExportDegradedRule) Description() string {
+	return "Audit-export channel writes_ok=false, consecutive_failures > threshold, or no successful write in the last 5 minutes"
+}
+func (r *auditExportDegradedRule) Severity() int { return SeverityMedium }
+
+// bindStatusFn wires the channel-health snapshot source. The engine
+// calls this from BindStatusSource after BuildBuiltinRules + the
+// Manager are both constructed (the Manager is itself the status
+// source). Idempotent.
+func (r *auditExportDegradedRule) bindStatusFn(fn func() Status) {
+	r.statusFn = fn
+}
+
+// setStderrWriter overrides the stderr fallback target. Test hook —
+// production CLI always uses os.Stderr.
+func (r *auditExportDegradedRule) setStderrWriter(w io.Writer) {
+	r.stderrMu.Lock()
+	r.stderrWriter = w
+	r.stderrMu.Unlock()
+}
+
+// Observe evaluates the channel-health predicate on every observed
+// event. The event content itself is ignored — the rule is a
+// state-monitor, not an event-classifier — but riding the event hook
+// gives the rule a polling cadence proportional to traffic + lets it
+// reuse the engine's lock/forward machinery without a separate
+// goroutine.
+//
+// Operators who want the rule to fire even when no traffic flows
+// should enable --heartbeat-interval; heartbeats arrive at a fixed
+// cadence + run through the engine, giving the rule a guaranteed
+// minimum poll rate independent of decision-event volume.
+func (r *auditExportDegradedRule) Observe(_ Event, now time.Time) (AlertFire, bool) {
+	if r == nil || r.statusFn == nil {
+		return AlertFire{}, false
+	}
+	st := r.statusFn()
+	healthy, reason := r.evaluate(st, now)
+	if healthy {
+		if r.degraded {
+			// Recovery edge — clear the latch + write a one-line
+			// stderr notice so an operator watching the logs sees the
+			// resolution. Recovery transitions don't emit an OCSF alert
+			// event (the original degraded alert carries the audit
+			// trail; a recovery event would double the noise).
+			r.degraded = false
+			r.writeStderr("kbounce: audit-export recovered " +
+				"(writes_ok=true, consecutive_failures=0); /healthz returns to 200\n")
+		}
+		return AlertFire{}, false
+	}
+	if r.degraded {
+		// Still degraded — already fired. Do not re-fire per event.
+		return AlertFire{}, false
+	}
+	r.degraded = true
+	r.writeStderr(fmt.Sprintf(
+		"kbounce: audit_export_degraded fired (%s); "+
+			"/healthz now reports 503 until the channel recovers\n",
+		reason))
+	return AlertFire{
+		Detail: fmt.Sprintf(
+			"Pattern audit_export_degraded fired: %s", reason),
+		WindowSeconds:     0,
+		MatchedEventCount: 1,
+		Suggestion:        SuggestionAuditExportDegraded,
+		Ext: map[string]any{
+			"observed_reason":                       reason,
+			"observed_log_writes_ok":                st.LogWritesOK,
+			"observed_log_consecutive_failures":     st.LogConsecutiveFailures,
+			"observed_webhook_writes_ok":            st.WebhookWritesOK,
+			"observed_webhook_consecutive_failures": st.WebhookConsecutiveFailures,
+			"observed_local_fallback_path":          "stderr_and_healthz_503",
+		},
+	}, true
+}
+
+// evaluate runs the same gates as computeAuditExportHealth but uses
+// the rule's own per-instance threshold (which may be tuned via the
+// YAML config independently of /healthz). Heartbeat health is
+// deliberately NOT considered here — the heartbeat_gap rule owns
+// that surface; this rule scopes to the JSONL log + webhook
+// channels' write health.
+func (r *auditExportDegradedRule) evaluate(s Status, now time.Time) (bool, string) {
+	var reasons []string
+	threshold := int64(r.consecFailureThreshold)
+	if s.LogConfigured {
+		if !s.LogWritesOK {
+			reasons = append(reasons, "log writes_ok=false")
+		}
+		if s.LogConsecutiveFailures > threshold {
+			reasons = append(reasons, fmt.Sprintf(
+				"log consecutive_failures=%d (threshold=%d)",
+				s.LogConsecutiveFailures, threshold))
+		}
+		if s.LogLastSuccessUnixMilli > 0 {
+			age := now.Sub(time.UnixMilli(s.LogLastSuccessUnixMilli).UTC())
+			if age > AuditExportStaleSuccessThreshold {
+				reasons = append(reasons, fmt.Sprintf(
+					"log last_success age=%s (threshold=%s)",
+					age.Round(time.Second), AuditExportStaleSuccessThreshold))
+			}
+		}
+	}
+	if s.WebhookConfigured {
+		if !s.WebhookWritesOK {
+			reasons = append(reasons, "webhook writes_ok=false")
+		}
+		if s.WebhookConsecutiveFailures > threshold {
+			reasons = append(reasons, fmt.Sprintf(
+				"webhook consecutive_failures=%d (threshold=%d)",
+				s.WebhookConsecutiveFailures, threshold))
+		}
+		if s.WebhookLastSuccessUnixMilli > 0 {
+			age := now.Sub(time.UnixMilli(s.WebhookLastSuccessUnixMilli).UTC())
+			if age > AuditExportStaleSuccessThreshold {
+				reasons = append(reasons, fmt.Sprintf(
+					"webhook last_success age=%s (threshold=%s)",
+					age.Round(time.Second), AuditExportStaleSuccessThreshold))
+			}
+		}
+	}
+	if len(reasons) == 0 {
+		return true, ""
+	}
+	out := reasons[0]
+	for _, r := range reasons[1:] {
+		out += "; " + r
+	}
+	return false, out
+}
+
+// writeStderr is the internal helper that writes one line to the
+// rule's configured stderr writer under the mutex. No-op when the
+// writer is nil (production calls setStderrWriter or relies on
+// engine wiring to default it to os.Stderr).
+func (r *auditExportDegradedRule) writeStderr(s string) {
+	r.stderrMu.Lock()
+	w := r.stderrWriter
+	r.stderrMu.Unlock()
+	if w == nil {
+		return
+	}
+	fmt.Fprint(w, s)
 }
 
 // isAdminFallbackEvent reports whether the event represents a

@@ -5,6 +5,55 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Audit-export failure visibility (2026-05-18, #265 Slice 8)
+
+Closes `[[audit-export-failure-visibility]]`. Surfaces export-channel
+write health on three independent operator surfaces so a silent
+audit-export outage cannot pass undetected.
+
+- **Manager.Status() extensions** — `log_writes_ok`,
+  `log_consecutive_failures`, `log_last_success_unix_milli`,
+  `webhook_writes_ok`, `webhook_consecutive_failures`,
+  `webhook_last_success_unix_milli`, plus the aggregate verdict
+  `audit_export_healthy` + `audit_export_degraded_reason`.
+  `LogWriter` + `WebhookPusher` track the per-channel counters; the
+  Manager pure-functionally computes the aggregate via
+  `computeAuditExportHealth`. Independent of the heartbeat-watchdog
+  503 surface (either-or 503 per the memo).
+- **`/healthz` extension** — returns 503 with `audit_export_healthy:
+  false` when ANY configured channel trips `writes_ok=false`,
+  `consecutive_failures > 3`, or `last_success` age > 5 minutes.
+  External supervisors (k8s liveness probes, monit, supervisor
+  scripts) see the same signal the SIEM-side `audit_export_degraded`
+  rule trips on.
+- **`kbounce audit-export health` CLI subcommand** — explicit
+  operator-facing check that hits the running proxy's `/healthz`
+  endpoint. Exits 0 (healthy), 1 (degraded — degradation reason on
+  stderr), or 2 (transport / parse error — distinct so a shell
+  script can tell "kbounce isn't running" apart from "kbounce is
+  fine but audit-export is degraded"). `--insecure-skip-verify` for
+  the dev-cert path; `--url` for non-default ports / TLS bindings.
+- **`audit_export_degraded` alert rule** — 6th built-in alert (after
+  `heartbeat_gap`). Severity Medium. Edge-triggered (one alert per
+  outage window, not one per event). Writes a one-line operator-
+  facing notice to stderr INDEPENDENT of the audit-export channel
+  itself so an operator monitoring container logs sees the alert
+  even when the JSONL log + HTTPS webhook are both down. Wired into
+  the engine via `RuleEngine.BindStatusSource`. YAML override via
+  `audit_export_degraded.consec_failure_threshold`.
+- **Tests** — F1-F8 failure-mode coverage in
+  `internal/audit/audit_export_failure_test.go` (queue-full + retry-
+  exhaustion + recovery + stale-success + heartbeat-OR-in +
+  end-to-end engine wiring + token-mask discipline + read-only-dir
+  open-failure). CLI exit-code shape in
+  `internal/cli/audit_export_health_test.go`.
+
+Per `[[security-team-positioning-safety-not-surveillance]]` every
+operator-facing string stays neutral; the `audit_export_degraded`
+alert payload is scanned for forbidden words by the neutral-language
+test. Per `[[push-policy-public-repo]]` no operator paths /
+environment specifics in the new code.
+
 ### Audit-export webhook presets (2026-05-18, #257)
 
 Adds `--audit-webhook-preset` so the webhook body + auth header can

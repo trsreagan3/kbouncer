@@ -62,6 +62,20 @@ type WebhookPusher struct {
 	dropped   atomic.Int64
 	inFlight  atomic.Int64
 	lastErr   atomic.Value // string, with token + URL userinfo masked
+
+	// Per [[audit-export-failure-visibility]] health-surface
+	// counters — same shape as LogWriter (writesOK / consecFailures
+	// / lastSuccessUnixNano). writesOK is true when the most-recent
+	// delivery attempt completed in the success branch (2xx after
+	// retries); flips to false on retry-exhaustion + queue-full
+	// drops + SSRF rejection at runtime. consecFailures tracks the
+	// run of failed deliveries since the last 2xx. lastSuccessUnix
+	// Nano records the wall-clock of the most-recent 2xx so the
+	// watchdog can flag a wedged remote collector that returns no
+	// errors but accepts no events either.
+	writesOK             atomic.Bool
+	consecFailures       atomic.Int64
+	lastSuccessUnixNano  atomic.Int64
 }
 
 // WebhookOptions configures a WebhookPusher. URL + Token are
@@ -181,6 +195,11 @@ func NewWebhookPusher(ctx context.Context, opts WebhookOptions) (*WebhookPusher,
 		done:               make(chan struct{}),
 	}
 	wp.lastErr.Store("")
+	// Same fresh-channel-is-healthy semantics as LogWriter: a startup
+	// probe arriving before the first delivery attempt should not be
+	// reported as degraded purely because no successful push has
+	// happened yet.
+	wp.writesOK.Store(true)
 	wp.wg.Add(1)
 	go wp.run(ctx)
 	return wp, nil
@@ -212,6 +231,14 @@ func (wp *WebhookPusher) Push(_ context.Context, ev Event) error {
 		case wp.queue <- marker:
 		default:
 		}
+		// Per [[audit-export-failure-visibility]]: a queue-full
+		// overflow counts as a failed write for the health surface
+		// even when the AUDIT_DROPPED marker enqueues successfully —
+		// the operator's decision event itself was lost. Recorded
+		// under the same consecFailures counter the deliver-path
+		// uses so a single threshold captures both shapes.
+		wp.writesOK.Store(false)
+		wp.consecFailures.Add(1)
 		return fmt.Errorf("audit webhook queue full (depth=%d); event dropped", cap(wp.queue))
 	}
 }
@@ -272,6 +299,14 @@ func (wp *WebhookPusher) deliver(ctx context.Context, ev Event) {
 		if err == nil {
 			wp.total.Add(1)
 			wp.lastErr.Store("")
+			// Per [[audit-export-failure-visibility]]: reset the
+			// failure run on the first 2xx + record the wall-clock so
+			// the watchdog can flag "no successful delivery in 5+
+			// minutes" even on a wedged collector that returns no
+			// errors but accepts no events either.
+			wp.writesOK.Store(true)
+			wp.consecFailures.Store(0)
+			wp.lastSuccessUnixNano.Store(time.Now().UTC().UnixNano())
 			return
 		}
 		// Mask the URL + Authorization details from the recorded
@@ -296,8 +331,16 @@ func (wp *WebhookPusher) deliver(ctx context.Context, ev Event) {
 			}
 		}
 	}
-	// All attempts exhausted — count the drop.
+	// All attempts exhausted — count the drop + mark the channel
+	// unhealthy for the visibility surface. consecFailures is a
+	// per-event counter (one increment per exhausted delivery), not
+	// a per-attempt one, so the 3-consecutive-failures /healthz
+	// threshold matches "the last 3+ events were dropped after
+	// exhausting retries" rather than "the last 3+ retry-loops
+	// failed for any reason".
 	wp.dropped.Add(1)
+	wp.writesOK.Store(false)
+	wp.consecFailures.Add(1)
 }
 
 // sendOnce performs one HTTP POST with the preset-built URL, headers,
@@ -383,6 +426,49 @@ func (wp *WebhookPusher) LastError() string {
 		return v
 	}
 	return ""
+}
+
+// WritesOK reports whether the most-recent delivery completed in the
+// 2xx branch. True on a fresh pusher with no attempts yet. Flips to
+// false on queue-full drops + retry-exhaustion + stays false until
+// the next 2xx delivery resets it.
+//
+// Per [[audit-export-failure-visibility]]: read by /healthz, the MCP
+// status tool, the `kbounce audit-export health` CLI subcommand, and
+// the audit_export_degraded alert-rule predicate.
+func (wp *WebhookPusher) WritesOK() bool {
+	if wp == nil {
+		return true
+	}
+	return wp.writesOK.Load()
+}
+
+// ConsecutiveFailures returns the count of consecutive failed
+// deliveries since the last 2xx. 0 on a fresh pusher + reset to 0
+// on each 2xx. The /healthz 503 trigger fires at > 3 (per the
+// memo's threshold table).
+func (wp *WebhookPusher) ConsecutiveFailures() int64 {
+	if wp == nil {
+		return 0
+	}
+	return wp.consecFailures.Load()
+}
+
+// LastSuccess returns the wall-clock of the most-recent 2xx delivery.
+// Zero time when none has happened yet. The watchdog uses this to
+// flag a wedged collector that accepts the TCP connection + returns
+// no errors but never responds with 2xx (the retry loop exhausts +
+// records a failure each event, but consecFailures alone misses the
+// case where traffic stops entirely + the channel falls silent).
+func (wp *WebhookPusher) LastSuccess() time.Time {
+	if wp == nil {
+		return time.Time{}
+	}
+	v := wp.lastSuccessUnixNano.Load()
+	if v == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, v).UTC()
 }
 
 // maskURL strips userinfo (user:pass@) + query string from a URL

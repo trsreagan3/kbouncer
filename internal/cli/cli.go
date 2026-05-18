@@ -112,6 +112,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newProfileCmd())
 	root.AddCommand(newAuditCmd())
+	root.AddCommand(newAuditExportCmd())
 	root.AddCommand(newPauseCmd())
 	root.AddCommand(newPromptsCmd())
 	root.AddCommand(newRulesCmd())
@@ -449,7 +450,8 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				if status.AlertsEnabled {
 					fmt.Fprintf(os.Stderr,
 						"audit alerts: enabled (rules=admin_fallback_burst, pause_long, "+
-							"non_org_profile_install, unusual_high_risk_action, heartbeat_gap)\n")
+							"non_org_profile_install, unusual_high_risk_action, heartbeat_gap, "+
+							"audit_export_degraded)\n")
 				}
 				if status.HeartbeatEnabled {
 					fmt.Fprintf(os.Stderr,
@@ -821,9 +823,27 @@ func buildAuditManager(
 		mgr.BindHeartbeater(hb)
 		hb.Start(ctx)
 	}
-	var healthCheck func() bool
-	if hb != nil {
-		healthCheck = hb.Healthy
+	// Per [[audit-export-failure-visibility]]: /healthz flips to 503
+	// when the heartbeat watchdog OR the audit-export channel-write
+	// health predicate fires (either-or, both independent of each
+	// other). The combined callback fans the two surfaces into a
+	// single bool the proxy.Config.AuditHealthCheck consumes —
+	// channel-write degradation is detected via the Manager's status
+	// snapshot (consec-failure threshold + 5-min stale-success
+	// window from computeAuditExportHealth) so /healthz, the MCP
+	// status tool, the `kbounce audit-export health` CLI, and the
+	// audit_export_degraded alert rule all read the same predicate.
+	healthCheck := func() bool {
+		if mgr != nil {
+			st := mgr.Status()
+			if !st.AuditExportHealthy {
+				return false
+			}
+		}
+		if hb != nil && !hb.Healthy() {
+			return false
+		}
+		return true
 	}
 	closer := func() {
 		if hb != nil {

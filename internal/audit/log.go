@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // LogWriter is the JSONL audit log writer. Append-only file with
@@ -32,6 +33,18 @@ type LogWriter struct {
 	dropped  atomic.Int64 // events dropped because the queue was full
 	lastErr  atomic.Value // string — last write/marshal error message (empty when clean)
 	closeOnce sync.Once
+
+	// Per [[audit-export-failure-visibility]] health-surface
+	// counters. writesOK is true when the most-recent attempt
+	// succeeded (or none have happened yet); consecFailures is the
+	// monotonically-increasing run of failed writes since the last
+	// success; lastSuccessUnixNano is the wall-clock of the most-
+	// recent successful write. All three power the F1-F8 visibility
+	// table the CLI subcommand + /healthz + audit_export_degraded
+	// alert rule all read.
+	writesOK             atomic.Bool
+	consecFailures       atomic.Int64
+	lastSuccessUnixNano  atomic.Int64
 }
 
 // LogWriterOptions configures a LogWriter. Path must be non-empty
@@ -74,6 +87,11 @@ func NewLogWriter(ctx context.Context, opts LogWriterOptions) (*LogWriter, error
 		done:  make(chan struct{}),
 	}
 	lw.lastErr.Store("")
+	// Newly-constructed writer starts in the "healthy, no attempts
+	// yet" shape — a startup-time /healthz probe that lands before
+	// any decisions should not flag the channel as degraded just
+	// because the success counter is still zero.
+	lw.writesOK.Store(true)
 	lw.wg.Add(1)
 	go lw.run(ctx, f)
 	return lw, nil
@@ -98,6 +116,14 @@ func (lw *LogWriter) Write(_ context.Context, ev Event) error {
 		return nil
 	default:
 		lw.dropped.Add(1)
+		// Queue-full drop counts as a failed write for the visibility
+		// surface — the operator wanted this event written + the writer
+		// could not. Recorded under the same consec-failures counter
+		// the worker uses on disk I/O errors so a single threshold
+		// captures both failure shapes.
+		lw.writesOK.Store(false)
+		lw.consecFailures.Add(1)
+		lw.lastErr.Store(fmt.Sprintf("audit log queue full (depth=%d); event dropped", cap(lw.queue)))
 		return fmt.Errorf("audit log queue full (depth=%d); event dropped", cap(lw.queue))
 	}
 }
@@ -145,16 +171,27 @@ func (lw *LogWriter) drainRemaining(f *os.File, enc *json.Encoder) {
 func (lw *LogWriter) writeOne(f *os.File, enc *json.Encoder, ev Event) {
 	if err := enc.Encode(ev); err != nil {
 		lw.lastErr.Store(fmt.Sprintf("encode event id=%d: %v", ev.DecisionID, err))
+		lw.writesOK.Store(false)
+		lw.consecFailures.Add(1)
 		return
 	}
 	if lw.fsync {
 		if err := f.Sync(); err != nil {
 			lw.lastErr.Store(fmt.Sprintf("fsync: %v", err))
+			lw.writesOK.Store(false)
+			lw.consecFailures.Add(1)
 			return
 		}
 	}
 	lw.total.Add(1)
 	lw.lastErr.Store("")
+	// Reset the failure run on success + record the wall-clock so
+	// the watchdog can flag "no write has landed in the last 5
+	// minutes" even when no explicit error is recorded (the worker
+	// may be wedged on a downstream operation that never errors).
+	lw.writesOK.Store(true)
+	lw.consecFailures.Store(0)
+	lw.lastSuccessUnixNano.Store(time.Now().UTC().UnixNano())
 }
 
 // Close stops the worker goroutine + closes the underlying file.
@@ -208,4 +245,47 @@ func (lw *LogWriter) LastError() string {
 		return v
 	}
 	return ""
+}
+
+// WritesOK reports whether the most-recent write attempt succeeded.
+// True on a fresh writer with no attempts yet (so a startup-time
+// health probe does not flag a brand-new export channel as degraded).
+// Flips to false on any failed write (queue-full, encode-error,
+// fsync-error) and stays false until the next successful write.
+//
+// Per [[audit-export-failure-visibility]]: read by /healthz, the MCP
+// status tool, the `kbounce audit-export health` CLI subcommand, and
+// the audit_export_degraded alert-rule predicate.
+func (lw *LogWriter) WritesOK() bool {
+	if lw == nil {
+		return true
+	}
+	return lw.writesOK.Load()
+}
+
+// ConsecutiveFailures returns the count of consecutive failed writes
+// since the last successful write. 0 on a fresh writer + reset to 0
+// on each success. The /healthz 503 trigger fires at > 3 (per the
+// memo's threshold table).
+func (lw *LogWriter) ConsecutiveFailures() int64 {
+	if lw == nil {
+		return 0
+	}
+	return lw.consecFailures.Load()
+}
+
+// LastSuccess returns the wall-clock of the most-recent successful
+// write. Zero time when no successful write has happened yet
+// (newly-constructed writer pre-first-write). Read by the watchdog
+// to flag "no write has landed in the last 5 minutes" stalls even
+// when no explicit error is recorded.
+func (lw *LogWriter) LastSuccess() time.Time {
+	if lw == nil {
+		return time.Time{}
+	}
+	v := lw.lastSuccessUnixNano.Load()
+	if v == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, v).UTC()
 }

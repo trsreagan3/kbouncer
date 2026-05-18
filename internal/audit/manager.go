@@ -3,7 +3,28 @@ package audit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
+	"time"
+)
+
+// Audit-export degraded-state thresholds per [[audit-export-failure-
+// visibility]]. /healthz returns 503 + the audit_export_degraded rule
+// fires when ANY of these conditions hold on a CONFIGURED channel:
+//
+//	1. WritesOK is false (most-recent attempt failed)
+//	2. ConsecutiveFailures > AuditExportConsecutiveFailureThreshold
+//	3. time since LastSuccess > AuditExportStaleSuccessThreshold
+//	   (only when at least one successful write has happened —
+//	   a pre-first-write probe is not degraded)
+//
+// The thresholds are deliberately conservative so transient hiccups
+// (collector restart, disk fsync stall) do not light up /healthz —
+// 3+ consecutive failures or 5+ minutes of silence is the failure
+// signal, not 1 failure or 30s of silence.
+const (
+	AuditExportConsecutiveFailureThreshold = 3
+	AuditExportStaleSuccessThreshold       = 5 * time.Minute
 )
 
 // Emitter is the interface the proxy hot-path uses to publish a
@@ -36,6 +57,46 @@ type Status struct {
 	WebhookInFlight   int64  `json:"webhook_in_flight"`
 	WebhookLastError  string `json:"webhook_last_error,omitempty"`
 	TotalEvents       int64  `json:"total_events"`
+
+	// Export-channel health surface per [[audit-export-failure-
+	// visibility]]. Each channel reports three things independent of
+	// any aggregate health verdict:
+	//
+	//	LogWritesOK / WebhookWritesOK
+	//	   true when the most-recent write attempt succeeded (or no
+	//	   attempt has been made yet); false the moment a write fails
+	//	   and stays false until the next success resets it.
+	//	LogConsecutiveFailures / WebhookConsecutiveFailures
+	//	   monotonically increasing counter while writes keep failing;
+	//	   reset to 0 on the next successful write. The /healthz +
+	//	   audit_export_degraded thresholds use this — a single failed
+	//	   write is noise (transient disk hiccup, collector restart);
+	//	   3+ consecutive failures is the failure signal.
+	//	LogLastSuccessUnixMilli / WebhookLastSuccessUnixMilli
+	//	   wall-clock of the most-recent successful write. 0 before the
+	//	   first successful write. /healthz flips to 503 when an
+	//	   enabled channel hasn't had a successful write in 5+ minutes
+	//	   even if no explicit failure is recorded (the worker may be
+	//	   wedged without surfacing an error).
+	//
+	// Zero / unset (channel not configured) → omitted from JSON by the
+	// channel-configured guard fields above.
+	LogWritesOK                bool  `json:"log_writes_ok"`
+	LogConsecutiveFailures     int64 `json:"log_consecutive_failures"`
+	LogLastSuccessUnixMilli    int64 `json:"log_last_success_unix_milli,omitempty"`
+	WebhookWritesOK            bool  `json:"webhook_writes_ok"`
+	WebhookConsecutiveFailures int64 `json:"webhook_consecutive_failures"`
+	WebhookLastSuccessUnixMilli int64 `json:"webhook_last_success_unix_milli,omitempty"`
+
+	// AuditExportHealthy is the AGGREGATE health verdict surfaced to
+	// /healthz + the `kbounce audit-export health` CLI subcommand.
+	// True when every configured export channel (log + webhook +
+	// heartbeat) is in a healthy state per the per-channel thresholds.
+	// Independent of heartbeat 503: an unhealthy log or webhook flips
+	// this to false even when heartbeat is healthy, and vice versa
+	// (either-or per [[audit-export-failure-visibility]]).
+	AuditExportHealthy        bool   `json:"audit_export_healthy"`
+	AuditExportDegradedReason string `json:"audit_export_degraded_reason,omitempty"`
 
 	// Slice 2 alert-rule engine state. AlertsEnabled is true when a
 	// RuleEngine is wrapping this status's source emitter (the
@@ -123,8 +184,9 @@ func (m *Manager) Emit(ctx context.Context, ev Event) {
 
 // Status snapshots the runtime counters.
 func (m *Manager) Status() Status {
-	s := Status{HeartbeatHealthy: true}
+	s := Status{HeartbeatHealthy: true, LogWritesOK: true, WebhookWritesOK: true}
 	if m == nil {
+		s.AuditExportHealthy = true
 		return s
 	}
 	s.TotalEvents = m.total.Load()
@@ -134,6 +196,11 @@ func (m *Manager) Status() Status {
 		s.LogTotal = m.log.Total()
 		s.LogDropped = m.log.Dropped()
 		s.LogLastError = m.log.LastError()
+		s.LogWritesOK = m.log.WritesOK()
+		s.LogConsecutiveFailures = m.log.ConsecutiveFailures()
+		if last := m.log.LastSuccess(); !last.IsZero() {
+			s.LogLastSuccessUnixMilli = last.UnixMilli()
+		}
 	}
 	if m.webhook != nil {
 		s.WebhookConfigured = true
@@ -142,6 +209,11 @@ func (m *Manager) Status() Status {
 		s.WebhookDropped = m.webhook.Dropped()
 		s.WebhookInFlight = m.webhook.InFlight()
 		s.WebhookLastError = m.webhook.LastError()
+		s.WebhookWritesOK = m.webhook.WritesOK()
+		s.WebhookConsecutiveFailures = m.webhook.ConsecutiveFailures()
+		if last := m.webhook.LastSuccess(); !last.IsZero() {
+			s.WebhookLastSuccessUnixMilli = last.UnixMilli()
+		}
 	}
 	if m.heartbeater != nil && m.heartbeater.interval > 0 {
 		s.HeartbeatEnabled = true
@@ -152,7 +224,80 @@ func (m *Manager) Status() Status {
 		}
 		s.HeartbeatHealthy = m.heartbeater.Healthy()
 	}
+	s.AuditExportHealthy, s.AuditExportDegradedReason = computeAuditExportHealth(s, time.Now().UTC())
 	return s
+}
+
+// computeAuditExportHealth evaluates the export channels' health per
+// [[audit-export-failure-visibility]]'s degradation table. Returns
+// the aggregate verdict + a human-readable reason (empty when
+// healthy). Pure function over the Status snapshot so the same
+// predicate can be re-evaluated by /healthz, the CLI subcommand, the
+// MCP status tool, and the audit_export_degraded alert watchdog
+// without state divergence.
+//
+// Channels NOT configured are skipped — an operator who runs without
+// a webhook should not see "webhook degraded" in /healthz output.
+// The heartbeat field is OR'd into the verdict because the spec
+// makes the two surfaces independent (either-or 503 per the memo).
+func computeAuditExportHealth(s Status, now time.Time) (bool, string) {
+	var reasons []string
+	if s.LogConfigured {
+		if !s.LogWritesOK {
+			reasons = append(reasons, "log writes_ok=false")
+		}
+		if s.LogConsecutiveFailures > AuditExportConsecutiveFailureThreshold {
+			reasons = append(reasons, fmt.Sprintf(
+				"log consecutive_failures=%d (threshold=%d)",
+				s.LogConsecutiveFailures, AuditExportConsecutiveFailureThreshold))
+		}
+		if s.LogLastSuccessUnixMilli > 0 {
+			age := now.Sub(time.UnixMilli(s.LogLastSuccessUnixMilli).UTC())
+			if age > AuditExportStaleSuccessThreshold {
+				reasons = append(reasons, fmt.Sprintf(
+					"log last_success age=%s (threshold=%s)",
+					age.Round(time.Second), AuditExportStaleSuccessThreshold))
+			}
+		}
+	}
+	if s.WebhookConfigured {
+		if !s.WebhookWritesOK {
+			reasons = append(reasons, "webhook writes_ok=false")
+		}
+		if s.WebhookConsecutiveFailures > AuditExportConsecutiveFailureThreshold {
+			reasons = append(reasons, fmt.Sprintf(
+				"webhook consecutive_failures=%d (threshold=%d)",
+				s.WebhookConsecutiveFailures, AuditExportConsecutiveFailureThreshold))
+		}
+		if s.WebhookLastSuccessUnixMilli > 0 {
+			age := now.Sub(time.UnixMilli(s.WebhookLastSuccessUnixMilli).UTC())
+			if age > AuditExportStaleSuccessThreshold {
+				reasons = append(reasons, fmt.Sprintf(
+					"webhook last_success age=%s (threshold=%s)",
+					age.Round(time.Second), AuditExportStaleSuccessThreshold))
+			}
+		}
+	}
+	// Heartbeat is OR'd in per the memo's "independent 503 surfaces"
+	// constraint — an unhealthy heartbeat is its own degradation
+	// even when the export channels themselves are clean (the
+	// audit-export channel itself may be the failure source, which
+	// the heartbeat watchdog catches independently).
+	if !s.HeartbeatHealthy {
+		reasons = append(reasons, "heartbeat watchdog unhealthy")
+	}
+	if len(reasons) == 0 {
+		return true, ""
+	}
+	// Stable join so the audit_export_degraded alert + /healthz
+	// surface the same string verbatim — eases SIEM-side rule
+	// authoring (regex on reason for an exact substring works
+	// across both surfaces).
+	out := reasons[0]
+	for _, r := range reasons[1:] {
+		out += "; " + r
+	}
+	return false, out
 }
 
 // BindHeartbeater wires the given Heartbeater into the Manager so

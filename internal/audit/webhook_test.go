@@ -326,7 +326,17 @@ func TestWebhookConstants(t *testing.T) {
 func TestManager_NilSafe(t *testing.T) {
 	var m *Manager
 	m.Emit(context.Background(), FromDecision(DecisionInput{}))
-	assert.Equal(t, Status{HeartbeatHealthy: true}, m.Status())
+	// Per Slice 8 ([[audit-export-failure-visibility]]) the bare-
+	// Manager Status() also reports the audit-export health surface
+	// in its healthy default (no channels configured = nothing to
+	// fail). Pins the wire shape every status reader (MCP, /healthz,
+	// `kbounce audit-export health`) consumes.
+	assert.Equal(t, Status{
+		HeartbeatHealthy:    true,
+		LogWritesOK:         true,
+		WebhookWritesOK:     true,
+		AuditExportHealthy:  true,
+	}, m.Status())
 	m.Close()
 }
 

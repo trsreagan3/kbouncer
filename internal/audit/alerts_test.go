@@ -394,7 +394,7 @@ func TestBuildBuiltinRules_AppliesOverrides(t *testing.T) {
 		},
 	}
 	rules := BuildBuiltinRules(cfg)
-	require.Len(t, rules, 5)
+	require.Len(t, rules, 6)
 
 	// admin_fallback_burst now requires 11+ events to fire.
 	afb := rules[0].(*adminFallbackBurstRule)
@@ -409,7 +409,7 @@ func TestBuildBuiltinRules_AppliesOverrides(t *testing.T) {
 
 func TestBuildBuiltinRules_NilConfigUsesDefaults(t *testing.T) {
 	rules := BuildBuiltinRules(nil)
-	require.Len(t, rules, 5)
+	require.Len(t, rules, 6)
 	afb := rules[0].(*adminFallbackBurstRule)
 	assert.Equal(t, DefaultAdminFallbackBurstThreshold, afb.threshold)
 	assert.Equal(t, DefaultAdminFallbackBurstWindow, afb.window)
@@ -521,6 +521,7 @@ func TestRuleEngine_RuleNamesExposed(t *testing.T) {
 		"non_org_profile_install",
 		"unusual_high_risk_action",
 		"heartbeat_gap",
+		"audit_export_degraded",
 	}, names)
 }
 
