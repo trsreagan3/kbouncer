@@ -88,6 +88,11 @@ type Status struct {
 	WebhookConsecutiveFailures int64 `json:"webhook_consecutive_failures"`
 	WebhookLastSuccessUnixMilli int64 `json:"webhook_last_success_unix_milli,omitempty"`
 
+	// #258 — Security Lake parquet writer state. Nested status is the
+	// same shape SecurityLakeWriter.Status() returns; embedding it
+	// here keeps the MCP audit-export status surface unified.
+	SecurityLake SecurityLakeStatus `json:"security_lake"`
+
 	// AuditExportHealthy is the AGGREGATE health verdict surfaced to
 	// /healthz + the `kbounce audit-export health` CLI subcommand.
 	// True when every configured export channel (log + webhook +
@@ -126,17 +131,23 @@ type Status struct {
 }
 
 // Manager fans events out to the JSONL log writer + the HTTPS
-// webhook pusher (each optional; either or both may be nil).
+// webhook pusher + the Security Lake parquet writer (each optional;
+// any or all may be nil).
 //
-// Per the security-team-audit-export spec, both channels are
+// Per the security-team-audit-export spec, every channel is
 // independent: a webhook outage doesn't stop the log file from
 // catching up via shipper, and a disk-full audit log doesn't stop
 // the webhook from continuing to deliver. The Manager doesn't try
-// to maintain ordering between the two channels — each consumer
+// to maintain ordering between the channels — each consumer
 // uses the monotonic DecisionID for ordering.
 type Manager struct {
 	log     *LogWriter
 	webhook *WebhookPusher
+	// #258 — optional Security Lake parquet writer. Nil disables this
+	// channel. When wired, every event is also flushed (per-class) to
+	// the operator's S3 bucket in the Security-Lake-compatible
+	// partition layout.
+	securityLake *SecurityLakeWriter
 	// #285 — optional per-session NDJSON recorder. Nil disables this
 	// channel. When wired, every event is teed to
 	// {dir}/{session_id}.ndjson so the cross-product replay CLI can
@@ -153,12 +164,13 @@ type Manager struct {
 	heartbeater *Heartbeater
 }
 
-// ManagerOptions configures a Manager. Pass a nil LogWriter, nil
-// WebhookPusher, or nil SessionRecorder to disable that channel.
+// ManagerOptions configures a Manager. Pass nil for any channel to
+// disable it.
 type ManagerOptions struct {
-	LogWriter       *LogWriter
-	WebhookPusher   *WebhookPusher
-	SessionRecorder *SessionRecorder
+	LogWriter          *LogWriter
+	WebhookPusher      *WebhookPusher
+	SecurityLakeWriter *SecurityLakeWriter
+	SessionRecorder    *SessionRecorder
 }
 
 // NewManager constructs a Manager with the given (possibly nil)
@@ -167,9 +179,10 @@ type ManagerOptions struct {
 // confirm the proxy was actually called.
 func NewManager(opts ManagerOptions) *Manager {
 	return &Manager{
-		log:      opts.LogWriter,
-		webhook:  opts.WebhookPusher,
-		recorder: opts.SessionRecorder,
+		log:          opts.LogWriter,
+		webhook:      opts.WebhookPusher,
+		securityLake: opts.SecurityLakeWriter,
+		recorder:     opts.SessionRecorder,
 	}
 }
 
@@ -187,6 +200,12 @@ func (m *Manager) Emit(ctx context.Context, ev Event) {
 	}
 	if m.webhook != nil {
 		_ = m.webhook.Push(ctx, ev)
+	}
+	// #258 — Security Lake parquet writer. Synchronous in-memory
+	// append; the background rotator handles flushes. Fail-soft so
+	// an unreachable bucket never blocks the hot path.
+	if m.securityLake != nil {
+		m.securityLake.Write(ctx, ev)
 	}
 	// #285 — per-session NDJSON tee. Fail-soft inside Record.
 	if m.recorder != nil {
@@ -236,6 +255,9 @@ func (m *Manager) Status() Status {
 		if last := m.webhook.LastSuccess(); !last.IsZero() {
 			s.WebhookLastSuccessUnixMilli = last.UnixMilli()
 		}
+	}
+	if m.securityLake != nil {
+		s.SecurityLake = m.securityLake.Status()
 	}
 	if m.heartbeater != nil && m.heartbeater.interval > 0 {
 		s.HeartbeatEnabled = true
@@ -344,6 +366,12 @@ func (m *Manager) Close() {
 	}
 	if m.webhook != nil {
 		m.webhook.Close()
+	}
+	// #258 — Security Lake teardown flushes every pending parquet
+	// batch synchronously (per the spec) so a shutdown doesn't drop
+	// in-memory rows.
+	if m.securityLake != nil {
+		m.securityLake.Close()
 	}
 	// #285 — recorder shutdown atomic-renames every still-open
 	// session's .partial -> .ndjson. SIGKILL-leftover .partials are

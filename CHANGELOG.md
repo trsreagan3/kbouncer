@@ -5,6 +5,32 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### AWS Security Lake audit-export adapter (2026-05-19, #258)
+
+- **`kbounce run --security-lake-bucket BUCKET --security-lake-region REGION
+  [--security-lake-role-arn ARN] [--security-lake-rotation-seconds N]`** —
+  writes OCSF v1.1.0 class 6003 events as parquet files into a
+  Security-Lake-compatible S3 bucket layout
+  (`region=<r>/eventday=<YYYYMMDD>/eventhour=<HH>/api_activity-
+  <unix-ms>.parquet`). Per-class in-memory batching with rotation
+  on the configured interval (default 300s) OR a 10 MiB size cap,
+  whichever fires first; `Close()` flushes pending batches
+  synchronously. Credentials via STS AssumeRole when
+  `--security-lake-role-arn` is set, otherwise the default
+  aws-sdk-go-v2 credential chain; refuses to start with a clear
+  error if no credentials are reachable.
+- Cross-product parity per `[[cross-product-agent-parity]]`:
+  ibounce + dbounce ship the same adapter with byte-identical
+  column set + partition layout. `SecurityLakeColumnNames` in the
+  audit package locks the schema; the cross-product test fixture
+  asserts it.
+- Per `[[no-hosted-saas]]` + `[[self-host-zero-billing-dependency]]`
+  the bucket lives in the operator's AWS account; iam-jit-the-
+  company never receives the data.
+- Per `[[creates-never-mutates]]` every S3 operation is `PutObject`
+  only; rotation timestamps guarantee unique keys per flush.
+- Documented in `docs/SECURITY-LAKE-INTEGRATION.md`.
+
 ### Per-session recording (2026-05-19, #285)
 
 - **`kbounce run --record-sessions-dir PATH`** — tees every audit

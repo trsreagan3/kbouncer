@@ -35,6 +35,7 @@ func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
 		"",
 		0,
 		"",
+		"", "", "", 0,
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrLicenseRequired,
@@ -56,6 +57,7 @@ func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 		"",
 		0,
 		"",
+		"", "", "", 0,
 	)
 	require.NoError(t, err, "JSONL log alone should not require an Enterprise license")
 	require.NotNil(t, mgr)
@@ -78,6 +80,7 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 		"",
 		0,
 		"",
+		"", "", "", 0,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, mgr, "no flags → no Manager constructed")
@@ -98,6 +101,7 @@ func TestAuditAlerts_LicensePlaceholderRejects(t *testing.T) {
 		dir+"/rules.yaml",
 		0,
 		"",
+		"", "", "", 0,
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrAlertRulesLicenseRequired,
@@ -125,6 +129,7 @@ func TestAuditHeartbeat_OnEnabledWiresHealthCheckAndEmits(t *testing.T) {
 		"",
 		audit.MinHeartbeatInterval,
 		"",
+		"", "", "", 0,
 	)
 	require.NoError(t, err)
 	defer closer()
@@ -154,6 +159,7 @@ func TestAuditHeartbeat_TooSmallIntervalRejected(t *testing.T) {
 		"",
 		100*time.Millisecond,
 		"",
+		"", "", "", 0,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "heartbeat-interval",

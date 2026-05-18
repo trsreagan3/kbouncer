@@ -229,6 +229,14 @@ func newRunCmd() *cobra.Command {
 		// #285 — per-session NDJSON recordings directory. Empty disables
 		// the channel. Replayable via `iam-jit session replay <FILE>`.
 		recordSessionsDir string
+		// #258 — AWS Security Lake adapter. All four fields off by
+		// default. Per [[no-hosted-saas]] + [[self-host-zero-billing-
+		// dependency]] the bucket lives in the operator's AWS account;
+		// iam-jit-the-company never receives the data.
+		securityLakeBucket          string
+		securityLakeRegion          string
+		securityLakeRoleARN         string
+		securityLakeRotationSeconds int
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -478,6 +486,8 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				auditAlertRulesPath,
 				auditHeartbeatInterval,
 				recordSessionsDir,
+				securityLakeBucket, securityLakeRegion, securityLakeRoleARN,
+				securityLakeRotationSeconds,
 			)
 			if auditErr != nil {
 				return auditErr
@@ -576,6 +586,25 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 						"audit heartbeat: enabled (interval=%ds; /healthz returns 503 "+
 							"+ stderr fires on heartbeat_gap)\n",
 						status.HeartbeatIntervalSeconds)
+				}
+				if status.SecurityLake.Configured {
+					// #258 — Security Lake banner. AWS account + caller
+					// ARN come from sts:GetCallerIdentity at the writer's
+					// Start(); printing here matches the "log AWS account
+					// + role at startup banner" requirement.
+					roleLabel := status.SecurityLake.RoleARN
+					if roleLabel == "" {
+						roleLabel = "(default-chain)"
+					}
+					fmt.Fprintf(os.Stderr,
+						"audit security-lake: s3://%s/ (region=%s, account=%s, "+
+							"caller=%s, role=%s, rotation=%ds)\n",
+						status.SecurityLake.Bucket,
+						status.SecurityLake.Region,
+						status.SecurityLake.AccountID,
+						status.SecurityLake.CallerARN,
+						roleLabel,
+						status.SecurityLake.RotationSeconds)
 				}
 			}
 			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
@@ -867,6 +896,33 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"(one file per agent session). Replayable via `iam-jit session "+
 			"replay <FILE>`. File mode 0o600. Default off; the recorder "+
 			"captures agent identity + operation details so it ships opt-in.")
+	// #258 — AWS Security Lake audit-export adapter. Per [[no-hosted-
+	// saas]] + [[self-host-zero-billing-dependency]] the bucket lives
+	// in the operator's AWS account; iam-jit-the-company never
+	// receives the data.
+	cmd.Flags().StringVar(&securityLakeBucket, "security-lake-bucket", "",
+		"#258 — name of the operator-owned S3 bucket that AWS Security "+
+			"Lake auto-ingests from. When set, every OCSF event is also "+
+			"written as a parquet file at `s3://<bucket>/region=<r>/"+
+			"eventday=<YYYYMMDD>/eventhour=<HH>/api_activity-<unix-ms>."+
+			"parquet`. Requires --security-lake-region; honours "+
+			"--security-lake-role-arn if set otherwise uses the default "+
+			"AWS credential chain.")
+	cmd.Flags().StringVar(&securityLakeRegion, "security-lake-region", "",
+		"#258 — AWS region the Security Lake bucket lives in. Required "+
+			"when --security-lake-bucket is set. Becomes the `region=<r>` "+
+			"partition key on every parquet file.")
+	cmd.Flags().StringVar(&securityLakeRoleARN, "security-lake-role-arn", "",
+		"#258 — optional IAM role to assume for Security Lake writes "+
+			"(STS AssumeRole). When unset the default AWS credential chain "+
+			"is used. Recommended for cross-account deployments where the "+
+			"bucket lives in a dedicated security account.")
+	cmd.Flags().IntVar(&securityLakeRotationSeconds,
+		"security-lake-rotation-seconds", audit.SecurityLakeDefaultRotationSeconds,
+		"#258 — how often the in-memory parquet batch flushes to S3. "+
+			"Default 300 (5 minutes) matches the Security Lake custom-"+
+			"source ingest cadence. A 10 MiB size cap also forces a flush, "+
+			"whichever fires first.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more
@@ -913,10 +969,30 @@ func buildAuditManager(
 	alertRulesPath string,
 	heartbeatInterval time.Duration,
 	recordSessionsDir string,
+	securityLakeBucket, securityLakeRegion, securityLakeRoleARN string,
+	securityLakeRotationSeconds int,
 ) (audit.Emitter, func() bool, func(), error) {
 	noop := func() {}
+	// #258 — Security Lake parse-time validation. Bucket without region
+	// (or vice versa) is a misconfiguration; fail-fast so the operator
+	// fixes it once rather than seeing a credential probe failure deep
+	// in startup. Validated BEFORE the early-return so passing only
+	// --security-lake-region (which would otherwise no-op) surfaces
+	// the missing-bucket error.
+	if securityLakeBucket != "" && securityLakeRegion == "" {
+		return nil, nil, noop, fmt.Errorf(
+			"kbounce: --security-lake-bucket requires --security-lake-region " +
+				"(the region becomes the `region=<r>` partition key on every " +
+				"parquet file)")
+	}
+	if securityLakeRegion != "" && securityLakeBucket == "" {
+		return nil, nil, noop, fmt.Errorf(
+			"kbounce: --security-lake-region requires --security-lake-bucket " +
+				"(passing region without a target bucket has no effect)")
+	}
 	if logPath == "" && webhookURL == "" && alertRulesPath == "" &&
-		heartbeatInterval == 0 && recordSessionsDir == "" {
+		heartbeatInterval == 0 && recordSessionsDir == "" &&
+		securityLakeBucket == "" {
 		return nil, nil, noop, nil
 	}
 	// Validate the preset name up front so a typo surfaces before
@@ -980,10 +1056,35 @@ func buildAuditManager(
 		}
 		sessRecorder = sr
 	}
+	// #258 — Security Lake parquet writer. Default OFF; only
+	// constructed when --security-lake-bucket is set. Start() probes
+	// credentials (default chain or AssumeRole when --security-lake-
+	// role-arn is set) and refuses to start with a clear error if
+	// none are reachable. Per [[no-hosted-saas]] + [[self-host-zero-
+	// billing-dependency]] the bucket lives in the operator's AWS
+	// account; iam-jit-the-company never receives the data.
+	var securityLakeWriter *audit.SecurityLakeWriter
+	if securityLakeBucket != "" {
+		slw, err := audit.NewSecurityLakeWriter(audit.SecurityLakeWriterOptions{
+			Bucket:          securityLakeBucket,
+			Region:          securityLakeRegion,
+			RoleARN:         securityLakeRoleARN,
+			RotationSeconds: securityLakeRotationSeconds,
+		})
+		if err != nil {
+			return nil, nil, noop, err
+		}
+		if err := slw.Start(ctx); err != nil {
+			return nil, nil, noop, fmt.Errorf(
+				"kbounce: Security Lake writer failed to start: %w", err)
+		}
+		securityLakeWriter = slw
+	}
 	mgr := audit.NewManager(audit.ManagerOptions{
-		LogWriter:       logWriter,
-		WebhookPusher:   webhookPusher,
-		SessionRecorder: sessRecorder,
+		LogWriter:          logWriter,
+		WebhookPusher:      webhookPusher,
+		SecurityLakeWriter: securityLakeWriter,
+		SessionRecorder:    sessRecorder,
 	})
 	// Heartbeat wiring. When the rule engine is enabled (which the
 	// license gate currently blocks pre-#235), we'd bind the
