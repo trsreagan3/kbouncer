@@ -5,6 +5,42 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Investigate-with-Claude workflow (2026-05-18, #273)
+
+`kbounce investigate` composes the existing `audit tail --export
+ocsf-bundle` (#268) and `diagnostics bundle` (#277) into a single
+"land a Claude-ready evidence pack" subcommand. Operator drops the
+two artifacts into THEIR local Claude client (Claude Code, Cursor's
+Claude integration, desktop Claude, the Anthropic console —
+whichever they use) and asks an investigative prompt; kbounce never
+calls Anthropic. Per `[[self-host-zero-billing-dependency]]` the
+only network call is the same local /healthz GET `diagnostics
+bundle` makes. Per `[[creates-never-mutates]]` it's read-only.
+
+Cross-product alignment per `[[cross-product-agent-parity]]` —
+ibounce / dbounce / gbounce ship the same subcommand shape with
+the same `--out-dir` / `--time-range` / `--filter` / `--print-
+prompts` flag set.
+
+- Writes `kbounce-investigation.ndjson` (OCSF v1.1.0 class 2004
+  Detection Finding wrapping filtered audit events) +
+  `kbounce-investigation-context.zip` (the standard diagnostics
+  bundle with `--no-audit` — the evidence file already carries the
+  audit content).
+- `--print-prompts` lists the 10 starter investigative prompts as a
+  paste-able block without writing artifact files.
+- `--time-range 24h|7d|4w` filters the evidence to a recent window;
+  translates to a `time>=cutoff` filter on the OCSF wire shape.
+- Per `[[don't-tailor-to-lighthouse]]` the prompts are generic — no
+  specific Claude surface is named.
+- Per `[[security-team-positioning-safety-not-surveillance]]` the
+  prompts stay in the "denial / scope mismatch / policy mismatch"
+  vocabulary; nothing reads as accusation.
+
+Docs: `docs/INVESTIGATE-WITH-CLAUDE.md` — workflow walkthrough,
+the 10 starter prompts, privacy story, and cross-bouncer parity
+notes.
+
 ### Local-operator `audit tail` UX — follow / filter / summary / export (2026-05-18, #268)
 
 Closes `[[cross-product-agent-parity]]`-#268. `kbounce audit tail`
