@@ -27,6 +27,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/mcp"
 	"github.com/trsreagan3/kbouncer/internal/mcpinstall"
 	"github.com/trsreagan3/kbouncer/internal/profile"
@@ -175,6 +176,15 @@ func newRunCmd() *cobra.Command {
 		tlsCertPath        string
 		tlsKeyPath         string
 		requireClientCert  string
+		// Slice 1 of #252 — security-team audit-export. Two channels
+		// (operator picks one or both); webhook flags are license-
+		// gated for Enterprise per [[security-team-audit-export]].
+		auditLogPath         string
+		auditLogFsync        bool
+		auditWebhookURL      string
+		auditWebhookToken    string
+		auditWebhookBatch    int
+		allowInternalWebhook bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -328,6 +338,23 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 						"(mTLS without TLS is meaningless); run `kbounce init-tls` first")
 			}
 
+			// Slice 1 of #252 — wire the audit-export channels.
+			// Both channels are opt-in; the SQLite audit row written
+			// via writeDecisionForTask is the canonical source of
+			// truth regardless. Webhook flags require an Enterprise
+			// license (placeholder error until #235 license-file
+			// plumbing lands).
+			auditMgr, auditCloser, auditErr := buildAuditManager(
+				cmd.Context(),
+				auditLogPath, auditLogFsync,
+				auditWebhookURL, auditWebhookToken, auditWebhookBatch,
+				allowInternalWebhook,
+			)
+			if auditErr != nil {
+				return auditErr
+			}
+			defer auditCloser()
+
 			cfg := proxy.Config{
 				Host:                    host,
 				Port:                    port,
@@ -343,6 +370,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				TLSCertPath:             tlsCertPath,
 				TLSKeyPath:              tlsKeyPath,
 				RequireClientCertCAPath: requireClientCert,
+				AuditEmitter:            auditMgr,
 			}.Normalize()
 
 			// Cooperative mode + --sync-prompt-on-deny: per spec the
@@ -378,6 +406,21 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				}
 			}
 			fmt.Fprintf(os.Stderr, "audit db: %s\n", st.Path())
+			if auditMgr != nil {
+				status := auditMgr.Status()
+				if status.LogConfigured {
+					fmt.Fprintf(os.Stderr,
+						"audit log: %s (fsync=%t)\n", status.LogPath, auditLogFsync)
+				}
+				if status.WebhookConfigured {
+					// MaskedURL strips userinfo + query; token is
+					// NEVER printed (kept only in the WebhookPusher's
+					// outgoing Authorization header).
+					fmt.Fprintf(os.Stderr,
+						"audit webhook: %s (token=***, batch=%d)\n",
+						status.WebhookMaskedURL, auditWebhookBatch)
+				}
+			}
 			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
 			if up != nil {
 				insecureNote := ""
@@ -552,7 +595,92 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"Locks the proxy down to 'only my kubectl context can "+
 			"connect'. Requires --tls-cert + --tls-key. Operator-supplied "+
 			"CA — kbounce does NOT issue client certs.")
+
+	// Slice 1 of #252 — security-team audit-export channels.
+	// See [[security-team-audit-export]] memo for the design.
+	cmd.Flags().StringVar(&auditLogPath, "audit-log-path", "",
+		"Append-only JSONL audit log path. One JSON event per decision "+
+			"(verb, resource, verdict, profile, mode, etc.). Free across "+
+			"all tiers. Unset → no JSONL export (the SQLite audit row in "+
+			"--db is still written; the JSONL is a shipping convenience). "+
+			"NO ROTATION built in — point logrotate / Fluent Bit / Vector "+
+			"at the file. Append-only (O_APPEND|O_CREATE|O_WRONLY, mode 0600).")
+	cmd.Flags().BoolVar(&auditLogFsync, "audit-log-fsync", false,
+		"Call fsync(2) after every JSONL line. Default off for throughput "+
+			"(buffered writes are durable to a crash but not a power loss). "+
+			"Opt in for compliance-grade durability at the cost of ~10x "+
+			"per-line write latency.")
+	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
+		"HTTPS URL of an operator-owned audit-event collector. Each decision "+
+			"event POSTed as JSON. ENTERPRISE-tier feature (license-gated; "+
+			"see #235 for license-file plumbing status). Bounded queue + "+
+			"exponential backoff retry + drop-on-overflow with synthetic "+
+			"AUDIT_DROPPED marker so consumers see the gap. SSRF-gated: "+
+			"refuses RFC1918 / loopback / .internal / .local without "+
+			"--allow-internal-webhook.")
+	cmd.Flags().StringVar(&auditWebhookToken, "audit-webhook-token", "",
+		"Bearer token sent on the Authorization header of every webhook "+
+			"POST. Required when --audit-webhook-url is set. NEVER logged, "+
+			"NEVER printed in banners or errors, NEVER serialized into "+
+			"event bodies.")
+	cmd.Flags().IntVar(&auditWebhookBatch, "audit-webhook-batch-size", 1,
+		"Events per webhook POST. Default 1 = one decision per request "+
+			"(simplest consumer shape). Increase for high-throughput orgs "+
+			"that have a batching collector.")
+	cmd.Flags().BoolVar(&allowInternalWebhook, "allow-internal-webhook", false,
+		"Opt-out of the SSRF gate on --audit-webhook-url. Required when "+
+			"the collector is on an intranet (RFC1918 / .internal / etc.). "+
+			"Default refuses; the gate mirrors dbounce's MED-D8-06 closure.")
 	return cmd
+}
+
+// buildAuditManager wires the --audit-log-path / --audit-webhook-*
+// flags into an audit.Manager + a closer the caller defers. Returns
+// (nil, no-op, nil) when neither channel is configured.
+//
+// License gate: webhook flags require an Enterprise license file.
+// kbounce does not yet have license-file plumbing (tracked in #235);
+// until that lands, the webhook flags surface
+// audit.ErrLicenseRequired so an operator who tries to use the
+// Enterprise feature without the license-file infrastructure gets
+// a clear error rather than a silent bypass.
+func buildAuditManager(
+	ctx context.Context,
+	logPath string, logFsync bool,
+	webhookURL, webhookToken string, webhookBatch int,
+	allowInternal bool,
+) (*audit.Manager, func(), error) {
+	noop := func() {}
+	if logPath == "" && webhookURL == "" {
+		return nil, noop, nil
+	}
+	var logWriter *audit.LogWriter
+	var webhookPusher *audit.WebhookPusher
+	if logPath != "" {
+		lw, err := audit.NewLogWriter(ctx, audit.LogWriterOptions{
+			Path:  logPath,
+			Fsync: logFsync,
+		})
+		if err != nil {
+			return nil, noop, err
+		}
+		logWriter = lw
+	}
+	if webhookURL != "" {
+		// Enterprise license gate — placeholder until #235 lands.
+		// Once license-file plumbing exists, replace this with the
+		// real verifier; the audit package doesn't change.
+		return nil, noop, audit.ErrLicenseRequired
+	}
+	_ = webhookToken // referenced when license-file plumbing lands
+	_ = webhookBatch
+	_ = allowInternal
+	mgr := audit.NewManager(audit.ManagerOptions{
+		LogWriter:     logWriter,
+		WebhookPusher: webhookPusher,
+	})
+	closer := func() { mgr.Close() }
+	return mgr, closer, nil
 }
 
 // newInitTLSCmd implements `kbounce init-tls`. One-time setup that

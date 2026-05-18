@@ -42,6 +42,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/parser"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/rules"
@@ -218,6 +219,15 @@ type Config struct {
 	// Ignored when TLSCertPath / TLSKeyPath are unset (mTLS without
 	// TLS is meaningless).
 	RequireClientCertCAPath string
+
+	// AuditEmitter, when non-nil, receives every decision event the
+	// proxy makes — fanned out to a JSONL log file + an optional
+	// HTTPS webhook by the audit Manager. Slice 1 of the security-
+	// team audit-export feature (see [[security-team-audit-export]]).
+	// nil disables both channels; the SQLite audit row written via
+	// writeDecisionForTask is still the canonical source of truth
+	// regardless.
+	AuditEmitter audit.Emitter
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -406,6 +416,19 @@ type EvalOptions struct {
 	// without re-parsing the request URL. One of: "watch", "spdy", ""
 	// (not a stream). Pure-evaluator callers (tests) leave it empty.
 	StreamKind string
+
+	// AuditEmitter, when non-nil, receives a copy of every decision
+	// as a structured Event for fan-out to the JSONL log file +
+	// HTTPS webhook (security-team audit-export, Slice 1). nil
+	// disables the export channels; the SQLite audit row is still
+	// written either way.
+	AuditEmitter audit.Emitter
+
+	// AuditHost / AuditUpstream populate the schema's host + upstream
+	// fields. Set by the proxy server from Config.Host:Port + the
+	// resolved upstream URL. Pure-evaluator callers leave both empty.
+	AuditHost     string
+	AuditUpstream string
 }
 
 // EvaluateRequestWithProfile is the K-Slice 7 evaluator. It runs the
@@ -507,6 +530,7 @@ func EvaluateRequestFull(
 			StreamKind:      opts.StreamKind,
 		}
 		decisionID := writeDecision(st, obs, activePause)
+		emitAuditEvent(opts, obs, parsed, "")
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -555,6 +579,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceProfile
 			obs.Enforced = effectiveMode == ModeTransparent
 			decisionID := writeDecision(st, obs, activePause)
+			emitAuditEvent(opts, obs, parsed, "")
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -601,6 +626,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceTask
 			obs.Enforced = effectiveMode == ModeTransparent
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -634,6 +660,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = effectiveMode == ModeTransparent
 		decisionID := writeDecisionForTaskMaybe(st, obs, activePause, activeTask)
+		emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask))
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -650,6 +677,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceTask
 			obs.Enforced = false
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -668,6 +696,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceGlobal
 			obs.Enforced = false
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -678,6 +707,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceTask
 		obs.Enforced = effectiveMode == ModeTransparent
 		decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+		emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -690,6 +720,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = false
 		decisionID := writeDecision(st, obs, activePause)
+		emitAuditEvent(opts, obs, parsed, "")
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -707,8 +738,64 @@ func EvaluateRequestFull(
 	obs.Enforced = effectiveMode == ModeTransparent && verdict == VerdictDeny
 
 	decisionID := writeDecision(st, obs, activePause)
+	emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask))
 	maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 	return obs
+}
+
+// activeTaskID returns the active task id when t is non-nil, "" otherwise.
+// Centralizes the nil-check so the emit-event call sites stay readable.
+func activeTaskID(t *tasks.Scope) string {
+	if t == nil {
+		return ""
+	}
+	return t.TaskID
+}
+
+// emitAuditEvent fans the canonical DecisionInput off to the
+// audit.Emitter (security-team audit-export, Slice 1) when one is
+// configured. No-op when opts.AuditEmitter is nil — both export
+// channels are opt-in; the SQLite audit row is the canonical
+// source of truth regardless.
+//
+// Per [[security-team-audit-export]]: this is the SINGLE call site
+// in the proxy that publishes export events. The Emit method is
+// non-blocking by contract (bounded chans + drop-on-overflow on
+// each consumer), so the proxy hot-path never waits on disk or
+// network here.
+func emitAuditEvent(opts EvalOptions, obs *RequestObservation, parsed *parser.ParsedRequest, taskID string) {
+	if opts.AuditEmitter == nil {
+		return
+	}
+	in := audit.DecisionInput{
+		At:             obs.At,
+		DecisionID:     obs.DecisionID,
+		Mode:           obs.ModeAtDecision,
+		Profile:        obs.ProfileName,
+		Verdict:        obs.DecisionVerdict,
+		Reason:         obs.DecisionReason,
+		DecisionSource: obs.DecisionSource,
+		Enforced:       obs.Enforced,
+		Host:           opts.AuditHost,
+		Upstream:       opts.AuditUpstream,
+		Method:         obs.Method,
+		Path:           obs.Path,
+		StreamKind:     obs.StreamKind,
+		TaskID:         taskID,
+	}
+	if parsed != nil {
+		in.ParsedVerb = parsed.Verb
+		in.ParsedGroup = parsed.Group
+		in.ParsedVersion = parsed.Version
+		in.ParsedResource = parsed.Resource
+		in.ParsedNamespace = parsed.Namespace
+		in.ParsedName = parsed.Name
+		in.ParsedSubresource = parsed.Subresource
+		in.IsWatch = parsed.IsWatch
+		in.IsDryRun = parsed.IsDryRun
+	}
+	ev := audit.FromDecision(in)
+	opts.AuditEmitter.Emit(context.Background(), ev)
 }
 
 // maybeEnqueuePrompt writes a pending_prompts row when ALL of:
@@ -1062,6 +1149,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// so EvalOptions + the post-eval guard both see the same value.
 	syncPromptActive := s.cfg.SyncPromptOnDeny && s.cfg.Mode == ModeTransparent
 
+	upstreamLabel := ""
+	if s.cfg.Upstream != nil {
+		upstreamLabel = s.cfg.Upstream.Host()
+	}
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
 		s.cfg.ActiveProfile, s.cfg.Cluster,
@@ -1070,6 +1161,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			SyncPromptOnDeny: syncPromptActive,
 			TaskOwner:        s.cfg.TaskOwner,
 			StreamKind:       string(streamKind),
+			AuditEmitter:     s.cfg.AuditEmitter,
+			AuditHost:        net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
+			AuditUpstream:    upstreamLabel,
 		},
 	)
 

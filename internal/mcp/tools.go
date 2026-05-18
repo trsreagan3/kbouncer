@@ -305,6 +305,25 @@ func ToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name": "kbounce_audit_export_status",
+			"description": "Report the security-team audit-export " +
+				"channels' runtime state (Slice 1 of #252). Returns " +
+				"which of the two transports are configured (JSONL " +
+				"log file + HTTPS webhook), cumulative event totals, " +
+				"drop counts, in-flight webhook deliveries, and the " +
+				"last-error message for each. Read-only. The webhook " +
+				"URL is returned with userinfo + query stripped; the " +
+				"Bearer token is NEVER returned (and is masked out " +
+				"of any error messages). Use this to confirm the " +
+				"running proxy is shipping events to your aggregator " +
+				"+ to spot a stuck queue (webhook_in_flight rising). " +
+				"Per [[security-team-audit-export]] + [[no-hosted-saas]].",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			"name": "kbounce_pending_sync_prompts",
 			"description": "List the pending_prompts rows that the " +
 				"running proxy is CURRENTLY blocked on waiting for an " +

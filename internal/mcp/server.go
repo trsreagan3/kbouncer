@@ -54,6 +54,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/parser"
 	"github.com/trsreagan3/kbouncer/internal/presets"
 	"github.com/trsreagan3/kbouncer/internal/profile"
@@ -111,6 +112,12 @@ type Config struct {
 	// Actor is the string recorded in audit rows when MCP-initiated
 	// mutations land. Defaults to "kbounce-mcp" when empty.
 	Actor string
+
+	// AuditEmitter, when non-nil, lets the kbounce_audit_export_status
+	// MCP tool report runtime counters (events emitted, dropped,
+	// in-flight) for the security-team audit-export feature
+	// (Slice 1 of #252). nil → status tool reports "not configured."
+	AuditEmitter audit.Emitter
 }
 
 // Server is the MCP-over-stdio server. Construct one via NewServer,
@@ -249,8 +256,48 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolApplyPreset(args)
 	case "kbounce_list_presets":
 		return s.toolListPresets(args)
+	case "kbounce_audit_export_status":
+		return s.toolAuditExportStatus(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
+}
+
+// toolAuditExportStatus surfaces the runtime counters for the
+// security-team audit-export feature (Slice 1 of #252). Read-only.
+// Returns whether the JSONL log + HTTPS webhook channels are
+// configured, plus their cumulative event totals + drop counts +
+// last-error messages.
+//
+// Per [[security-team-audit-export]]: the webhook token NEVER
+// appears in this surface — the WebhookPusher's masking layer
+// strips the token from any error message + MaskedURL strips the
+// URL userinfo. Tests assert this by scanning the JSON output for
+// the raw token.
+func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error) {
+	if s.cfg.AuditEmitter == nil {
+		return map[string]any{
+			"log_configured":     false,
+			"webhook_configured": false,
+			"total_events":       int64(0),
+			"note": "audit export disabled (no --audit-log-path / " +
+				"--audit-webhook-url passed to `kbounce run`)",
+		}, nil
+	}
+	st := s.cfg.AuditEmitter.Status()
+	return map[string]any{
+		"log_configured":     st.LogConfigured,
+		"log_path":           st.LogPath,
+		"log_total":          st.LogTotal,
+		"log_dropped":        st.LogDropped,
+		"log_last_error":     st.LogLastError,
+		"webhook_configured": st.WebhookConfigured,
+		"webhook_url":        st.WebhookMaskedURL,
+		"webhook_total":      st.WebhookTotal,
+		"webhook_dropped":    st.WebhookDropped,
+		"webhook_in_flight":  st.WebhookInFlight,
+		"webhook_last_error": st.WebhookLastError,
+		"total_events":       st.TotalEvents,
+	}, nil
 }
 
 // requireStore is the shared precondition check for tools that need
