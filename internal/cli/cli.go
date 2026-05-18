@@ -1029,6 +1029,7 @@ func newProfileInstallCmd() *cobra.Command {
 		force          bool
 		timeoutSecs    int
 		profilesPath   string
+		auditLogPath   string
 	)
 	cmd := &cobra.Command{
 		Use:   "install --from URL [--sha256 HEX] [--force] [--timeout 10]",
@@ -1076,6 +1077,40 @@ gate but still records the new source.`,
 				return err
 			}
 
+			// Admin-action audit event per [[basic-app-hygiene-features]]
+			// TIER 1 — distinct from the synthetic EventTypeProfileInstall
+			// that drives the non_org_profile_install alert rule (#270).
+			// This event is the "who installed what" config-change row.
+			// Both fire on a successful install + ride the same audit-
+			// export channel.
+			emitAdminAction(cmd, auditLogPath, audit.AdminActionInput{
+				Action:     audit.AdminActionProfileInstall,
+				Actor:      currentActor(),
+				EntityKind: "profile",
+				EntityName: strings.Join(result.InstalledNames, ","),
+				Source:     audit.AdminActionSourceCLI,
+				// Before: pre-install state captured implicitly as
+				// EmptyStateHash (no profile bundle) for first install,
+				// or the prior on-disk content for an --force overwrite.
+				// We keep the hash inputs lightweight (names + source)
+				// rather than re-reading the full YAML to avoid
+				// double-hashing the bundle bytes that the proxy already
+				// records.
+				Before: nil,
+				After: map[string]any{
+					"installed_profiles": result.InstalledNames,
+					"source":             result.SourceURL,
+					"sha256":             result.SHA256,
+				},
+				ExtraExt: map[string]any{
+					"source":            result.SourceURL,
+					"sha256":            result.SHA256,
+					"sha256_verified":   result.SHA256Verified,
+					"installed_count":   len(result.InstalledNames),
+					"profiles_path":     result.ProfilesPath,
+				},
+			})
+
 			if result.SHA256Verified {
 				fmt.Fprintf(cmd.OutOrStdout(), "sha256 verified: %s\n", result.SHA256)
 			} else {
@@ -1111,6 +1146,7 @@ gate but still records the new source.`,
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
 		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml). "+
 			"Honors KBOUNCER_PROFILES_PATH env var if unset.")
+	addAdminAuditFlag(cmd, &auditLogPath)
 	return cmd
 }
 

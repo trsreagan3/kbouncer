@@ -27,6 +27,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/rules"
 	"github.com/trsreagan3/kbouncer/internal/store"
 )
@@ -62,13 +63,14 @@ plural ('pods', 'deployments', ...).`,
 
 func newRulesAddCmd() *cobra.Command {
 	var (
-		pattern     string
-		effect      string
-		nsScope     string
-		resScope    string
-		verbScope   string
-		note        string
-		dbPath      string
+		pattern      string
+		effect       string
+		nsScope      string
+		resScope     string
+		verbScope    string
+		note         string
+		dbPath       string
+		auditLogPath string
 	)
 	cmd := &cobra.Command{
 		Use:   "add --pattern P --effect E [--namespace-scope NS] [--resource-scope RS] [--note ...]",
@@ -83,6 +85,10 @@ func newRulesAddCmd() *cobra.Command {
 				return fmt.Errorf("open store: %w", err)
 			}
 			defer st.Close()
+			// Capture before-state for the admin-action hash so the
+			// tamper-detection rule can witness exactly which rules
+			// changed.
+			beforeRules, _ := st.ListRules()
 			r := rules.ProxyRule{
 				Pattern:        pattern,
 				Effect:         eff,
@@ -105,6 +111,21 @@ func newRulesAddCmd() *cobra.Command {
 				}
 				return err
 			}
+			afterRules, _ := st.ListRules()
+			emitAdminAction(cmd, auditLogPath, audit.AdminActionInput{
+				Action:     audit.AdminActionRuleAdd,
+				Actor:      currentActor(),
+				EntityKind: "rule",
+				EntityName: pattern,
+				Source:     audit.AdminActionSourceCLI,
+				Before:     rulesToHashable(beforeRules),
+				After:      rulesToHashable(afterRules),
+				ExtraExt: map[string]any{
+					"rule_id": int64(id),
+					"effect":  string(eff),
+					"pattern": pattern,
+				},
+			})
 			fmt.Fprintf(cmd.OutOrStdout(), "added rule #%d: %s %s\n",
 				int64(id), eff, pattern)
 			return nil
@@ -128,6 +149,7 @@ func newRulesAddCmd() *cobra.Command {
 		"Operator-readable note describing why this rule exists.")
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	addAdminAuditFlag(cmd, &auditLogPath)
 	return cmd
 }
 
@@ -192,7 +214,10 @@ func newRulesListCmd() *cobra.Command {
 }
 
 func newRulesRemoveCmd() *cobra.Command {
-	var dbPath string
+	var (
+		dbPath       string
+		auditLogPath string
+	)
 	cmd := &cobra.Command{
 		Use:   "remove ID",
 		Short: "Remove a rule by id",
@@ -207,6 +232,8 @@ func newRulesRemoveCmd() *cobra.Command {
 				return fmt.Errorf("open store: %w", err)
 			}
 			defer st.Close()
+			beforeRules, _ := st.ListRules()
+			removed, removedPattern := findRule(beforeRules, rules.ID(id))
 			ok, err := st.RemoveRule(rules.ID(id))
 			if err != nil {
 				return err
@@ -215,11 +242,55 @@ func newRulesRemoveCmd() *cobra.Command {
 				fmt.Fprintf(cmd.ErrOrStderr(), "no rule with id #%d\n", id)
 				os.Exit(1)
 			}
+			afterRules, _ := st.ListRules()
+			emitAdminAction(cmd, auditLogPath, audit.AdminActionInput{
+				Action:     audit.AdminActionRuleRemove,
+				Actor:      currentActor(),
+				EntityKind: "rule",
+				EntityName: removedPattern,
+				Source:     audit.AdminActionSourceCLI,
+				Before:     rulesToHashable(beforeRules),
+				After:      rulesToHashable(afterRules),
+				ExtraExt: map[string]any{
+					"rule_id":         id,
+					"removed_pattern": removedPattern,
+					"removed_effect":  removed,
+				},
+			})
 			fmt.Fprintf(cmd.OutOrStdout(), "removed rule #%d\n", id)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	addAdminAuditFlag(cmd, &auditLogPath)
 	return cmd
+}
+
+// rulesToHashable reshapes a StoredRule slice into a stable
+// JSON-marshalable form for the admin-action before/after hash. Sorts
+// by ID so the hash is invariant to caller ordering (the store
+// already returns ordered rows, but this is the load-bearing
+// canonical-form guarantee for the tamper-detection rule).
+func rulesToHashable(in []rules.StoredRule) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, sr := range in {
+		m := sr.Rule.ToMap()
+		m["id"] = int64(sr.ID)
+		out = append(out, m)
+	}
+	return out
+}
+
+// findRule returns the effect + pattern of the rule with the given
+// id, or empty strings when not present. Best-effort lookup so the
+// admin-action event can carry the operator-readable identity of the
+// removed rule.
+func findRule(rs []rules.StoredRule, id rules.ID) (effect, pattern string) {
+	for _, sr := range rs {
+		if sr.ID == id {
+			return string(sr.Rule.Effect), sr.Rule.Pattern
+		}
+	}
+	return "", ""
 }

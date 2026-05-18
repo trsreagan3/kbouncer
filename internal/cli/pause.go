@@ -33,6 +33,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/store"
 )
 
@@ -63,9 +64,10 @@ ground between "Ctrl-C the proxy" and "redo my rules."`,
 
 func newPauseStartCmd() *cobra.Command {
 	var (
-		duration string
-		reason   string
-		dbPath   string
+		duration     string
+		reason       string
+		dbPath       string
+		auditLogPath string
 	)
 	cmd := &cobra.Command{
 		Use:   "start --for DURATION [--reason ...]",
@@ -80,7 +82,8 @@ func newPauseStartCmd() *cobra.Command {
 				return fmt.Errorf("open store: %w", err)
 			}
 			defer st.Close()
-			pid, err := st.StartPause(seconds, reason, currentActor())
+			actor := currentActor()
+			pid, err := st.StartPause(seconds, reason, actor)
 			if err != nil {
 				// Exit code 2 mirrors the Python pause-refused path so
 				// scripts wrapping both products can distinguish
@@ -96,6 +99,34 @@ func newPauseStartCmd() *cobra.Command {
 			if active == nil {
 				return errors.New("pause window started but immediately not active (clock skew?)")
 			}
+			// Admin-action audit event per [[basic-app-hygiene-features]]
+			// TIER 1 — distinct from the synthetic EventTypeAdminFallback
+			// Grant the proxy emits when it observes the pause-open edge
+			// (#270). The admin-action event is the "who opened the
+			// window?" config-change row; the proxy synthetic is the
+			// alert-rule input. Both ride the same audit-export channel.
+			emitAdminAction(cmd, auditLogPath, audit.AdminActionInput{
+				Action:     audit.AdminActionPauseStart,
+				Actor:      actor,
+				EntityKind: "pause_window",
+				EntityName: fmt.Sprintf("pause#%d", pid),
+				Source:     audit.AdminActionSourceCLI,
+				// Before: no pause active. After: window opened with the
+				// requested duration + reason. Hashes give the
+				// tamper-detection rule a stable witness of what
+				// changed.
+				Before: nil,
+				After: map[string]any{
+					"pause_id":         pid,
+					"duration_seconds": seconds,
+					"ends_at":          active.EndsAt,
+					"reason":           reason,
+				},
+				ExtraExt: map[string]any{
+					"pause_id":         pid,
+					"duration_seconds": seconds,
+				},
+			})
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"pause #%d active — proxy is COOPERATIVE for the next %s (ends at %s).\n",
 				pid, duration, active.EndsAt)
@@ -117,11 +148,15 @@ func newPauseStartCmd() *cobra.Command {
 			"/healthz. e.g. 'incident response' / 'cluster migration'.")
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	addAdminAuditFlag(cmd, &auditLogPath)
 	return cmd
 }
 
 func newPauseStopCmd() *cobra.Command {
-	var dbPath string
+	var (
+		dbPath       string
+		auditLogPath string
+	)
 	cmd := &cobra.Command{
 		Use:   "stop",
 		Short: "End the currently-active pause (if any)",
@@ -131,7 +166,8 @@ func newPauseStopCmd() *cobra.Command {
 				return fmt.Errorf("open store: %w", err)
 			}
 			defer st.Close()
-			pid, err := st.EndPause(currentActor())
+			actor := currentActor()
+			pid, err := st.EndPause(actor)
 			if err != nil {
 				return err
 			}
@@ -139,12 +175,28 @@ func newPauseStopCmd() *cobra.Command {
 				fmt.Fprintln(cmd.OutOrStdout(), "no pause is currently active.")
 				return nil
 			}
+			// Admin-action audit event — pairs with the synthetic
+			// EventTypePauseEnd the proxy emits on the close-edge.
+			emitAdminAction(cmd, auditLogPath, audit.AdminActionInput{
+				Action:     audit.AdminActionPauseStop,
+				Actor:      actor,
+				EntityKind: "pause_window",
+				EntityName: fmt.Sprintf("pause#%d", *pid),
+				Source:     audit.AdminActionSourceCLI,
+				Before:     map[string]any{"pause_id": *pid, "active": true},
+				After:      map[string]any{"pause_id": *pid, "active": false, "end_kind": "resumed_early"},
+				ExtraExt: map[string]any{
+					"pause_id": *pid,
+					"end_kind": "resumed_early",
+				},
+			})
 			fmt.Fprintf(cmd.OutOrStdout(), "pause #%d ended early.\n", *pid)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	addAdminAuditFlag(cmd, &auditLogPath)
 	return cmd
 }
 

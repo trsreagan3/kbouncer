@@ -30,6 +30,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/presets"
 	"github.com/trsreagan3/kbouncer/internal/store"
 )
@@ -155,7 +156,10 @@ func newPresetsShowCmd() *cobra.Command {
 }
 
 func newPresetsApplyCmd() *cobra.Command {
-	var dbPath string
+	var (
+		dbPath       string
+		auditLogPath string
+	)
 	cmd := &cobra.Command{
 		Use:   "apply NAME",
 		Short: "Insert the named preset's rules into the global rules table",
@@ -175,6 +179,7 @@ with ` + "`kbounce rules remove ID`" + ` if you want to undo.`,
 				return fmt.Errorf("open store: %w", err)
 			}
 			defer st.Close()
+			beforeRules, _ := st.ListRules()
 			applied := 0
 			for _, r := range p.Rules {
 				if _, err := st.AddRule(r); err != nil {
@@ -184,6 +189,20 @@ with ` + "`kbounce rules remove ID`" + ` if you want to undo.`,
 				}
 				applied++
 			}
+			afterRules, _ := st.ListRules()
+			emitAdminAction(cmd, auditLogPath, audit.AdminActionInput{
+				Action:     audit.AdminActionPresetApply,
+				Actor:      currentActor(),
+				EntityKind: "preset",
+				EntityName: p.Name,
+				Source:     audit.AdminActionSourceCLI,
+				Before:     rulesToHashable(beforeRules),
+				After:      rulesToHashable(afterRules),
+				ExtraExt: map[string]any{
+					"preset_name":   p.Name,
+					"rules_applied": applied,
+				},
+			})
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"applied preset %q: %d rule(s) added.\n", p.Name, applied)
 			return nil
@@ -191,6 +210,7 @@ with ` + "`kbounce rules remove ID`" + ` if you want to undo.`,
 	}
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	addAdminAuditFlag(cmd, &auditLogPath)
 	return cmd
 }
 
