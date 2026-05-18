@@ -198,6 +198,11 @@ func newRunCmd() *cobra.Command {
 		// JSONL log + HTTPS webhook transport as decision events.
 		// Enterprise-tier (license-gated; placeholder error until #235).
 		auditAlertRulesPath string
+		// Heartbeat cadence per [[prompt-injection-disable-bouncer-
+		// threat]] + [[audit-export-failure-visibility]]. 0 = OFF
+		// (default; safety-not-surveillance positioning); 30s
+		// recommended for Enterprise.
+		auditHeartbeatInterval time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -357,13 +362,14 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			// truth regardless. Webhook flags require an Enterprise
 			// license (placeholder error until #235 license-file
 			// plumbing lands).
-			auditEmitter, auditCloser, auditErr := buildAuditManager(
+			auditEmitter, auditHealth, auditCloser, auditErr := buildAuditManager(
 				cmd.Context(),
 				auditLogPath, auditLogFsync,
 				auditWebhookURL, auditWebhookToken, auditWebhookBatch,
 				allowInternalWebhook,
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
 				auditAlertRulesPath,
+				auditHeartbeatInterval,
 			)
 			if auditErr != nil {
 				return auditErr
@@ -386,6 +392,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				TLSKeyPath:              tlsKeyPath,
 				RequireClientCertCAPath: requireClientCert,
 				AuditEmitter:            auditEmitter,
+				AuditHealthCheck:        auditHealth,
 			}.Normalize()
 
 			// Cooperative mode + --sync-prompt-on-deny: per spec the
@@ -442,7 +449,13 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				if status.AlertsEnabled {
 					fmt.Fprintf(os.Stderr,
 						"audit alerts: enabled (rules=admin_fallback_burst, pause_long, "+
-							"non_org_profile_install, unusual_high_risk_action)\n")
+							"non_org_profile_install, unusual_high_risk_action, heartbeat_gap)\n")
+				}
+				if status.HeartbeatEnabled {
+					fmt.Fprintf(os.Stderr,
+						"audit heartbeat: enabled (interval=%ds; /healthz returns 503 "+
+							"+ stderr fires on heartbeat_gap)\n",
+						status.HeartbeatIntervalSeconds)
 				}
 			}
 			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
@@ -681,27 +694,53 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 	cmd.Flags().StringVar(&auditAlertRulesPath, "alert-rules", "",
 		"Path to a YAML file tuning the audit alert-rule engine "+
 			"(admin_fallback_burst / pause_long / non_org_profile_install / "+
-			"unusual_high_risk_action). Set to the empty string (default) to "+
-			"DISABLE the rule engine entirely; set to a path to ENABLE with "+
-			"the YAML's thresholds layered over the built-in defaults (so an "+
-			"empty file enables all four rules with their defaults). Alert "+
-			"events ride the same JSONL log + HTTPS webhook transport as "+
-			"decision events (OCSF class 6003, activity_id 99, "+
-			"activity_name 'anomaly_detected'). ENTERPRISE-tier "+
-			"(license-gated; see #235 for license-file plumbing status).")
+			"unusual_high_risk_action / heartbeat_gap). Set to the empty "+
+			"string (default) to DISABLE the rule engine entirely; set to a "+
+			"path to ENABLE with the YAML's thresholds layered over the "+
+			"built-in defaults (so an empty file enables all five rules with "+
+			"their defaults). Alert events ride the same JSONL log + HTTPS "+
+			"webhook transport as decision events (OCSF class 6003, "+
+			"activity_id 99, activity_name 'anomaly_detected'). ENTERPRISE-"+
+			"tier (license-gated; see #235 for license-file plumbing status).")
+	// Heartbeat liveness emitter — per [[prompt-injection-disable-
+	// bouncer-threat]] + [[audit-export-failure-visibility]]. OFF
+	// by default; 30s recommended for Enterprise.
+	cmd.Flags().DurationVar(&auditHeartbeatInterval, "heartbeat-interval", 0,
+		"Audit-export heartbeat cadence. When non-zero, a background "+
+			"goroutine emits a HEARTBEAT OCSF event at this interval so a "+
+			"downstream SIEM has a positive liveness signal for the audit-"+
+			"export channel. Recommended: 30s for Enterprise deployments. "+
+			"Default 0 (DISABLED) per [[security-team-positioning-safety-"+
+			"not-surveillance]] — opt in once the SIEM has a `heartbeat_gap` "+
+			"rule wired. Pairs with the local heartbeat_gap rule (enabled "+
+			"via --alert-rules) which flips /healthz to 503 + writes to "+
+			"stderr when the watchdog detects a missed-tick gap (the audit-"+
+			"export channel itself may be the failure source, so the "+
+			"fallback surfaces must not ride through it). Minimum 1s; "+
+			"requires --alert-rules to be a non-empty path for the local "+
+			"gap detection (ENTERPRISE-tier).")
 	return cmd
 }
 
-// buildAuditManager wires the --audit-log-path / --audit-webhook-*
-// flags into an audit.Manager + a closer the caller defers. Returns
-// (nil, no-op, nil) when neither channel is configured.
+// buildAuditManager wires the --audit-log-path / --audit-webhook-* /
+// --alert-rules / --heartbeat-interval flags into an audit.Emitter +
+// an optional health-check func + a closer the caller defers.
+// Returns (nil, nil, no-op, nil) when no audit-export channel is
+// configured.
 //
-// License gate: webhook flags require an Enterprise license file.
-// kbounce does not yet have license-file plumbing (tracked in #235);
-// until that lands, the webhook flags surface
-// audit.ErrLicenseRequired so an operator who tries to use the
-// Enterprise feature without the license-file infrastructure gets
-// a clear error rather than a silent bypass.
+// License gate: webhook flags + alert-rules require an Enterprise
+// license file. kbounce does not yet have license-file plumbing
+// (tracked in #235); until that lands, the affected flags surface
+// audit.ErrLicenseRequired / ErrAlertRulesLicenseRequired so an
+// operator who tries to use the Enterprise feature without the
+// license-file infrastructure gets a clear error rather than a
+// silent bypass.
+//
+// Heartbeat wiring per [[prompt-injection-disable-bouncer-threat]]:
+// when --heartbeat-interval is non-zero, a Heartbeater goroutine is
+// launched against the returned emitter + bound to the rule engine
+// (if one was built) so the local heartbeat_gap rule's stderr +
+// /healthz 503 fallbacks fire when a gap is detected.
 func buildAuditManager(
 	ctx context.Context,
 	logPath string, logFsync bool,
@@ -709,22 +748,31 @@ func buildAuditManager(
 	allowInternal bool,
 	webhookPreset, webhookTags, webhookSentinelTable string,
 	alertRulesPath string,
-) (audit.Emitter, func(), error) {
+	heartbeatInterval time.Duration,
+) (audit.Emitter, func() bool, func(), error) {
 	noop := func() {}
-	if logPath == "" && webhookURL == "" && alertRulesPath == "" {
-		return nil, noop, nil
+	if logPath == "" && webhookURL == "" && alertRulesPath == "" && heartbeatInterval == 0 {
+		return nil, nil, noop, nil
 	}
 	// Validate the preset name up front so a typo surfaces before
 	// the license gate (gives the operator a single clear error per
 	// run rather than fixing one then hitting the next).
 	if _, err := audit.ParsePreset(webhookPreset); err != nil {
-		return nil, noop, err
+		return nil, nil, noop, err
+	}
+	// Validate heartbeat interval shape up front (the audit package
+	// clamps below MinHeartbeatInterval defensively; we reject the
+	// flag here for a clearer error).
+	if heartbeatInterval != 0 && heartbeatInterval < audit.MinHeartbeatInterval {
+		return nil, nil, noop, fmt.Errorf(
+			"kbounce: --heartbeat-interval must be 0 (disabled) or >= %s; got %s",
+			audit.MinHeartbeatInterval, heartbeatInterval)
 	}
 	// Slice 2 of #252 — alert-rule engine is an Enterprise feature
 	// per [[security-team-audit-export]]. Same placeholder license
 	// gate as the webhook flags; both wait on #235.
 	if alertRulesPath != "" {
-		return nil, noop, audit.ErrAlertRulesLicenseRequired
+		return nil, nil, noop, audit.ErrAlertRulesLicenseRequired
 	}
 	var logWriter *audit.LogWriter
 	var webhookPusher *audit.WebhookPusher
@@ -734,7 +782,7 @@ func buildAuditManager(
 			Fsync: logFsync,
 		})
 		if err != nil {
-			return nil, noop, err
+			return nil, nil, noop, err
 		}
 		logWriter = lw
 	}
@@ -742,7 +790,7 @@ func buildAuditManager(
 		// Enterprise license gate — placeholder until #235 lands.
 		// Once license-file plumbing exists, replace this with the
 		// real verifier; the audit package doesn't change.
-		return nil, noop, audit.ErrLicenseRequired
+		return nil, nil, noop, audit.ErrLicenseRequired
 	}
 	_ = webhookToken // referenced when license-file plumbing lands
 	_ = webhookBatch
@@ -753,8 +801,37 @@ func buildAuditManager(
 		LogWriter:     logWriter,
 		WebhookPusher: webhookPusher,
 	})
-	closer := func() { mgr.Close() }
-	return mgr, closer, nil
+	// Heartbeat wiring. When the rule engine is enabled (which the
+	// license gate currently blocks pre-#235), we'd bind the
+	// heartbeater into it; without the engine, the heartbeater still
+	// emits HEARTBEAT events so the SIEM-side gap rule has its
+	// liveness signal, and Healthy() always reports true (no local
+	// watchdog without the rule engine — the gap is observable on
+	// the SIEM side via the missing seq numbers).
+	var hb *audit.Heartbeater
+	var emitter audit.Emitter = mgr
+	if heartbeatInterval > 0 {
+		hb = audit.NewHeartbeater(emitter, heartbeatInterval)
+		// Bind into the Manager so its Status() surfaces the
+		// heartbeat fields for the MCP audit-export status tool +
+		// the startup banner — symmetric with the engine-wrapped
+		// path. (When/if the rule engine lights up post-#235, the
+		// CLI also calls eng.BindHeartbeater so the local
+		// heartbeat_gap rule can flip /healthz on a missed tick.)
+		mgr.BindHeartbeater(hb)
+		hb.Start(ctx)
+	}
+	var healthCheck func() bool
+	if hb != nil {
+		healthCheck = hb.Healthy
+	}
+	closer := func() {
+		if hb != nil {
+			hb.Close()
+		}
+		mgr.Close()
+	}
+	return emitter, healthCheck, closer, nil
 }
 
 // newInitTLSCmd implements `kbounce init-tls`. One-time setup that

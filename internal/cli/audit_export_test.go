@@ -9,6 +9,7 @@ package cli
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,7 +24,7 @@ import (
 // rather than silently constructing a webhook + bypassing the
 // license check.
 func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
-	_, _, err := buildAuditManager(
+	_, _, _, err := buildAuditManager(
 		t.Context(),
 		"", false,
 		"https://collector.example.com/audit",
@@ -32,6 +33,7 @@ func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
 		false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		0,
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrLicenseRequired,
@@ -45,12 +47,13 @@ func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
 // gate is on the webhook flags only.
 func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 	dir := t.TempDir()
-	mgr, closer, err := buildAuditManager(
+	mgr, _, closer, err := buildAuditManager(
 		t.Context(),
 		dir+"/audit.jsonl", false,
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		0,
 	)
 	require.NoError(t, err, "JSONL log alone should not require an Enterprise license")
 	require.NotNil(t, mgr)
@@ -65,12 +68,13 @@ func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 // Preserves backward compat for the existing test suite + the bare
 // `kbounce run` path that doesn't opt into the export feature.
 func TestAudit_NoFlagsNoManager(t *testing.T) {
-	mgr, closer, err := buildAuditManager(
+	mgr, _, closer, err := buildAuditManager(
 		t.Context(),
 		"", false,
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		0,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, mgr, "no flags → no Manager constructed")
@@ -83,18 +87,71 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 // TestAuditWebhook_LicensePlaceholderRejects; both wait on #235.
 func TestAuditAlerts_LicensePlaceholderRejects(t *testing.T) {
 	dir := t.TempDir()
-	_, _, err := buildAuditManager(
+	_, _, _, err := buildAuditManager(
 		t.Context(),
 		"", false,
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		dir+"/rules.yaml",
+		0,
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrAlertRulesLicenseRequired,
 		"--alert-rules must return ErrAlertRulesLicenseRequired until license-file plumbing lands")
 	assert.Contains(t, err.Error(), "#235",
 		"error message should direct the operator to the tracking issue")
+}
+
+// TestAuditHeartbeat_OnEnabledWiresHealthCheckAndEmits confirms that
+// passing --heartbeat-interval wires a Heartbeater, immediately emits
+// a first event, and returns a non-nil health-check callback for the
+// proxy's /healthz handler to consult.
+//
+// Per [[prompt-injection-disable-bouncer-threat]] +
+// [[audit-export-failure-visibility]]: the heartbeat is the canary +
+// the health-check is the local fallback when the audit-export
+// channel itself is the failure source.
+func TestAuditHeartbeat_OnEnabledWiresHealthCheckAndEmits(t *testing.T) {
+	dir := t.TempDir()
+	mgr, healthCheck, closer, err := buildAuditManager(
+		t.Context(),
+		dir+"/audit.jsonl", false,
+		"", "", 1, false,
+		"generic", "", audit.SentinelDefaultTable,
+		"",
+		audit.MinHeartbeatInterval,
+	)
+	require.NoError(t, err)
+	defer closer()
+	require.NotNil(t, healthCheck, "heartbeat enabled → health-check callback must be non-nil")
+	assert.True(t, healthCheck(), "newly-enabled heartbeater starts healthy")
+	// Heartbeater emits one event immediately at Start so the first
+	// status snapshot has heartbeat_total_emitted == 1.
+	require.Eventually(t, func() bool {
+		return mgr.Status().HeartbeatTotalEmitted >= 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"heartbeater must emit the first tick on Start without waiting an interval")
+	st := mgr.Status()
+	assert.True(t, st.HeartbeatEnabled)
+	assert.Equal(t, int(audit.MinHeartbeatInterval.Seconds()), st.HeartbeatIntervalSeconds)
+	assert.True(t, st.HeartbeatHealthy)
+}
+
+// TestAuditHeartbeat_TooSmallIntervalRejected pins the eager
+// validation of --heartbeat-interval; sub-1s values trip a clear
+// CLI error rather than the audit package's defensive clamp.
+func TestAuditHeartbeat_TooSmallIntervalRejected(t *testing.T) {
+	_, _, _, err := buildAuditManager(
+		t.Context(),
+		"", false,
+		"", "", 1, false,
+		"generic", "", audit.SentinelDefaultTable,
+		"",
+		100*time.Millisecond,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "heartbeat-interval",
+		"the CLI error must mention the offending flag")
 }
 
 // TestAuditWebhook_LicenseErrorMessageSurface pins the error

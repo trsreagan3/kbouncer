@@ -455,27 +455,35 @@ func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error)
 			"alerts_enabled":     false,
 			"alerts_fired_count": int64(0),
 			"total_events":       int64(0),
+			"heartbeat_enabled":  false,
+			"heartbeat_healthy":  true,
 			"note": "audit export disabled (no --audit-log-path / " +
-				"--audit-webhook-url / --alert-rules passed to `kbounce run`)",
+				"--audit-webhook-url / --alert-rules / --heartbeat-interval " +
+				"passed to `kbounce run`)",
 		}, nil
 	}
 	st := s.cfg.AuditEmitter.Status()
 	return map[string]any{
-		"log_configured":     st.LogConfigured,
-		"log_path":           st.LogPath,
-		"log_total":          st.LogTotal,
-		"log_dropped":        st.LogDropped,
-		"log_last_error":     st.LogLastError,
-		"webhook_configured": st.WebhookConfigured,
-		"webhook_url":        st.WebhookMaskedURL,
-		"webhook_total":      st.WebhookTotal,
-		"webhook_dropped":    st.WebhookDropped,
-		"webhook_in_flight":  st.WebhookInFlight,
-		"webhook_last_error": st.WebhookLastError,
-		"total_events":       st.TotalEvents,
-		"alerts_enabled":     st.AlertsEnabled,
-		"alerts_fired_count": st.AlertsFiredCount,
-		"last_alert_pattern": st.LastAlertPattern,
+		"log_configured":                 st.LogConfigured,
+		"log_path":                       st.LogPath,
+		"log_total":                      st.LogTotal,
+		"log_dropped":                    st.LogDropped,
+		"log_last_error":                 st.LogLastError,
+		"webhook_configured":             st.WebhookConfigured,
+		"webhook_url":                    st.WebhookMaskedURL,
+		"webhook_total":                  st.WebhookTotal,
+		"webhook_dropped":                st.WebhookDropped,
+		"webhook_in_flight":              st.WebhookInFlight,
+		"webhook_last_error":             st.WebhookLastError,
+		"total_events":                   st.TotalEvents,
+		"alerts_enabled":                 st.AlertsEnabled,
+		"alerts_fired_count":             st.AlertsFiredCount,
+		"last_alert_pattern":             st.LastAlertPattern,
+		"heartbeat_enabled":              st.HeartbeatEnabled,
+		"heartbeat_interval_seconds":     st.HeartbeatIntervalSeconds,
+		"heartbeat_total_emitted":        st.HeartbeatTotalEmitted,
+		"heartbeat_last_emit_unix_milli": st.HeartbeatLastEmitUnixMilli,
+		"heartbeat_healthy":              st.HeartbeatHealthy,
 	}, nil
 }
 

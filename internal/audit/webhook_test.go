@@ -318,10 +318,15 @@ func TestWebhookConstants(t *testing.T) {
 }
 
 // Defensive: the manager's no-op + audit-disabled paths must not panic.
+// Per Slice 7 ([[prompt-injection-disable-bouncer-threat]]) the nil-
+// Manager Status() reports HeartbeatHealthy=true — no Heartbeater
+// configured means no expectation to fail, so /healthz stays at 200
+// when an audit-disabled CLI invocation wires the bare-Manager
+// status path.
 func TestManager_NilSafe(t *testing.T) {
 	var m *Manager
 	m.Emit(context.Background(), FromDecision(DecisionInput{}))
-	assert.Equal(t, Status{}, m.Status())
+	assert.Equal(t, Status{HeartbeatHealthy: true}, m.Status())
 	m.Close()
 }
 

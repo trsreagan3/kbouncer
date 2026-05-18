@@ -119,6 +119,25 @@ const (
 	// session's agent block. Lets analysts close their "all events
 	// from session X" queries with both bookends.
 	EventTypeSessionEnded EventType = "SESSION_ENDED"
+
+	// EventTypeHeartbeat is the synthetic liveness marker emitted at a
+	// fixed cadence by the Heartbeater goroutine when
+	// --heartbeat-interval is non-zero. Surfaces as OCSF
+	// activity_id=99 / activity_name="heartbeat" with
+	// unmapped.iam_jit.event_type=HEARTBEAT.
+	//
+	// Per [[prompt-injection-disable-bouncer-threat]] +
+	// [[audit-export-failure-visibility]]: heartbeats give downstream
+	// SIEMs a positive liveness signal so an attacker who silenced the
+	// audit-export channel (kill -9, disabled flag, broken webhook)
+	// fails OPEN to a noisy "heartbeat_gap" alert on the SIEM side
+	// rather than silently disappearing from the operator's view.
+	//
+	// Cross-product invariant per [[cross-product-agent-parity]]:
+	// ibounce / kbounce / dbounce emit the SAME shape (different
+	// product names in metadata.product) so a single SIEM dashboard
+	// rule catches gaps across the suite.
+	EventTypeHeartbeat EventType = "HEARTBEAT"
 )
 
 // OCSF activity_id enum (class 6003 / API Activity).
@@ -289,6 +308,18 @@ type IAMJITExt struct {
 	// traffic as a first-class signal. Synthetic events (AUDIT_DROPPED,
 	// security alerts) leave it nil — those aren't bound to any agent.
 	Agent *OCSFAgent `json:"agent,omitempty"`
+
+	// Heartbeat fields (populated on EventTypeHeartbeat events; omitted
+	// otherwise). HeartbeatSeq is the monotonically-increasing tick id
+	// (1-based) so a SIEM-side `heartbeat_gap` rule can detect missing
+	// sequence numbers without timestamp arithmetic. HeartbeatInterval
+	// Seconds is the configured cadence in seconds — lets the SIEM
+	// rule auto-scale its tolerance window to whatever the operator
+	// picked. HeartbeatGapMissed is set on `heartbeat_gap` alert events
+	// to report how many ticks were missed before the gap was observed.
+	HeartbeatSeq             int64 `json:"heartbeat_seq,omitempty"`
+	HeartbeatIntervalSeconds int   `json:"heartbeat_interval_seconds,omitempty"`
+	HeartbeatGapMissed       int   `json:"heartbeat_gap_missed,omitempty"`
 }
 
 // Event is the OCSF v1.1.0 class 6003 (API Activity) wire shape.
@@ -581,6 +612,60 @@ func NewDroppedMarker(count int64) Event {
 			},
 		},
 		EventType: EventTypeAuditDropped,
+	}
+}
+
+// NewHeartbeatEvent builds an OCSF-shaped synthetic heartbeat event
+// the Heartbeater goroutine emits at a fixed cadence (one per
+// --heartbeat-interval tick). Surfaces as activity_id=99 (Other) /
+// activity_name="heartbeat" with severity_id=1 (Informational) +
+// status_id=1 (Success) — a heartbeat is a positive liveness signal,
+// not an anomaly, so the wire shape carries the lowest severity to
+// keep alert-fatigue noise off the SIEM.
+//
+// Per [[prompt-injection-disable-bouncer-threat]]: the heartbeat is
+// the CANARY that lets a downstream SIEM detect "the bouncer went
+// quiet" — without it, an attacker that silences the audit-export
+// channel disappears silently. A `heartbeat_gap` SIEM rule (mirrored
+// on the local rule-engine side as heartbeatGapRule) flags missing
+// ticks loudly.
+func NewHeartbeatEvent(seq int64, intervalSeconds int) Event {
+	return Event{
+		Metadata: OCSFMetadata{
+			Version: OCSFSchemaVersion,
+			Product: OCSFProduct{
+				Name:       ProductName,
+				VendorName: VendorName,
+				Version:    buildVersion,
+			},
+		},
+		Time:         nowUnixMilli(),
+		ClassUID:     ClassUID,
+		ClassName:    ClassName,
+		CategoryUID:  CategoryUID,
+		CategoryName: CategoryName,
+		ActivityID:   ActivityOther,
+		ActivityName: "heartbeat",
+		TypeUID:      ClassUID*100 + ActivityOther,
+		TypeName:     typeNameForActivity(ActivityOther),
+		SeverityID:   SeverityInformational,
+		Severity:     "Informational",
+		StatusID:     StatusSuccess,
+		Status:       "Success",
+		StatusDetail: "audit-export heartbeat (positive liveness signal)",
+		API: OCSFAPI{
+			Service: OCSFAPIService{Name: "kubernetes"},
+			Request: OCSFAPIRequest{},
+		},
+		Resources: []OCSFResource{},
+		Unmapped: OCSFUnmapped{
+			IAMJIT: IAMJITExt{
+				EventType:                string(EventTypeHeartbeat),
+				HeartbeatSeq:             seq,
+				HeartbeatIntervalSeconds: intervalSeconds,
+			},
+		},
+		EventType: EventTypeHeartbeat,
 	}
 }
 

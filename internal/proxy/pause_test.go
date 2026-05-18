@@ -154,3 +154,44 @@ func TestHealthz_NoPauseLeavesFieldNil(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &payload))
 	assert.Nil(t, payload["pause"], "no pause active → pause field is null")
 }
+
+// TestHealthz_AuditUnhealthyReturns503 confirms the heartbeat-gap
+// fallback wired via AuditHealthCheck flips /healthz to 503 per
+// [[prompt-injection-disable-bouncer-threat]] +
+// [[audit-export-failure-visibility]]. The audit-export channel
+// itself may be the failure source, so the /healthz HTTP status code
+// is one of two independent fallback surfaces (stderr is the other)
+// an operator can monitor with shell-grade tooling.
+func TestHealthz_AuditUnhealthyReturns503(t *testing.T) {
+	st := freshStore(t)
+	cfg := Config{
+		AuditHealthCheck: func() bool { return false },
+	}
+	srv := NewServer(cfg, st)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	srv.healthz(rr, req)
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code,
+		"unhealthy audit export must flip /healthz to 503")
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &payload))
+	assert.Equal(t, "degraded", payload["status"])
+	assert.Equal(t, false, payload["audit_export_healthy"])
+}
+
+// TestHealthz_AuditHealthyReturns200 confirms the normal-state path
+// is unaffected when the audit-export watchdog reports healthy.
+func TestHealthz_AuditHealthyReturns200(t *testing.T) {
+	st := freshStore(t)
+	cfg := Config{
+		AuditHealthCheck: func() bool { return true },
+	}
+	srv := NewServer(cfg, st)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	srv.healthz(rr, req)
+	assert.Equal(t, http.StatusOK, rr.Code)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &payload))
+	assert.Equal(t, true, payload["audit_export_healthy"])
+}

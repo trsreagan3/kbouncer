@@ -46,6 +46,22 @@ type Status struct {
 	AlertsEnabled    bool   `json:"alerts_enabled"`
 	AlertsFiredCount int64  `json:"alerts_fired_count"`
 	LastAlertPattern string `json:"last_alert_pattern,omitempty"`
+
+	// Heartbeat watchdog state (per [[prompt-injection-disable-bouncer
+	// -threat]] + [[audit-export-failure-visibility]]). HeartbeatEnabled
+	// reports whether a Heartbeater is wired with a non-zero interval
+	// (operator passed --heartbeat-interval). HeartbeatIntervalSeconds
+	// is the configured cadence; HeartbeatTotalEmitted is the
+	// cumulative number of heartbeat events emitted (lets the SIEM
+	// confirm the channel is alive end-to-end);
+	// HeartbeatLastEmitUnixMilli is the wall-clock of the most-recent
+	// emit (zero before the first tick); HeartbeatHealthy reports the
+	// local watchdog's current state (mirrors what /healthz returns).
+	HeartbeatEnabled           bool  `json:"heartbeat_enabled"`
+	HeartbeatIntervalSeconds   int   `json:"heartbeat_interval_seconds,omitempty"`
+	HeartbeatTotalEmitted      int64 `json:"heartbeat_total_emitted,omitempty"`
+	HeartbeatLastEmitUnixMilli int64 `json:"heartbeat_last_emit_unix_milli,omitempty"`
+	HeartbeatHealthy           bool  `json:"heartbeat_healthy"`
 }
 
 // Manager fans events out to the JSONL log writer + the HTTPS
@@ -61,6 +77,13 @@ type Manager struct {
 	log     *LogWriter
 	webhook *WebhookPusher
 	total   atomic.Int64
+	// heartbeater is the optional liveness Heartbeater bound via
+	// BindHeartbeater so Manager.Status() surfaces the watchdog
+	// fields when the rule engine isn't wrapping this Manager. When
+	// the engine IS wrapping, RuleEngine.Status() reads its own
+	// e.heartbeater (set via RuleEngine.BindHeartbeater) so both
+	// wiring shapes report the same snapshot.
+	heartbeater *Heartbeater
 }
 
 // ManagerOptions configures a Manager. Pass a nil LogWriter or
@@ -100,7 +123,7 @@ func (m *Manager) Emit(ctx context.Context, ev Event) {
 
 // Status snapshots the runtime counters.
 func (m *Manager) Status() Status {
-	s := Status{}
+	s := Status{HeartbeatHealthy: true}
 	if m == nil {
 		return s
 	}
@@ -120,7 +143,28 @@ func (m *Manager) Status() Status {
 		s.WebhookInFlight = m.webhook.InFlight()
 		s.WebhookLastError = m.webhook.LastError()
 	}
+	if m.heartbeater != nil && m.heartbeater.interval > 0 {
+		s.HeartbeatEnabled = true
+		s.HeartbeatIntervalSeconds = int(m.heartbeater.interval.Seconds())
+		s.HeartbeatTotalEmitted = m.heartbeater.Seq()
+		if last := m.heartbeater.LastEmit(); !last.IsZero() {
+			s.HeartbeatLastEmitUnixMilli = last.UnixMilli()
+		}
+		s.HeartbeatHealthy = m.heartbeater.Healthy()
+	}
 	return s
+}
+
+// BindHeartbeater wires the given Heartbeater into the Manager so
+// Status() surfaces the watchdog fields. Symmetric with
+// RuleEngine.BindHeartbeater — when the operator hasn't enabled the
+// rule engine, the bare Manager still reports heartbeat state for
+// the MCP audit-export status tool.
+func (m *Manager) BindHeartbeater(hb *Heartbeater) {
+	if m == nil || hb == nil {
+		return
+	}
+	m.heartbeater = hb
 }
 
 // Close stops both worker goroutines. Idempotent.

@@ -229,6 +229,19 @@ type Config struct {
 	// regardless.
 	AuditEmitter audit.Emitter
 
+	// AuditHealthCheck, when non-nil, is called by /healthz to
+	// determine whether the proxy should return 503 instead of 200.
+	// Wired by the CLI to the audit Heartbeater's Healthy() method
+	// (per [[prompt-injection-disable-bouncer-threat]] +
+	// [[audit-export-failure-visibility]]): when the heartbeatGapRule
+	// detects a missed-tick gap, the watchdog flips unhealthy and
+	// /healthz starts returning 503 so an external supervisor (k8s
+	// liveness probe, monit) sees the same silenced-audit-export
+	// signal the SIEM-side `heartbeat_gap` rule trips on. nil = the
+	// /healthz handler keeps its baseline 200 (healthcheck always
+	// passes — heartbeat feature disabled).
+	AuditHealthCheck func() bool
+
 	// AgentRegistry, when non-nil, is the in-process map of
 	// MCP-session-id → AgentInfo populated by the MCP server's
 	// initialize handler. Proxy hot-path reads it on each inbound
@@ -1479,18 +1492,20 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Reason    string `json:"reason,omitempty"`
 	}
 	payload := struct {
-		Status               string        `json:"status"`
-		Mode                 string        `json:"mode"`
-		DefaultPolicy        string        `json:"default_policy"`
-		ActiveProfile        string        `json:"active_profile"`
-		DecisionsCount       int64         `json:"decisions_count"`
-		LookupErrorsCounter  int64         `json:"lookup_errors_counter"`
-		Pause                *HealthzPause `json:"pause"`
+		Status              string        `json:"status"`
+		Mode                string        `json:"mode"`
+		DefaultPolicy       string        `json:"default_policy"`
+		ActiveProfile       string        `json:"active_profile"`
+		DecisionsCount      int64         `json:"decisions_count"`
+		LookupErrorsCounter int64         `json:"lookup_errors_counter"`
+		AuditExportHealthy  bool          `json:"audit_export_healthy"`
+		Pause               *HealthzPause `json:"pause"`
 	}{
 		Status:              "ok",
 		Mode:                string(s.cfg.Mode),
 		DefaultPolicy:       string(s.cfg.DefaultPolicy),
 		LookupErrorsCounter: LookupErrorsCount(),
+		AuditExportHealthy:  true,
 	}
 	if s.cfg.ActiveProfile != nil {
 		payload.ActiveProfile = s.cfg.ActiveProfile.Name
@@ -1519,7 +1534,21 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 	}
-	w.WriteHeader(http.StatusOK)
+	// Per [[prompt-injection-disable-bouncer-threat]] +
+	// [[audit-export-failure-visibility]]: when the audit-export
+	// heartbeat watchdog flips unhealthy (heartbeatGapRule fired),
+	// /healthz returns 503 so an external supervisor (k8s liveness
+	// probe, monit, supervisor scripts) sees the same silenced-
+	// audit-export signal the SIEM-side rule trips on. Riding the
+	// alert through the audit-export channel alone would be
+	// invisible when the channel itself is the failure source.
+	statusCode := http.StatusOK
+	if s.cfg.AuditHealthCheck != nil && !s.cfg.AuditHealthCheck() {
+		payload.Status = "degraded"
+		payload.AuditExportHealthy = false
+		statusCode = http.StatusServiceUnavailable
+	}
+	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		log.Warn().Err(err).Msg("kbounce: encode /healthz response failed")
 	}

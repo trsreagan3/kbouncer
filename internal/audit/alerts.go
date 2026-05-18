@@ -47,6 +47,13 @@ const (
 	DefaultAdminFallbackBurstWindow    = 5 * time.Minute
 	DefaultPauseLongThreshold          = 30 * time.Minute
 	DefaultPauseLongWindow             = 2 * time.Hour // bound the per-event ring size
+	// DefaultHeartbeatGapMissedThreshold is the number of CONSECUTIVE
+	// missed heartbeats that triggers the heartbeat_gap rule. 2 is
+	// the spec floor per [[prompt-injection-disable-bouncer-threat]]
+	// — a single missed tick is noise (scheduler jitter, brief GC
+	// pause); 2+ consecutive misses indicates the audit-export
+	// channel has actually gone quiet and the operator wants to know.
+	DefaultHeartbeatGapMissedThreshold = 2
 )
 
 // DefaultK8sHighRiskSubresources is the built-in set of K8s
@@ -104,6 +111,11 @@ const (
 	SuggestionUnusualHighRiskAction = "review the decision context to " +
 		"confirm the denied action was intended; add an explicit allow " +
 		"rule when appropriate"
+	SuggestionHeartbeatGap = "investigate the audit-export channel " +
+		"(check kbounce process liveness, downstream collector " +
+		"reachability, and the --heartbeat-interval flag); the " +
+		"alert is the canary for prompt-injection-disable threats " +
+		"per [[prompt-injection-disable-bouncer-threat]]"
 )
 
 // AlertRule is the interface every built-in (and future operator-
@@ -162,6 +174,7 @@ type RulesConfig struct {
 	PauseLong             *PauseLongConfig             `yaml:"pause_long,omitempty"`
 	NonOrgProfileInstall  *NonOrgProfileInstallConfig  `yaml:"non_org_profile_install,omitempty"`
 	UnusualHighRiskAction *UnusualHighRiskActionConfig `yaml:"unusual_high_risk_action,omitempty"`
+	HeartbeatGap          *HeartbeatGapConfig          `yaml:"heartbeat_gap,omitempty"`
 }
 
 // AdminFallbackBurstConfig tunes the admin_fallback_burst rule. A
@@ -197,6 +210,16 @@ type NonOrgProfileInstallConfig struct {
 type UnusualHighRiskActionConfig struct {
 	HighRiskSubresources     []string `yaml:"high_risk_subresources,omitempty"`
 	HighRiskClusterMutations []string `yaml:"high_risk_cluster_mutations,omitempty"`
+}
+
+// HeartbeatGapConfig tunes the heartbeat_gap rule. MissedThreshold
+// is the number of CONSECUTIVE missed heartbeats that fires the
+// rule (default 2). The rule observes EventTypeHeartbeat events
+// and compares the embedded HeartbeatSeq against the previously-
+// observed seq; a jump of (1 + MissedThreshold) or more is treated
+// as a gap.
+type HeartbeatGapConfig struct {
+	MissedThreshold int `yaml:"missed_threshold,omitempty"`
 }
 
 // LoadRulesConfig reads + parses a YAML file at path. Returns a
@@ -270,7 +293,14 @@ func BuildBuiltinRules(cfg *RulesConfig) []AlertRule {
 		}
 	}
 
-	return []AlertRule{afb, pl, npi, uhr}
+	hg := &heartbeatGapRule{
+		missedThreshold: DefaultHeartbeatGapMissedThreshold,
+	}
+	if cfg.HeartbeatGap != nil && cfg.HeartbeatGap.MissedThreshold > 0 {
+		hg.missedThreshold = cfg.HeartbeatGap.MissedThreshold
+	}
+
+	return []AlertRule{afb, pl, npi, uhr, hg}
 }
 
 // stringSet is a tiny helper to turn a slice into a lookup map for
@@ -308,6 +338,11 @@ type RuleEngine struct {
 	firedCount  atomic.Int64
 	lastPattern atomic.Value // string
 	now         func() time.Time
+	// heartbeater is the optional Heartbeater bound via
+	// BindHeartbeater; surfaced by Status() so the MCP audit-export
+	// status tool can report heartbeat liveness alongside alert
+	// counters. nil when the operator hasn't enabled heartbeats.
+	heartbeater *Heartbeater
 }
 
 // NewRuleEngine constructs an engine wrapping the given Emitter. A
@@ -397,7 +432,41 @@ func (e *RuleEngine) Status() Status {
 	if v, ok := e.lastPattern.Load().(string); ok {
 		s.LastAlertPattern = v
 	}
+	if e.heartbeater != nil && e.heartbeater.interval > 0 {
+		s.HeartbeatEnabled = true
+		s.HeartbeatIntervalSeconds = int(e.heartbeater.interval.Seconds())
+		s.HeartbeatTotalEmitted = e.heartbeater.Seq()
+		if last := e.heartbeater.LastEmit(); !last.IsZero() {
+			s.HeartbeatLastEmitUnixMilli = last.UnixMilli()
+		}
+		s.HeartbeatHealthy = e.heartbeater.Healthy()
+	} else {
+		// Disabled → healthy by definition (no expectation to fail).
+		s.HeartbeatHealthy = true
+	}
 	return s
+}
+
+// BindHeartbeater wires the given Heartbeater into the heartbeat_gap
+// rule (if present in the registered rule set) so the rule's fire
+// path can flip the local stderr + /healthz 503 fallbacks. No-op
+// when the engine has no heartbeat_gap rule registered (the
+// operator built a custom rule set without it) — by-name lookup
+// keeps the binding decoupled from rule slice ordering.
+//
+// Per [[audit-export-failure-visibility]]: the binding is the
+// load-bearing piece that lets the alert escape the audit-export
+// channel when the channel itself is the failure source.
+func (e *RuleEngine) BindHeartbeater(hb *Heartbeater) {
+	if e == nil || hb == nil {
+		return
+	}
+	e.heartbeater = hb
+	for _, r := range e.rules {
+		if hg, ok := r.(*heartbeatGapRule); ok {
+			hg.bindHeartbeater(hb)
+		}
+	}
 }
 
 // RuleNames returns the registered rule names in stable order.
@@ -771,6 +840,101 @@ func fireUnusual(sub, verb, resource, kind string) AlertFire {
 			"observed_resource":    resource,
 		},
 	}
+}
+
+// heartbeatGapRule fires when the embedded HeartbeatSeq on an
+// observed EventTypeHeartbeat event jumps by more than (1 +
+// missedThreshold) from the prior observed seq — indicating
+// missedThreshold or more consecutive ticks were dropped before
+// the next one landed. Severity High (4) per
+// [[prompt-injection-disable-bouncer-threat]]: a quiet audit-export
+// channel is the load-bearing signal the SIEM + operator need to
+// know about, treated at parity with transparent-mode high-risk
+// denies.
+//
+// Per [[audit-export-failure-visibility]]: when the rule fires, it
+// ALSO calls the wired Heartbeater's markUnhealthy hook so the
+// stderr fallback + /healthz 503 surfaces light up. Riding the
+// alert event through the audit-export channel alone would be
+// invisible when the channel itself is the failure source.
+//
+// Recovery: an observed heartbeat whose seq advances by exactly +1
+// from the prior value calls markHealthy on the wired Heartbeater
+// — the gap was intermittent and the operator's /healthz can flip
+// back to 200 without intervention.
+type heartbeatGapRule struct {
+	missedThreshold int
+	// lastSeq is the most-recent HeartbeatSeq observed. 0 means no
+	// heartbeat has been seen yet (the first observation initializes
+	// the value without firing — the rule needs two ticks worth of
+	// data to compute a gap).
+	lastSeq int64
+	// heartbeater is the optional callback target for the local
+	// stderr + /healthz fallback surfaces. nil → the rule emits the
+	// OCSF alert through the engine as usual but skips the fallback
+	// (used when the rule is wired stand-alone in unit tests).
+	heartbeater *Heartbeater
+}
+
+func (r *heartbeatGapRule) Name() string        { return "heartbeat_gap" }
+func (r *heartbeatGapRule) Description() string { return "Audit-export heartbeat sequence gap detected (audit-export channel may be silenced)" }
+func (r *heartbeatGapRule) Severity() int       { return SeverityHigh }
+
+// bindHeartbeater wires the local fallback hooks. Called by the
+// CLI after BuildBuiltinRules + NewRuleEngine + NewHeartbeater have
+// all run so the rule can flip /healthz + stderr when it fires.
+func (r *heartbeatGapRule) bindHeartbeater(hb *Heartbeater) {
+	r.heartbeater = hb
+}
+
+func (r *heartbeatGapRule) Observe(ev Event, _ time.Time) (AlertFire, bool) {
+	if ev.EventType != EventTypeHeartbeat {
+		return AlertFire{}, false
+	}
+	seq := ev.Unmapped.IAMJIT.HeartbeatSeq
+	if seq <= 0 {
+		// Malformed heartbeat — skip rather than fire on garbage.
+		return AlertFire{}, false
+	}
+	prior := r.lastSeq
+	r.lastSeq = seq
+	if prior == 0 {
+		// First heartbeat observed — initialize state but don't fire.
+		// Gap detection requires two data points.
+		if r.heartbeater != nil {
+			r.heartbeater.markHealthy()
+		}
+		return AlertFire{}, false
+	}
+	gap := seq - prior - 1 // ticks skipped between prior + current
+	if gap < int64(r.missedThreshold) {
+		// In-band tick (or out-of-order; treat as healthy). Recover if
+		// the rule had previously flipped to unhealthy.
+		if r.heartbeater != nil {
+			r.heartbeater.markHealthy()
+		}
+		return AlertFire{}, false
+	}
+	if r.heartbeater != nil {
+		r.heartbeater.markUnhealthy(int(gap), seq)
+	}
+	intervalSeconds := ev.Unmapped.IAMJIT.HeartbeatIntervalSeconds
+	return AlertFire{
+		Detail: fmt.Sprintf(
+			"Pattern heartbeat_gap fired: %d consecutive heartbeats missed "+
+				"between seq %d and seq %d (audit-export channel may be silenced)",
+			gap, prior, seq),
+		WindowSeconds:     intervalSeconds * (int(gap) + 1),
+		MatchedEventCount: int(gap),
+		Suggestion:        SuggestionHeartbeatGap,
+		Ext: map[string]any{
+			"observed_missed_heartbeats":   gap,
+			"observed_last_seq":            seq,
+			"observed_prior_seq":           prior,
+			"observed_interval_seconds":    intervalSeconds,
+			"observed_local_fallback_path": "stderr_and_healthz_503",
+		},
+	}, true
 }
 
 // isAdminFallbackEvent reports whether the event represents a

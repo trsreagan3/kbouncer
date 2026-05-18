@@ -313,10 +313,18 @@ func ToolDescriptors() []map[string]any {
 				"drop counts, in-flight webhook deliveries, and the " +
 				"last-error message for each. Slice 2 (alert rule " +
 				"engine) adds alerts_enabled, alerts_fired_count, and " +
-				"last_alert_pattern so an operator can confirm the four " +
+				"last_alert_pattern so an operator can confirm the five " +
 				"built-in rules (admin_fallback_burst, pause_long, " +
-				"non_org_profile_install, unusual_high_risk_action) are " +
-				"running + see when the most recent one fired. Read-only. " +
+				"non_org_profile_install, unusual_high_risk_action, " +
+				"heartbeat_gap) are running + see when the most recent " +
+				"one fired. Heartbeat fields (heartbeat_enabled, " +
+				"heartbeat_interval_seconds, heartbeat_total_emitted, " +
+				"heartbeat_last_emit_unix_milli, heartbeat_healthy) " +
+				"surface the liveness watchdog per [[prompt-injection-" +
+				"disable-bouncer-threat]] + [[audit-export-failure-" +
+				"visibility]] — when heartbeat_healthy is false the " +
+				"local heartbeatGapRule has fired + /healthz returns " +
+				"503 + a stderr notice was written. Read-only. " +
 				"The webhook URL is returned with userinfo + query " +
 				"stripped; the Bearer token is NEVER returned (and is " +
 				"masked out of any error messages). Use this to confirm " +
