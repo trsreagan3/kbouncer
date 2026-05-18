@@ -183,12 +183,15 @@ func newRunCmd() *cobra.Command {
 		// Slice 1 of #252 — security-team audit-export. Two channels
 		// (operator picks one or both); webhook flags are license-
 		// gated for Enterprise per [[security-team-audit-export]].
-		auditLogPath         string
-		auditLogFsync        bool
-		auditWebhookURL      string
-		auditWebhookToken    string
-		auditWebhookBatch    int
-		allowInternalWebhook bool
+		auditLogPath              string
+		auditLogFsync             bool
+		auditWebhookURL           string
+		auditWebhookToken         string
+		auditWebhookBatch         int
+		allowInternalWebhook      bool
+		auditWebhookPreset        string
+		auditWebhookTags          string
+		auditWebhookSentinelTable string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -353,6 +356,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				auditLogPath, auditLogFsync,
 				auditWebhookURL, auditWebhookToken, auditWebhookBatch,
 				allowInternalWebhook,
+				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
 			)
 			if auditErr != nil {
 				return auditErr
@@ -420,9 +424,13 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 					// MaskedURL strips userinfo + query; token is
 					// NEVER printed (kept only in the WebhookPusher's
 					// outgoing Authorization header).
+					presetLabel := auditWebhookPreset
+					if presetLabel == "" {
+						presetLabel = string(audit.PresetGeneric)
+					}
 					fmt.Fprintf(os.Stderr,
-						"audit webhook: %s (token=***, batch=%d)\n",
-						status.WebhookMaskedURL, auditWebhookBatch)
+						"audit webhook: %s (preset=%s, token=***, batch=%d)\n",
+						status.WebhookMaskedURL, presetLabel, auditWebhookBatch)
 				}
 			}
 			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
@@ -635,6 +643,28 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 		"Opt-out of the SSRF gate on --audit-webhook-url. Required when "+
 			"the collector is on an intranet (RFC1918 / .internal / etc.). "+
 			"Default refuses; the gate mirrors dbounce's MED-D8-06 closure.")
+	// Slice 2 of #252 — per [[audit-webhook-presets]] (#257). Vendor
+	// adapters that reshape the webhook body + auth header to match a
+	// SIEM's native intake. The canonical OCSF event on the JSONL log
+	// file is UNCHANGED — only the webhook body is vendor-shaped.
+	cmd.Flags().StringVar(&auditWebhookPreset, "audit-webhook-preset", "generic",
+		"Webhook body + auth shape. One of: generic | datadog | splunk-hec | "+
+			"sentinel. 'generic' (default) preserves the Slice 1 wire shape "+
+			"(Bearer + JSON array of OCSF events). 'datadog' sets DD-API-KEY + "+
+			"overlays ddsource/service/ddtags/status/host/message per event. "+
+			"'splunk-hec' sends NDJSON with 'Authorization: Splunk <token>'. "+
+			"'sentinel' HMAC-SHA256-signs SharedKey auth for Log Analytics "+
+			"Workspace ingest (--audit-webhook-token must be the base64 "+
+			"workspace shared key for sentinel). The OCSF event in the JSONL "+
+			"log file is unchanged regardless of preset.")
+	cmd.Flags().StringVar(&auditWebhookTags, "audit-webhook-tags", "",
+		"Free-form comma-separated tag string appended to Datadog's ddtags. "+
+			"Example: env:prod,team:platform. Ignored by other presets.")
+	cmd.Flags().StringVar(&auditWebhookSentinelTable, "audit-webhook-sentinel-table",
+		audit.SentinelDefaultTable,
+		"Log Analytics custom-log table name for the sentinel preset. "+
+			"Becomes the Log-Type header on every POST; Sentinel auto-creates "+
+			"the table on first ingest. Ignored by other presets.")
 	return cmd
 }
 
@@ -653,10 +683,17 @@ func buildAuditManager(
 	logPath string, logFsync bool,
 	webhookURL, webhookToken string, webhookBatch int,
 	allowInternal bool,
+	webhookPreset, webhookTags, webhookSentinelTable string,
 ) (*audit.Manager, func(), error) {
 	noop := func() {}
 	if logPath == "" && webhookURL == "" {
 		return nil, noop, nil
+	}
+	// Validate the preset name up front so a typo surfaces before
+	// the license gate (gives the operator a single clear error per
+	// run rather than fixing one then hitting the next).
+	if _, err := audit.ParsePreset(webhookPreset); err != nil {
+		return nil, noop, err
 	}
 	var logWriter *audit.LogWriter
 	var webhookPusher *audit.WebhookPusher
@@ -679,6 +716,8 @@ func buildAuditManager(
 	_ = webhookToken // referenced when license-file plumbing lands
 	_ = webhookBatch
 	_ = allowInternal
+	_ = webhookTags
+	_ = webhookSentinelTable
 	mgr := audit.NewManager(audit.ManagerOptions{
 		LogWriter:     logWriter,
 		WebhookPusher: webhookPusher,

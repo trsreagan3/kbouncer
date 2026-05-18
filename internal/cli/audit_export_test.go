@@ -30,6 +30,7 @@ func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
 		"some-bearer-token",
 		1,
 		false,
+		"generic", "", audit.SentinelDefaultTable,
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrLicenseRequired,
@@ -47,6 +48,7 @@ func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 		t.Context(),
 		dir+"/audit.jsonl", false,
 		"", "", 1, false,
+		"generic", "", audit.SentinelDefaultTable,
 	)
 	require.NoError(t, err, "JSONL log alone should not require an Enterprise license")
 	require.NotNil(t, mgr)
@@ -65,6 +67,7 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 		t.Context(),
 		"", false,
 		"", "", 1, false,
+		"generic", "", audit.SentinelDefaultTable,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, mgr, "no flags → no Manager constructed")

@@ -5,6 +5,42 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Audit-export webhook presets (2026-05-18, #257)
+
+Adds `--audit-webhook-preset` so the webhook body + auth header can
+match a SIEM's native intake without an external transformer. The
+canonical OCSF event written to the JSONL log file is UNCHANGED —
+only the webhook body gets vendor-shaped at send-time.
+
+Supported presets:
+
+- `generic` (default) — backward-compat. `Authorization: Bearer
+  <token>` + `Content-Type: application/json` + JSON-array body of
+  OCSF events. Byte-identical to the Slice 1 (#252) wire shape.
+- `datadog` — `DD-API-KEY: <token>` header. Per-event overlay layers
+  `ddsource`, `service`, `ddtags`, `status` (derived from OCSF
+  `status_id`), `host` (from `src_endpoint`), and a neutral
+  `message` summary line. OCSF originals are preserved (vendor-
+  reserved field collisions get shadow-copied under `ocsf.<name>`).
+  Operator-supplied tags via `--audit-webhook-tags`.
+- `splunk-hec` — `Authorization: Splunk <token>` header. NDJSON
+  body where each line wraps the OCSF event under the HEC `event`
+  field with `sourcetype` (`iam_jit:bouncer:kbounce`), `source`,
+  `host`, and `time` (unix seconds derived from OCSF `time`).
+- `sentinel` — HMAC-SHA256-signed `SharedKey` Authorization for the
+  Log Analytics Workspace Data Collector API. Workspace ID is
+  extracted from the URL host; `--audit-webhook-token` must be the
+  base64 workspace shared key. Log-Type table name configurable via
+  `--audit-webhook-sentinel-table` (default `IamJitBouncer`).
+
+Per `[[scorer-is-ground-truth]]`: the adapter is pure transformation
+— no scoring, no LLM, no re-evaluation of severity / status /
+verdict. Per `[[security-team-positioning-safety-not-surveillance]]`:
+overlay language stays neutral. License-gate placeholder unchanged
+(real Ed25519 plumbing per #235); presets are orthogonal. Security
+Lake adapter ships in a separate slice (#258 — S3 + parquet,
+different transport).
+
 ### Cross-product agent-parity closure (2026-05-17)
 
 Closes the two pre-launch parity gaps with `ibounce` flagged by

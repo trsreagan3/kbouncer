@@ -3,7 +3,6 @@ package audit
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,6 +36,13 @@ type WebhookPusher struct {
 	batchSize     int
 	client        *http.Client
 
+	// preset selects the per-vendor adapter that builds the outgoing
+	// (url, headers, body) tuple. Generic = backward-compat Bearer +
+	// JSON-array body, byte-identical to the Slice 1 shape.
+	preset        Preset
+	tags          string
+	sentinelTable string
+
 	queue   chan Event
 	done    chan struct{}
 	wg      sync.WaitGroup
@@ -58,6 +64,17 @@ type WebhookOptions struct {
 	AllowInternal bool
 	BatchSize     int
 	QueueDepth    int
+	// Preset selects the per-vendor adapter. Empty / "generic" =
+	// backward-compat Bearer + JSON-array body. Named presets layer
+	// vendor-native fields + auth headers per [[audit-webhook-presets]].
+	Preset Preset
+	// Tags is an operator-supplied free-form string appended to
+	// Datadog's ddtags. Ignored by other presets (but threaded through
+	// so MCP status / banner can surface what was configured).
+	Tags string
+	// SentinelTable names the Log Analytics custom-log table for the
+	// sentinel preset. Defaults to SentinelDefaultTable when unset.
+	SentinelTable string
 	// HTTPClient lets tests inject a custom transport (httptest.Server).
 	// Production callers leave nil → a sensible default with bounded
 	// timeouts.
@@ -124,6 +141,15 @@ func NewWebhookPusher(ctx context.Context, opts WebhookOptions) (*WebhookPusher,
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
+	preset := opts.Preset
+	if preset == "" {
+		preset = PresetGeneric
+	}
+	// Validate the preset name at construction so a typo surfaces at
+	// startup rather than on the first decision event.
+	if _, err := ParsePreset(string(preset)); err != nil {
+		return nil, err
+	}
 	wp := &WebhookPusher{
 		url:           opts.URL,
 		maskedURL:     maskURL(opts.URL),
@@ -131,6 +157,9 @@ func NewWebhookPusher(ctx context.Context, opts WebhookOptions) (*WebhookPusher,
 		allowInternal: opts.AllowInternal,
 		batchSize:     batch,
 		client:        client,
+		preset:        preset,
+		tags:          opts.Tags,
+		sentinelTable: opts.SentinelTable,
 		queue:         make(chan Event, depth),
 		done:          make(chan struct{}),
 	}
@@ -188,12 +217,25 @@ func (wp *WebhookPusher) run(ctx context.Context) {
 // deliver runs the retry loop for one event. Increments inFlight
 // for the duration so the MCP status tool can surface queue depth +
 // in-flight count separately.
+//
+// Per [[audit-webhook-presets]]: the preset adapter (BuildRequest)
+// converts the OCSF event into the per-vendor (url, headers, body)
+// tuple. The canonical OCSF event on the JSONL log file is unaffected
+// — only the webhook body gets vendor-shaped.
 func (wp *WebhookPusher) deliver(ctx context.Context, ev Event) {
 	wp.inFlight.Add(1)
 	defer wp.inFlight.Add(-1)
-	body, err := json.Marshal(ev)
+	cfg := PresetConfig{
+		URL:           wp.url,
+		Token:         wp.token,
+		Tags:          wp.tags,
+		SentinelTable: wp.sentinelTable,
+		Product:       ProductName,
+	}
+	targetURL, headers, body, err := BuildRequest(wp.preset, cfg, []Event{ev})
 	if err != nil {
-		wp.lastErr.Store(fmt.Sprintf("marshal event id=%d: %v", ev.DecisionID, err))
+		wp.lastErr.Store(fmt.Sprintf("build request (preset=%s): %s",
+			wp.preset, maskTokenInString(err.Error(), wp.token)))
 		return
 	}
 	for attempt := 0; attempt < MaxWebhookAttempts; attempt++ {
@@ -204,7 +246,7 @@ func (wp *WebhookPusher) deliver(ctx context.Context, ev Event) {
 			return
 		default:
 		}
-		err := wp.sendOnce(ctx, body)
+		err := wp.sendOnce(ctx, targetURL, headers, body)
 		if err == nil {
 			wp.total.Add(1)
 			wp.lastErr.Store("")
@@ -236,15 +278,19 @@ func (wp *WebhookPusher) deliver(ctx context.Context, ev Event) {
 	wp.dropped.Add(1)
 }
 
-// sendOnce performs one HTTP POST. Returns nil on 2xx; an error on
-// transport failure or non-2xx response.
-func (wp *WebhookPusher) sendOnce(ctx context.Context, body []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wp.url, bytes.NewReader(body))
+// sendOnce performs one HTTP POST with the preset-built URL, headers,
+// and body. Returns nil on 2xx; an error on transport failure or
+// non-2xx response. The User-Agent is set unconditionally so the
+// collector can correlate the source binary across presets; per-preset
+// adapters control Content-Type + auth headers.
+func (wp *WebhookPusher) sendOnce(ctx context.Context, targetURL string, headers map[string]string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+wp.token)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("User-Agent", "kbounce-audit/"+OCSFSchemaVersion)
 	resp, err := wp.client.Do(req)
 	if err != nil {
