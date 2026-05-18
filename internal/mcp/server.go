@@ -446,6 +446,8 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolListPresets(args)
 	case "kbounce_audit_export_status":
 		return s.toolAuditExportStatus(args)
+	case "list_audit_webhook_presets":
+		return s.toolListAuditWebhookPresets(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }
@@ -499,6 +501,34 @@ func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error)
 		"heartbeat_last_emit_unix_milli": st.HeartbeatLastEmitUnixMilli,
 		"heartbeat_healthy":              st.HeartbeatHealthy,
 	}, nil
+}
+
+// toolListAuditWebhookPresets is the agent-facing surface mirroring
+// `kbounce audit-webhook presets list --json`. Returns the same
+// descriptor list the CLI emits so an agent can discover the webhook
+// preset shapes the bouncer speaks without spawning a subprocess.
+//
+// Per [[cross-product-agent-parity]]: identical JSON shape across
+// ibounce / kbounce / dbounce. Per [[scorer-is-ground-truth]]: the
+// descriptor list is static — the tool just defers to the shared
+// CLI helper.
+func (s *Server) toolListAuditWebhookPresets(_ map[string]any) (map[string]any, error) {
+	descriptors := audit.PresetDescriptors()
+	// Round-trip through JSON so the wire shape (lowercase, snake_case
+	// field names) matches what `kbounce audit-webhook presets list
+	// --json` emits + matches the ibounce + dbounce siblings. The
+	// in-package Go struct uses upper-camel names; the json tags on
+	// the struct already enforce the wire shape, so a JSON round-trip
+	// is the cleanest path to `map[string]any` for the MCP envelope.
+	body, err := json.Marshal(descriptors)
+	if err != nil {
+		return nil, fmt.Errorf("list_audit_webhook_presets: marshal: %w", err)
+	}
+	var presets []map[string]any
+	if err := json.Unmarshal(body, &presets); err != nil {
+		return nil, fmt.Errorf("list_audit_webhook_presets: unmarshal: %w", err)
+	}
+	return map[string]any{"presets": presets}, nil
 }
 
 // requireStore is the shared precondition check for tools that need

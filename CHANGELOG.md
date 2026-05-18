@@ -5,6 +5,43 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Schema endpoint + audit-webhook presets surface (2026-05-18, #276 + #259)
+
+Cross-product `[[cross-product-agent-parity]]` rollout matching the
+ibounce + dbounce siblings:
+
+- **`GET /schemas/config` HTTP endpoint** (#276) — kbounce's proxy
+  port serves the embedded `kbounce-config.schema.json` byte-for-byte
+  at `Content-Type: application/schema+json`. Agents that want to
+  validate a proposed `kbounce config import` payload against the
+  LIVE bouncer's accepted shape fetch this rather than relying on a
+  stale GitHub URL. READ-only (PUT/POST/DELETE return 405); no auth
+  (matches `/healthz` — the schema is non-sensitive metadata). The
+  served bytes are an in-tree build-time copy of
+  `schemas/kbounce-config.schema.json`; a test asserts byte-equality
+  so a drift between the embedded copy + the published copy fails
+  the build.
+- **`kbounce audit-webhook presets list`** (#259) — operator-facing
+  subcommand that prints the four webhook preset shapes the binary
+  speaks (`generic`, `datadog`, `splunk-hec`, `sentinel`) + each
+  preset's required + optional flags + auth header + body shape.
+  `--json` flag emits the structured descriptor list for agent
+  consumption. Mirrors the new `list_audit_webhook_presets` MCP tool
+  + the matching `ibounce` + `dbounce` subcommands. Per
+  `[[audit-webhook-presets]]`.
+- **`list_audit_webhook_presets` MCP tool** (#259) — agent-facing
+  surface returning the same descriptor list `kbounce audit-webhook
+  presets list --json` emits. Identical JSON shape across `ibounce`
+  / `kbounce` / `dbounce` so cross-product orchestration code calls
+  the matching tool on each bouncer and collates the results
+  uniformly.
+- **`audit.PresetDescriptors()` shared helper** — single source of
+  truth for the preset descriptor list. Both `internal/cli/audit_webhook.go`
+  + `internal/mcp/server.go` import it so the CLI surface + MCP
+  surface can never drift. A test asserts every name in
+  `audit.AllPresets()` shows up in the descriptor list (cross-pack
+  drift guard).
+
 ### Persist agent identity in the SQLite decisions table (2026-05-18, #289)
 
 Closes the `[[kbounce-agent-identity-sqlite-gap]]` parity gap: until

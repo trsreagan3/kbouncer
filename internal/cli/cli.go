@@ -113,6 +113,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newProfileCmd())
 	root.AddCommand(newAuditCmd())
 	root.AddCommand(newAuditExportCmd())
+	root.AddCommand(newAuditWebhookCmd())
 	root.AddCommand(newPauseCmd())
 	root.AddCommand(newPromptsCmd())
 	root.AddCommand(newRulesCmd())

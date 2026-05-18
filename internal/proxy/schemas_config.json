@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/trsreagan3/kbouncer/blob/main/schemas/kbounce-config.schema.json",
+  "title": "kbounce config export",
+  "description": "Schema for the JSON body emitted by `kbounce config export` and consumed by `kbounce config import`. Per [[basic-app-hygiene-features]] TIER 1 #2. Cross-product cousin to ibounce-config and dbounce-config schemas; the top-level `product` field gates per-product import refusal.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "product",
+    "exported_at",
+    "binary_version",
+    "profiles",
+    "rules",
+    "tasks",
+    "presets",
+    "audit_export",
+    "license_pointer",
+    "runtime_config"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Wire-format version. Currently \"1.0\" (string semver) per the #288 cross-product reconciliation. Pre-#288 exports carrying `schema_version: 1` (int) are accepted by the importer (normalized + a stderr deprecation warning is printed). Future minor versions add fields without bumping; major bumps land as \"2.0\" with a clear cross-binary error.",
+      "type": "string",
+      "enum": ["1.0"]
+    },
+    "product": {
+      "description": "Product name. Must be \"kbounce\" for a kbounce import.",
+      "type": "string",
+      "enum": ["kbounce"]
+    },
+    "exported_at": {
+      "description": "ISO-8601 UTC timestamp the export was generated.",
+      "type": "string"
+    },
+    "binary_version": {
+      "description": "Version of the kbounce binary that produced the export.",
+      "type": "string"
+    },
+    "profiles": {
+      "description": "All profiles (local + installed-from-URL).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"},
+          "description": {"type": "string"},
+          "source": {"type": "string"},
+          "deny_keywords": {"type": "array", "items": {"type": "string"}},
+          "keyword_targets": {"type": "array", "items": {"type": "string"}},
+          "keyword_match": {"type": "string"},
+          "only_clusters": {"type": "array", "items": {"type": "string"}},
+          "deny_verbs": {"type": "array", "items": {"type": "string"}},
+          "exempt_resources_for_verb_deny": {"type": "object"},
+          "deny_on_impersonation": {"type": "boolean"},
+          "deny_subresource_writes": {"type": "boolean"},
+          "exceptions": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "rules": {
+      "description": "Global rules-table rows.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "effect"],
+        "properties": {
+          "pattern": {"type": "string"},
+          "effect": {"type": "string", "enum": ["allow", "deny"]},
+          "namespace_scope": {"type": "string"},
+          "resource_scope": {"type": "string"},
+          "verb_scope": {"type": "string"},
+          "note": {"type": "string"},
+          "origin": {"type": "string"}
+        }
+      }
+    },
+    "tasks": {
+      "description": "Tasks-table rows. Free-form per-row shape — task wire model is consumed by review/audit tooling, not by the importer (tasks are recreated as audit-trail rows).",
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "presets": {
+      "description": "Built-in + installed presets (rule packs).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "rules"],
+        "properties": {
+          "name": {"type": "string"},
+          "description": {"type": "string"},
+          "builtin": {"type": "boolean"},
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["pattern", "effect"],
+              "properties": {
+                "pattern": {"type": "string"},
+                "effect": {"type": "string", "enum": ["allow", "deny"]},
+                "namespace_scope": {"type": "string"},
+                "resource_scope": {"type": "string"},
+                "verb_scope": {"type": "string"},
+                "note": {"type": "string"},
+                "origin": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "audit_export": {
+      "description": "Audit-export channel configuration. Token field is masked unless --with-secrets was passed at export time; the token_masked boolean records which mode was used.",
+      "type": "object",
+      "required": ["token_masked"],
+      "properties": {
+        "log_path": {"type": "string"},
+        "log_fsync": {"type": "boolean"},
+        "webhook_url": {"type": "string"},
+        "webhook_token": {"type": "string"},
+        "token_masked": {"type": "boolean"},
+        "webhook_batch": {"type": "integer"},
+        "webhook_preset": {"type": "string"},
+        "webhook_tags": {"type": "string"}
+      }
+    },
+    "license_pointer": {
+      "description": "On-disk path of the installed Enterprise license file, or empty if none. Stub for #235.",
+      "type": "string"
+    },
+    "runtime_config": {
+      "description": "Mode + default-policy snapshot. Free-form so future runtime keys land without a schema bump.",
+      "type": "object"
+    }
+  }
+}
