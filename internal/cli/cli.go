@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -219,6 +220,11 @@ func newRunCmd() *cobra.Command {
 		// #271 — bearer token for GET /audit/events when the proxy is
 		// bound off-loopback. Empty = loopback-only (no auth gate).
 		auditEventsToken string
+		// #254 — deployment preset. Single-flag shortcut for a common
+		// deployment shape (only `security-observe` in v1.0). Resolved
+		// BEFORE downstream validation so license / SSRF / loopback
+		// gates see the preset-resolved values.
+		deploymentPreset string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -233,6 +239,77 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 + env-var indirection. Ctrl+C exits cleanly (graceful shutdown).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// #254 — deployment preset resolution. Runs BEFORE any
+			// downstream parsing / validation so the preset-resolved
+			// values flow through everything that follows (mode parse,
+			// license gate, bind validation, etc.). HARD-override
+			// conflicts (e.g. --preset security-observe --mode
+			// cooperative) fail-fast here with a "drop one OR the
+			// other" message. SOFT overrides flow through. The
+			// preset's BANNER lines are stashed for printing alongside
+			// the existing startup banner so the operator sees what
+			// changed.
+			var presetBannerLines []string
+			if deploymentPreset != "" {
+				preset := GetPreset(deploymentPreset, "kbounce")
+				if preset == nil {
+					return fmt.Errorf(
+						"kbounce: unknown --preset %q; available: security-observe",
+						deploymentPreset)
+				}
+				operatorChanged := map[string]bool{
+					"mode":               cmd.Flags().Changed("mode"),
+					"default-policy":     cmd.Flags().Changed("default-policy"),
+					"audit-log-path":     cmd.Flags().Changed("audit-log-path"),
+					"alert-rules":        cmd.Flags().Changed("alert-rules"),
+					"heartbeat-interval": cmd.Flags().Changed("heartbeat-interval"),
+				}
+				currentValues := map[string]string{
+					"mode":               modeStr,
+					"default-policy":     defaultPolStr,
+					"audit-log-path":     auditLogPath,
+					"alert-rules":        auditAlertRulesPath,
+					"heartbeat-interval": auditHeartbeatInterval.String(),
+				}
+				// #254 + #235 — until license-file plumbing lands,
+				// kbounce's --alert-rules surface is a hard ENTERPRISE
+				// gate (returns ErrAlertRulesLicenseRequired before any
+				// rule loads). The preset SKIPS this setting in v1.0
+				// per the spec's "if a product doesn't support a
+				// canonical setting, skip + annotate in the banner;
+				// don't error" guidance. When #235 lands, drop this
+				// skip set so the preset wires --alert-rules through
+				// like the other settings.
+				skipKeys := map[string]bool{"alert-rules": true}
+				res, err := ApplyPreset(preset, operatorChanged, currentValues, skipKeys)
+				if err != nil {
+					return err
+				}
+				// Rebind the locals from the preset where the operator
+				// did not override.
+				for _, key := range res.DerivedKeys {
+					pv := preset.Values[key]
+					switch key {
+					case "mode":
+						modeStr = pv.Value
+					case "default-policy":
+						defaultPolStr = pv.Value
+					case "audit-log-path":
+						auditLogPath = pv.Value
+						// Pre-create the parent dir so the JSONL
+						// writer's open() does not fail on first run.
+						if d := filepath.Dir(auditLogPath); d != "" {
+							_ = os.MkdirAll(d, 0o700)
+						}
+					case "alert-rules":
+						auditAlertRulesPath = pv.Value
+					case "heartbeat-interval":
+						auditHeartbeatInterval = MustParseDuration(pv.Value)
+					}
+				}
+				presetBannerLines = FormatBanner(preset, res)
+			}
+
 			mode, err := proxy.ParseMode(modeStr)
 			if err != nil {
 				return err
@@ -448,6 +525,13 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			fmt.Fprintf(os.Stderr,
 				"kbounce proxy starting on %s://%s:%d (mode=%s, default-policy=%s, profile=%s)\n",
 				scheme, cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name)
+			// #254 — preset-derivation banner sits RIGHT AFTER the
+			// address line so the operator immediately sees which
+			// settings came from the preset. Same format across all
+			// four Bounce products per [[cross-product-agent-parity]].
+			for _, line := range presetBannerLines {
+				fmt.Fprintln(os.Stderr, line)
+			}
 			if cfg.TLSCertPath != "" {
 				fmt.Fprintf(os.Stderr, "tls cert: %s\n", cfg.TLSCertPath)
 				fmt.Fprintf(os.Stderr, "tls key:  %s\n", cfg.TLSKeyPath)
@@ -772,6 +856,21 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"proxy is bound externally. Empty + loopback bind = no auth "+
 			"required (the loopback bind is the trust anchor). Empty + "+
 			"external bind = kbounce refuses to start.")
+	// #254 — deployment preset. Single-flag shortcut for a common
+	// deployment shape. v1.0 ships only `security-observe` per
+	// [[deliberate-feature-completion]]; the framework supports more
+	// (see docs/DEPLOYMENT-PRESETS.md for the roadmap).
+	cmd.Flags().StringVar(&deploymentPreset, "preset", "",
+		"#254 — single-flag shortcut for a common deployment shape. "+
+			"security-observe = transparent mode + JSONL audit + alert "+
+			"rules (defaults) + 30s heartbeat. Designed for the security-"+
+			"team 'gather data first; author profile second' starting "+
+			"shape per [[bouncer-mode-selection-for-agents]]. Some preset "+
+			"values are HARD (e.g. --mode for security-observe — the "+
+			"entire point of the preset is transparent); passing them "+
+			"with a different value is an error. Others are SOFT (e.g. "+
+			"--audit-log-path); the operator's value wins. Startup banner "+
+			"shows which settings are derived from the preset.")
 	return cmd
 }
 

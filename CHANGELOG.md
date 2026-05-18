@@ -5,6 +5,37 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### `--preset security-observe` deployment preset (2026-05-19, #254)
+
+- **`kbounce run --preset security-observe`** — single-flag shortcut
+  for the canonical security-team observation deployment shape.
+  Equivalent to the explicit flag bundle `--mode transparent
+  --default-policy allow --audit-log-path ~/.kbouncer/audit/kbounce.jsonl
+  --alert-rules defaults --heartbeat-interval 30s`. Designed for the
+  "gather data first; author profile second" starting position per
+  `[[bouncer-mode-selection-for-agents]]` + the cross-product
+  security-team audit-export memo.
+- HARD override on `--mode` (the entire point of the preset is
+  transparent); passing `--preset security-observe --mode cooperative`
+  errors fast with a clear "drop the preset OR drop the explicit flag"
+  message.
+- SOFT overrides on `--audit-log-path` / `--alert-rules` /
+  `--heartbeat-interval` / `--default-policy` (operators have
+  different SIEM destinations + tunings).
+- Startup banner names the preset + every derived setting with
+  hard/soft annotation. Same preset name + same override semantics
+  ship across `ibounce` / `dbounce` / `gbounce` per
+  `[[cross-product-agent-parity]]`.
+- Framework + the post-v1.0 roadmap (`dev-loop`, `production-strict`,
+  `compliance-audit`) are documented in `docs/DEPLOYMENT-PRESETS.md`
+  but explicitly NOT shipped in this slice per
+  `[[deliberate-feature-completion]]`.
+- Per `[[security-team-positioning-safety-not-surveillance]]`: preset
+  description + banner use neutral language.
+- Per `[[self-host-zero-billing-dependency]]`: the preset does NOT
+  configure `--audit-webhook-url`; a self-hosted security-observe
+  deployment phones home to nothing without an operator action.
+
 ### Schema endpoint + audit-webhook presets surface (2026-05-18, #276 + #259)
 
 Cross-product `[[cross-product-agent-parity]]` rollout matching the

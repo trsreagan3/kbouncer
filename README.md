@@ -153,6 +153,11 @@ Start the HTTP proxy. The most-used flags:
 - `--prompt-on-deny` — async deny-prompt UX. Every transparent-mode
   DENY queues a prompt the operator can answer later via
   `kbounce prompts answer`.
+- `--preset security-observe` — single-flag shortcut for the
+  canonical security-team observation deployment shape (transparent
+  mode + JSONL audit + alert rules + 30s heartbeat). See
+  `docs/DEPLOYMENT-PRESETS.md` for the framework + override
+  semantics; same preset NAME ships across all four Bounce products.
 
 ### `kbounce init-tls`
 
