@@ -121,6 +121,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newInitTLSCmd())
 	root.AddCommand(newMCPCmd())
 	root.AddCommand(newVersionCheckCmd())
+	root.AddCommand(newConfigCmd())
 	return root
 }
 
