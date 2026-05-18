@@ -337,6 +337,58 @@ func ToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name": "kbounce_prompts_bulk_pending",
+			"description": "Read-only burst introspection per the [[bulk-" +
+				"prompt-answer-ux]] memo. Returns the most-recent unresolved " +
+				"BURST_DETECTED event (or burst_id=0 if none), the count of " +
+				"currently-pending prompts, the deduplicated (verb, resource) " +
+				"tuples those prompts cover, and the list of available bulk-" +
+				"answer dispositions. Always available. Use this to surface " +
+				"'you have N pending prompts since HH:MM' to the operator " +
+				"before recommending the right disposition. Pairs with " +
+				"kbounce_prompts_bulk_answer (which is operator-gated by " +
+				"design).",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			"name": "kbounce_prompts_bulk_answer",
+			"description": "Resolve a burst of pending DENY prompts with one " +
+				"disposition. GATED behind an operator-set shared secret per " +
+				"the [[bulk-prompt-answer-ux]] memo's 'Don't' list: an " +
+				"adversarial agent that could call this without authorization " +
+				"could bulk-allow itself + defeat the operator-in-loop intent. " +
+				"Operator wires the gate by passing --bulk-answer-mcp-token " +
+				"<secret> to `kbounce mcp serve` AND configuring the agent " +
+				"UI to send that secret in args.operator_token. " +
+				"Dispositions: session = 24h TTL bulk-allow rules; 3h = 3-hour " +
+				"TTL; 10min = 10-minute TTL; profile = hot-swap to args.profile " +
+				"name; none = mark answered with no rule change. Default OFF " +
+				"(no token configured → tool always refuses).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"decision": map[string]any{
+						"type": "string",
+						"enum": []string{"session", "3h", "10min", "profile", "none"},
+					},
+					"profile": map[string]any{
+						"type":        "string",
+						"description": "Required when decision=profile. The profile name to hot-swap to.",
+					},
+					"operator_token": map[string]any{
+						"type": "string",
+						"description": "Operator's shared secret from --bulk-answer-mcp-token. " +
+							"Required when the gate is enabled (always required at runtime; " +
+							"the tool refuses when the operator hasn't enabled the gate).",
+					},
+				},
+				"required": []string{"decision", "operator_token"},
+			},
+		},
+		{
 			"name": "kbounce_pending_sync_prompts",
 			"description": "List the pending_prompts rows that the " +
 				"running proxy is CURRENTLY blocked on waiting for an " +

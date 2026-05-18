@@ -30,8 +30,25 @@ import (
 var ErrInvalidRule = errors.New("kbounce: invalid rule")
 
 // AddRule persists a rule + returns its row id. Rejects malformed
-// patterns / effects via ErrInvalidRule wrapping.
+// patterns / effects via ErrInvalidRule wrapping. Permanent rule shape;
+// callers that want a time-bounded rule (the bulk-answer flow) should
+// use AddTimeBoundedRule.
 func (s *Store) AddRule(r rules.ProxyRule) (rules.ID, error) {
+	return s.AddTimeBoundedRule(r, time.Time{}, "")
+}
+
+// AddTimeBoundedRule is AddRule with an optional expiry + an actor name.
+// expiresAt zero-value = permanent (matches AddRule). createdBy is the
+// operator / "bulk-answer" / "mcp" label stored on the row for audit
+// review; empty string is allowed for back-compat with the AddRule
+// signature.
+//
+// Per [[creates-never-mutates]] + the bulk-answer-ux memo: the row is
+// NEVER deleted at expiry. LoadRuleSet filters out rows whose
+// expires_at is in the past; the audit history remains intact so a
+// post-hoc reviewer can answer "what was allowed at 14:02 inside the
+// 10-minute bulk window?"
+func (s *Store) AddTimeBoundedRule(r rules.ProxyRule, expiresAt time.Time, createdBy string) (rules.ID, error) {
 	if _, _, err := rules.ParsePattern(r.Pattern); err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrInvalidRule, err)
 	}
@@ -45,15 +62,21 @@ func (s *Store) AddRule(r rules.ProxyRule) (rules.ID, error) {
 	if r.Origin == "" {
 		r.Origin = rules.OriginUser
 	}
+	var expiresStr any
+	if !expiresAt.IsZero() {
+		expiresStr = expiresAt.UTC().Format("2006-01-02T15:04:05Z")
+	}
 	res, err := s.db.Exec(
 		`INSERT INTO rules(pattern, effect, namespace_scope, resource_scope,
-		                   verb_scope, note, origin, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		                   verb_scope, note, origin, created_at,
+		                   expires_at, created_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.Pattern, string(r.Effect),
 		nullableString(r.NamespaceScope), nullableString(r.ResourceScope),
 		nullableString(r.VerbScope), nullableString(r.Note),
 		r.Origin,
 		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		expiresStr, createdBy,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("kbounce: add rule: %w", err)
@@ -143,14 +166,20 @@ func (s *Store) RemoveRule(id rules.ID) (bool, error) {
 	return n > 0, nil
 }
 
-// LoadRuleSet snapshots the full rules table into a *rules.RuleSet for
-// the proxy's evaluator. Called once per decision in K-Slice 3 — the
-// table is small (a few hundred rules in realistic deployments) so
-// reading on every request keeps the implementation simple. If the
-// table grows we'll add an in-memory cache invalidated via a config
-// event hook.
+// LoadRuleSet snapshots the rules table into a *rules.RuleSet for the
+// proxy's evaluator. Called once per decision in K-Slice 3 — the table
+// is small (a few hundred rules in realistic deployments) so reading on
+// every request keeps the implementation simple.
+//
+// Per [[bulk-prompt-answer-ux]]: rows whose expires_at is in the past
+// are SKIPPED here (not deleted; per [[creates-never-mutates]] the audit
+// trail is preserved). The filter is wall-clock at call time so a
+// 10-minute bulk-answer window's rules go inert exactly when the clock
+// crosses expiry — no sweeper goroutine required for correctness; the
+// background sweeper exists only to surface "this rule expired" in
+// `kbounce rules list`.
 func (s *Store) LoadRuleSet() (*rules.RuleSet, error) {
-	stored, err := s.ListRules()
+	stored, err := s.ListActiveRules(time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +188,63 @@ func (s *Store) LoadRuleSet() (*rules.RuleSet, error) {
 		flat = append(flat, sr.Rule)
 	}
 	return rules.NewRuleSet(flat), nil
+}
+
+// ListActiveRules returns rules whose expires_at is NULL (permanent) or
+// strictly greater than `now`. Same ordering as ListRules (insertion).
+// Callers that want EVERY row regardless of expiry (e.g. the CLI's
+// `rules list` for audit review) should use ListRules.
+func (s *Store) ListActiveRules(now time.Time) ([]rules.StoredRule, error) {
+	nowStr := now.UTC().Format("2006-01-02T15:04:05Z")
+	rs, err := s.db.Query(
+		`SELECT id, pattern, effect,
+		        COALESCE(namespace_scope, ''), COALESCE(resource_scope, ''),
+		        COALESCE(verb_scope, ''), COALESCE(note, ''), COALESCE(origin, 'user')
+		 FROM rules
+		 WHERE expires_at IS NULL OR expires_at > ?
+		 ORDER BY id`, nowStr)
+	if err != nil {
+		return nil, fmt.Errorf("kbounce: list active rules: %w", err)
+	}
+	defer rs.Close()
+	out := make([]rules.StoredRule, 0, 16)
+	for rs.Next() {
+		var (
+			id     int64
+			effect string
+			r      rules.ProxyRule
+		)
+		if err := rs.Scan(&id, &r.Pattern, &effect, &r.NamespaceScope,
+			&r.ResourceScope, &r.VerbScope, &r.Note, &r.Origin); err != nil {
+			return nil, fmt.Errorf("kbounce: list active rules scan: %w", err)
+		}
+		eff := rules.Effect(effect)
+		if !eff.IsValid() {
+			continue
+		}
+		r.Effect = eff
+		out = append(out, rules.StoredRule{ID: rules.ID(id), Rule: r})
+	}
+	if err := rs.Err(); err != nil {
+		return nil, fmt.Errorf("kbounce: list active rules iterate: %w", err)
+	}
+	return out, nil
+}
+
+// CountExpiredRules returns the count of rules whose expires_at has
+// passed (relative to `now`). Used by the background sweeper +
+// /healthz introspection so an operator can see "I have 12 expired
+// bulk-answer rules in the audit trail." Pure read; never mutates.
+func (s *Store) CountExpiredRules(now time.Time) (int64, error) {
+	nowStr := now.UTC().Format("2006-01-02T15:04:05Z")
+	var n int64
+	row := s.db.QueryRow(
+		`SELECT COUNT(*) FROM rules
+		 WHERE expires_at IS NOT NULL AND expires_at <= ?`, nowStr)
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("kbounce: count expired rules: %w", err)
+	}
+	return n, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -52,7 +52,9 @@ import (
 //	4 — add pending_prompts (#5 async deny-prompt UX, v1.0 subset)
 //	5 — add decisions.is_stream + decisions.stream_kind (K-Slice 5)
 //	6 — add pending_prompts.sync_wait_id (#203 synchronous deny-prompt v1.1)
-const SchemaVersion = 6
+//	7 — add rules.expires_at + rules.created_by + bulk-answer state tables
+//	    (bulk-prompt-answer-ux: burst events + profile-switch reload signal)
+const SchemaVersion = 7
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
@@ -313,6 +315,60 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_prompts_sync_wait_id
 		ON pending_prompts(sync_wait_id) WHERE sync_wait_id IS NOT NULL`); err != nil {
 		return fmt.Errorf("kbounce: create idx_pending_prompts_sync_wait_id: %w", err)
+	}
+
+	// v7 additive migration ([[bulk-prompt-answer-ux]] memo):
+	// - rules.expires_at: NULL = permanent (existing behavior); non-NULL
+	//   timestamp = the row is honored by LoadRuleSet only while
+	//   wall-clock < expires_at. Per [[creates-never-mutates]] the row
+	//   is NEVER deleted at expiry — the audit trail keeps the full
+	//   history of "what was allowed when." LoadRuleSet filters; the
+	//   row stays in the table.
+	// - rules.created_by: actor that added the rule (operator name /
+	//   "bulk-answer" / "mcp"). Lets bulk-answer rows be enumerated
+	//   without re-parsing the note field.
+	// - burst_events: one row per BURST_DETECTED event the proxy emits.
+	//   Read by `kbounce prompts bulk-answer` (CLI surfaces "n prompts
+	//   in m seconds; how to handle?") + by the bulk-answer MCP tool
+	//   so an agent can introspect the same burst state. Persisting
+	//   the event (rather than an in-memory shape) lets cross-process
+	//   `kbounce prompts bulk-answer` see what the running proxy
+	//   detected.
+	// - profile_reload_signal: cross-process channel for the
+	//   profile-switch bulk-answer option. The CLI / MCP writes the
+	//   desired profile name; the running proxy's poll loop picks it
+	//   up + hot-swaps its active profile pointer. Single-row table
+	//   (pk=1) so writes are idempotent overwrites.
+	if err := s.addColumnIfMissing("rules", "expires_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("rules", "created_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_rules_expires_at ON rules(expires_at)`); err != nil {
+		return fmt.Errorf("kbounce: create idx_rules_expires_at: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS burst_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		detected_at TEXT NOT NULL,
+		prompt_count INTEGER NOT NULL,
+		window_seconds INTEGER NOT NULL,
+		resolved_at TEXT,
+		resolution_kind TEXT
+	)`); err != nil {
+		return fmt.Errorf("kbounce: create burst_events: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_burst_events_resolved_at ON burst_events(resolved_at)`); err != nil {
+		return fmt.Errorf("kbounce: create idx_burst_events_resolved_at: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS profile_reload_signal (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		profile_name TEXT NOT NULL,
+		requested_at TEXT NOT NULL,
+		requested_by TEXT NOT NULL,
+		applied_at TEXT
+	)`); err != nil {
+		return fmt.Errorf("kbounce: create profile_reload_signal: %w", err)
 	}
 
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it

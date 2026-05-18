@@ -65,6 +65,7 @@ on the NEXT call of the same shape.`,
 	cmd.AddCommand(newPromptsListCmd())
 	cmd.AddCommand(newPromptsShowCmd())
 	cmd.AddCommand(newPromptsAnswerCmd())
+	cmd.AddCommand(newPromptsBulkAnswerCmd())
 	return cmd
 }
 

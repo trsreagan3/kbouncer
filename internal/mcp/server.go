@@ -138,6 +138,16 @@ type Config struct {
 	// lands in the local audit only (webhook strips by default; see
 	// audit.WebhookOptions.IncludeProcessTree).
 	ProcessTreeFingerprint bool
+
+	// BulkAnswerToken gates the kbounce_prompts_bulk_answer tool. When
+	// empty (the default), the tool refuses every call — per the
+	// [[bulk-prompt-answer-ux]] memo's "Don't" list: an adversarial
+	// agent that could call bulk_answer unauthenticated could trigger
+	// a bulk-allow + defeat the operator-in-loop intent. When non-
+	// empty, calls must include args.operator_token = this value
+	// (constant-time compared). The CLI sets it via
+	// `kbounce mcp serve --bulk-answer-mcp-token <secret>`.
+	BulkAnswerToken string
 }
 
 // Server is the MCP-over-stdio server. Construct one via NewServer,
@@ -424,6 +434,10 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolTailDecisions(args)
 	case "kbounce_pending_sync_prompts":
 		return s.toolPendingSyncPrompts(args)
+	case "kbounce_prompts_bulk_pending":
+		return s.toolPromptsBulkPending(args)
+	case "kbounce_prompts_bulk_answer":
+		return s.toolPromptsBulkAnswer(args)
 	case "kbounce_recommend_rules":
 		return s.toolRecommendRules(args)
 	case "kbounce_apply_preset":

@@ -204,6 +204,12 @@ func newRunCmd() *cobra.Command {
 		// (default; safety-not-surveillance positioning); 30s
 		// recommended for Enterprise.
 		auditHeartbeatInterval time.Duration
+		// Bulk-answer burst-detector tuning per [[bulk-prompt-answer-ux]].
+		// All three zero-valued = use the proxy package defaults (5
+		// prompts in 60s, 5-minute cool-down).
+		bulkAnswerThreshold int
+		bulkAnswerWindow    time.Duration
+		bulkAnswerCooldown  time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -394,6 +400,9 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				RequireClientCertCAPath: requireClientCert,
 				AuditEmitter:            auditEmitter,
 				AuditHealthCheck:        auditHealth,
+				BulkAnswerThreshold:     bulkAnswerThreshold,
+				BulkAnswerWindow:        bulkAnswerWindow,
+				BulkAnswerCooldown:      bulkAnswerCooldown,
 			}.Normalize()
 
 			// Cooperative mode + --sync-prompt-on-deny: per spec the
@@ -707,6 +716,23 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 	// Heartbeat liveness emitter — per [[prompt-injection-disable-
 	// bouncer-threat]] + [[audit-export-failure-visibility]]. OFF
 	// by default; 30s recommended for Enterprise.
+	// Bulk-answer burst-detector tuning per [[bulk-prompt-answer-ux]].
+	// Zero values fall back to the proxy package defaults
+	// (BurstThresholdDefault / BurstWindowDefault / BurstCooldownDefault).
+	cmd.Flags().IntVar(&bulkAnswerThreshold, "bulk-answer-threshold", 0,
+		"Prompt count that trips the bulk-answer burst detector. "+
+			"Default 5: when 5 DENY prompts are enqueued within "+
+			"--bulk-answer-window seconds, the proxy records a "+
+			"BURST_DETECTED event surfaced by `kbounce prompts bulk-"+
+			"answer`. Per [[bulk-prompt-answer-ux]]: this is the safety "+
+			"valve for the 'block-happy = uninstalled' failure mode.")
+	cmd.Flags().DurationVar(&bulkAnswerWindow, "bulk-answer-window", 0,
+		"Sliding-window length over which the burst detector counts "+
+			"prompt enqueues. Default 60s.")
+	cmd.Flags().DurationVar(&bulkAnswerCooldown, "bulk-answer-cooldown", 0,
+		"How long the burst detector stays silent after emitting one "+
+			"event before it can fire again. Default 5m. Prevents one "+
+			"sustained burst from emitting dozens of identical events.")
 	cmd.Flags().DurationVar(&auditHeartbeatInterval, "heartbeat-interval", 0,
 		"Audit-export heartbeat cadence. When non-zero, a background "+
 			"goroutine emits a HEARTBEAT OCSF event at this interval so a "+
@@ -1355,13 +1381,14 @@ func newMCPCmd() *cobra.Command {
 	// Shared serve flag values, bound on both the parent (back-compat
 	// for `kbounce mcp --db ...`) and the `serve` subcommand.
 	var (
-		dbPath        string
-		profileName   string
-		profilesPath  string
-		modeStr       string
-		defaultPolStr string
-		owner         string
-		actor         string
+		dbPath          string
+		profileName     string
+		profilesPath    string
+		modeStr         string
+		defaultPolStr   string
+		owner           string
+		actor           string
+		bulkAnswerToken string
 	)
 
 	runServe := func(cmd *cobra.Command, args []string) error {
@@ -1396,13 +1423,14 @@ func newMCPCmd() *cobra.Command {
 		activeProfile, _ := profiles.Active(profileName) // err on unknown; we still want to serve
 
 		srv := mcp.NewServer(mcp.Config{
-			Store:         st,
-			ActiveProfile: activeProfile,
-			ProfilesPath:  resolvedProfilesPath,
-			Mode:          mode,
-			DefaultPolicy: defaultPol,
-			TaskOwner:     owner,
-			Actor:         actor,
+			Store:           st,
+			ActiveProfile:   activeProfile,
+			ProfilesPath:    resolvedProfilesPath,
+			Mode:            mode,
+			DefaultPolicy:   defaultPol,
+			TaskOwner:       owner,
+			Actor:           actor,
+			BulkAnswerToken: bulkAnswerToken,
 		})
 
 		fmt.Fprintf(os.Stderr,
@@ -1433,6 +1461,14 @@ func newMCPCmd() *cobra.Command {
 		cmd.Flags().StringVar(&actor, "actor", "",
 			"Actor name recorded in audit rows when MCP-initiated mutations land "+
 				"(default: 'kbounce-mcp').")
+		cmd.Flags().StringVar(&bulkAnswerToken, "bulk-answer-mcp-token", "",
+			"Shared secret that enables the kbounce_prompts_bulk_answer MCP "+
+				"tool per [[bulk-prompt-answer-ux]]. Default empty = the bulk-"+
+				"answer tool refuses every call (operator-in-loop). Pick a "+
+				"strong value once + paste the SAME value into the agent UI's "+
+				"tools/auth arguments (args.operator_token) so the agent's "+
+				"bulk-answer calls match. Read-only kbounce_prompts_bulk_pending "+
+				"is always available regardless.")
 	}
 
 	parent := &cobra.Command{

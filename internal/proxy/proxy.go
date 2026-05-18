@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -250,6 +251,16 @@ type Config struct {
 	// [[agent-identity-in-audit]] Feature 2. nil disables the lookup
 	// (audit row still emits a User-Agent-derived agent block).
 	AgentRegistry *audit.Registry
+
+	// BulkAnswerThreshold tunes the burst detector that powers the
+	// [[bulk-prompt-answer-ux]] memo. When N DENY prompts are enqueued
+	// within BulkAnswerWindow seconds (defaults: 5 prompts in 60s),
+	// the proxy emits a BURST_DETECTED event the operator's next
+	// `kbounce prompts bulk-answer` call surfaces. Zero values fall
+	// back to BurstThresholdDefault / BurstWindowDefault.
+	BulkAnswerThreshold int
+	BulkAnswerWindow    time.Duration
+	BulkAnswerCooldown  time.Duration
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -469,6 +480,13 @@ type EvalOptions struct {
 	// nil — the audit row still emits a default {name:"unknown",
 	// detected_from:"unknown"} block.
 	AgentRegistry *audit.Registry
+
+	// BurstDetector, when non-nil, is fed by the prompt-enqueue path so
+	// the [[bulk-prompt-answer-ux]] flow can surface a BURST_DETECTED
+	// event after N async prompts in T seconds. Pure-evaluator callers
+	// + the sync-prompt path leave it nil (sync-flow waiters do their
+	// own UX; bulk-answer's target is the async per-call queue).
+	BurstDetector *BurstDetector
 }
 
 // SessionHeaderName is the inbound HTTP header an MCP-aware client can
@@ -967,8 +985,17 @@ func maybeEnqueuePrompt(
 		input.Namespace = parsed.Namespace
 		input.Name = parsed.Name
 	}
-	if _, err := st.AddPendingPrompt(input); err != nil {
+	id, err := st.AddPendingPrompt(input)
+	if err != nil {
 		recordLookupError(err, "kbounce: prompt-enqueue failed")
+		return
+	}
+	// Feed the burst detector ONLY on a real new-row insert (id == prior
+	// row from idempotent re-enqueue would inflate the count). The
+	// detector is per-process; the persisted BURST_DETECTED row is the
+	// cross-process signal.
+	if id > 0 && opts.BurstDetector != nil {
+		opts.BurstDetector.OnPromptEnqueued()
 	}
 }
 
@@ -1064,6 +1091,46 @@ type Server struct {
 	cfg   Config
 	store *store.Store
 	http  *http.Server
+
+	// burstDetector observes the prompt-enqueue rate + emits a
+	// BURST_DETECTED event when the operator's threshold is crossed.
+	// Powers the [[bulk-prompt-answer-ux]] flow. nil disables emission
+	// (e.g. tests that don't pass a store).
+	burstDetector *BurstDetector
+
+	// activeProfile is the hot-swap-aware active profile pointer.
+	// Initialized from cfg.ActiveProfile at construction; replaced by
+	// the profile-reload watcher (powered by store.profile_reload_signal)
+	// when the bulk-answer profile-switch option fires. Reads go
+	// through ActiveProfile(); writes only from the watcher goroutine
+	// or test-only SetActiveProfile.
+	profileMu     sync.RWMutex
+	activeProfile *profile.Profile
+
+	// watcherMu serializes start/stop of the background watchers so
+	// Serve() (start) + Shutdown() (stop) racing across goroutines
+	// can't simultaneously read + write the stop channels. Without
+	// this the -race detector flags the test that calls Shutdown
+	// immediately after Serve starts.
+	watcherMu sync.Mutex
+
+	// watcherWG tracks the background watcher goroutines so Shutdown
+	// can wait for them to fully exit before returning. Without this
+	// `t.Cleanup(func() { st.Close() })` in tests can race a
+	// mid-poll watcher iteration against the store handle closing —
+	// surfaces as "sql: database is closed" warns + an inflated
+	// lookup_errors_counter on subsequent assertions.
+	watcherWG sync.WaitGroup
+
+	// profileReloadStop cancels the background profile-reload watcher.
+	// Closed by Shutdown; nil when no watcher was launched (no store
+	// configured or test path).
+	profileReloadStop chan struct{}
+
+	// expiredRulesSweepStop cancels the background expired-rules
+	// sweeper (cosmetic counter; rules are filtered at LoadRuleSet
+	// time regardless). nil when no sweeper was launched.
+	expiredRulesSweepStop chan struct{}
 }
 
 // lookupErrorsCounter is a process-wide counter of lookup-class
@@ -1102,9 +1169,26 @@ func ResetLookupErrorsCount() {
 // NewServer constructs the proxy server. The caller still has to call
 // Serve to bind + accept. Useful for tests that want a configured
 // server they can introspect before binding.
+//
+// Side-effects per [[bulk-prompt-answer-ux]]:
+//   - Constructs a burst detector from cfg.BulkAnswer* fields. The
+//     detector observes prompt enqueues via the EvalOptions
+//     BurstDetector field threaded through handle().
+//   - The profile-reload watcher + expired-rules sweeper are started by
+//     Serve / ServeListener so a NewServer-only test doesn't leak
+//     goroutines.
 func NewServer(cfg Config, st *store.Store) *Server {
 	cfg = cfg.Normalize()
-	s := &Server{cfg: cfg, store: st}
+	s := &Server{
+		cfg:           cfg,
+		store:         st,
+		activeProfile: cfg.ActiveProfile,
+	}
+	s.burstDetector = NewBurstDetector(st, BurstDetectorOptions{
+		Threshold: cfg.BulkAnswerThreshold,
+		Window:    cfg.BulkAnswerWindow,
+		Cooldown:  cfg.BulkAnswerCooldown,
+	})
 	mux := http.NewServeMux()
 	// /healthz is a liveness probe — never goes through proxy
 	// evaluation (so it doesn't pollute the audit log), never
@@ -1120,6 +1204,268 @@ func NewServer(cfg Config, st *store.Store) *Server {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
+}
+
+// ActiveProfile returns the hot-swap-aware active profile pointer.
+// Reads under the same RWMutex the profile-reload watcher writes
+// under so a request goroutine sees a coherent profile even mid-swap.
+func (s *Server) ActiveProfile() *profile.Profile {
+	if s == nil {
+		return nil
+	}
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
+	return s.activeProfile
+}
+
+// SetActiveProfile is the test + watcher entrypoint that hot-swaps the
+// proxy's active profile pointer. The next inbound request reads the
+// new profile via ActiveProfile(); requests in-flight at swap time
+// keep the profile they evaluated against (the pointer is read once
+// per request).
+//
+// Per [[creates-never-mutates]]: this swaps a POINTER kbounce owns;
+// it does NOT modify the profile YAML on disk (profiles install +
+// edit through the separate `kbounce profile install` path).
+func (s *Server) SetActiveProfile(p *profile.Profile) {
+	if s == nil {
+		return
+	}
+	s.profileMu.Lock()
+	s.activeProfile = p
+	s.profileMu.Unlock()
+}
+
+// BurstDetector returns the proxy's burst detector. Exposed for tests +
+// the /healthz introspection path. nil-safe (Snapshot() handles a nil
+// receiver).
+func (s *Server) BurstDetector() *BurstDetector {
+	if s == nil {
+		return nil
+	}
+	return s.burstDetector
+}
+
+// ProfileReloadPollInterval is how often the profile-reload watcher
+// checks the store for an unacked profile_reload_signal row. 1s is
+// a fair trade between "operator switches profile, see it apply
+// within a click" + "we don't hammer SQLite." Tests can override
+// the watcher entirely by not calling Serve.
+const ProfileReloadPollInterval = 1 * time.Second
+
+// ExpiredRulesSweepInterval is how often the expired-rules sweeper
+// re-counts expired rows. The count is cosmetic (LoadRuleSet filters
+// by wall-clock regardless); the sweeper exists to surface a stable
+// number in /healthz + future audit-export channels.
+const ExpiredRulesSweepInterval = 30 * time.Second
+
+// startBackgroundWatchers launches the profile-reload watcher + the
+// expired-rules cosmetic sweeper. Called from Serve / ServeListener so
+// a NewServer-only test doesn't leak goroutines. Idempotent on multiple
+// calls (no-ops the second time).
+func (s *Server) startBackgroundWatchers() {
+	if s == nil || s.store == nil {
+		return
+	}
+	s.watcherMu.Lock()
+	defer s.watcherMu.Unlock()
+	if s.profileReloadStop == nil {
+		s.profileReloadStop = make(chan struct{})
+		s.watcherWG.Add(1)
+		go func(stop chan struct{}) {
+			defer s.watcherWG.Done()
+			s.runProfileReloadWatcher(stop)
+		}(s.profileReloadStop)
+	}
+	if s.expiredRulesSweepStop == nil {
+		s.expiredRulesSweepStop = make(chan struct{})
+		s.watcherWG.Add(1)
+		go func(stop chan struct{}) {
+			defer s.watcherWG.Done()
+			s.runExpiredRulesSweeper(stop)
+		}(s.expiredRulesSweepStop)
+	}
+}
+
+// stopBackgroundWatchers closes both watcher stop channels + waits for
+// the goroutines to exit. Called by Shutdown. Idempotent.
+//
+// Wait-for-exit semantics are load-bearing: tests routinely call
+// `t.Cleanup(func() { st.Close() })` AFTER Shutdown returns, so the
+// store handle must NOT be in use by a still-running watcher
+// goroutine when Shutdown returns. Without the WaitGroup the
+// watcher's next mid-poll iteration would race the close +
+// surface as "sql: database is closed" warns that inflate the
+// lookup_errors_counter on subsequent assertions.
+func (s *Server) stopBackgroundWatchers() {
+	if s == nil {
+		return
+	}
+	s.watcherMu.Lock()
+	if s.profileReloadStop != nil {
+		close(s.profileReloadStop)
+		s.profileReloadStop = nil
+	}
+	if s.expiredRulesSweepStop != nil {
+		close(s.expiredRulesSweepStop)
+		s.expiredRulesSweepStop = nil
+	}
+	s.watcherMu.Unlock()
+	// Wait WITHOUT the mutex held so a mid-flight watcher reaching
+	// for s.store doesn't deadlock against a future startBackground
+	// Watchers (e.g. ServeListener re-call in a long-running test).
+	s.watcherWG.Wait()
+}
+
+// runProfileReloadWatcher polls the store's profile_reload_signal row
+// at ProfileReloadPollInterval. When an unacked signal appears, the
+// watcher loads the named profile via profile.LoadProfiles +
+// hot-swaps the proxy's active profile pointer via SetActiveProfile +
+// acks the signal so it doesn't re-fire.
+//
+// On any error (profile load fails, profile name unknown), the watcher
+// logs at WARN + acks anyway so a typo'd profile name doesn't pin the
+// signal forever — the operator sees the warning in stderr + can
+// re-issue the bulk-answer with the correct name.
+func (s *Server) runProfileReloadWatcher(stop chan struct{}) {
+	t := time.NewTicker(ProfileReloadPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			s.pollProfileReloadOnce()
+		}
+	}
+}
+
+// pollProfileReloadOnce is the inner step of runProfileReloadWatcher.
+// Factored so tests can drive a deterministic single-step poll
+// without depending on a real ticker.
+func (s *Server) pollProfileReloadOnce() {
+	if s == nil || s.store == nil {
+		return
+	}
+	sig, err := s.store.GetProfileReloadSignal()
+	if err != nil {
+		// Silently skip on "database is closed" — this is the test-
+		// teardown race where the watcher fires after t.Cleanup closed
+		// the store. Counting this as a lookup error would inflate the
+		// lookup_errors_counter assertion in TestHealthz_Includes
+		// LookupErrorsCounter (and is genuinely cosmetic — a closed
+		// store can't help the watcher anyway).
+		if !isClosedDBError(err) {
+			recordLookupError(err, "kbounce: profile-reload signal read failed")
+		}
+		return
+	}
+	if sig == nil || sig.AppliedAt != "" {
+		return
+	}
+	// Resolve profiles.yaml path the same way newRunCmd does. Config
+	// doesn't carry ProfilesPath today (the CLI loads profiles +
+	// passes the resolved Profile pointer); the watcher just resolves
+	// the default path so a hot-swap honors the same file the operator
+	// edited.
+	path, derr := profile.DefaultProfilesPath()
+	if derr != nil {
+		recordLookupError(derr, "kbounce: profile-reload resolve path failed")
+		_ = s.store.AckProfileReloadSignal()
+		return
+	}
+	profiles, lerr := profile.LoadProfiles(path)
+	if lerr != nil {
+		recordLookupError(lerr, "kbounce: profile-reload load profiles failed")
+		_ = s.store.AckProfileReloadSignal()
+		return
+	}
+	prof, aerr := profiles.Active(sig.ProfileName)
+	if aerr != nil {
+		log.Warn().
+			Str("requested_profile", sig.ProfileName).
+			Err(aerr).
+			Msg("kbounce: profile-reload signal references unknown profile; ignoring")
+		_ = s.store.AckProfileReloadSignal()
+		return
+	}
+	s.SetActiveProfile(prof)
+	log.Info().
+		Str("requested_profile", sig.ProfileName).
+		Str("requested_by", sig.RequestedBy).
+		Msg("kbounce: profile hot-swapped via bulk-answer signal")
+	_ = s.store.AckProfileReloadSignal()
+}
+
+// runExpiredRulesSweeper periodically counts expired bulk-answer rules
+// so /healthz + future audit-export channels have a stable number to
+// surface. The sweeper does NOT delete rows (per [[creates-never-
+// mutates]] — the audit history is preserved); it just refreshes a
+// cosmetic counter. LoadRuleSet is the load-bearing filter.
+func (s *Server) runExpiredRulesSweeper(stop chan struct{}) {
+	t := time.NewTicker(ExpiredRulesSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			if s.store == nil {
+				continue
+			}
+			n, err := s.store.CountExpiredRules(time.Now().UTC())
+			if err != nil {
+				// Same test-teardown race as the profile-reload watcher:
+				// suppress the lookup-error increment when the cause is
+				// "database is closed."
+				if !isClosedDBError(err) {
+					recordLookupError(err, "kbounce: expired-rules sweep failed")
+				}
+				continue
+			}
+			expiredRulesCounter.Store(n)
+		}
+	}
+}
+
+// isClosedDBError reports whether err originates from a database/sql
+// operation against a handle that was already Close()'d. We string-
+// match because database/sql.ErrConnDone wraps the "database is closed"
+// case inconsistently across drivers; matching the message is the
+// portable check.
+func isClosedDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return stringContains(msg, "database is closed") ||
+		stringContains(msg, "sql: database is closed")
+}
+
+// stringContains is a tiny indirection that avoids importing "strings"
+// at the top of this file just for the one call site. Keeps the
+// helper local + cheap.
+func stringContains(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+// expiredRulesCounter is the package-level cache the sweeper writes +
+// healthz reads. Atomic so the watcher + handlers don't race.
+var expiredRulesCounter atomic.Int64
+
+// ExpiredRulesCount returns the most-recent cached count of rules
+// whose expires_at has passed. Used by /healthz + tests. Returns 0
+// when no sweeper has run yet.
+func ExpiredRulesCount() int64 {
+	return expiredRulesCounter.Load()
 }
 
 // Addr returns the bound address, useful for tests using port 0.
@@ -1144,6 +1490,7 @@ func (s *Server) Serve() error {
 		Bool("tls", s.cfg.TLSCertPath != "" && s.cfg.TLSKeyPath != "").
 		Bool("require_client_cert", s.cfg.RequireClientCertCAPath != "").
 		Msg("kbounce proxy starting")
+	s.startBackgroundWatchers()
 	if s.cfg.TLSCertPath != "" && s.cfg.TLSKeyPath != "" {
 		tlsCfg, err := s.buildListenerTLSConfig()
 		if err != nil {
@@ -1208,11 +1555,13 @@ func (s *Server) buildListenerTLSConfig() (*tls.Config, error) {
 // ServeListener starts serving on a pre-bound listener. Used by tests
 // (httptest) and by the CLI when it wants to bind explicitly.
 func (s *Server) ServeListener(l net.Listener) error {
+	s.startBackgroundWatchers()
 	return s.http.Serve(l)
 }
 
 // Shutdown initiates a graceful shutdown.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopBackgroundWatchers()
 	return s.http.Shutdown(ctx)
 }
 
@@ -1259,13 +1608,17 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Upstream != nil {
 		upstreamLabel = s.cfg.Upstream.Host()
 	}
+	// Hot-swap-aware: ActiveProfile reads under the same RWMutex the
+	// bulk-answer profile-switch watcher writes under, so a request
+	// goroutine sees a coherent profile pointer even mid-swap.
+	activeProfile := s.ActiveProfile()
 	profileSource := ""
-	if s.cfg.ActiveProfile != nil {
-		profileSource = s.cfg.ActiveProfile.Source
+	if activeProfile != nil {
+		profileSource = activeProfile.Source
 	}
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
-		s.cfg.ActiveProfile, s.cfg.Cluster,
+		activeProfile, s.cfg.Cluster,
 		EvalOptions{
 			PromptOnDeny:       s.cfg.PromptOnDeny,
 			SyncPromptOnDeny:   syncPromptActive,
@@ -1276,6 +1629,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			AuditUpstream:      upstreamLabel,
 			AuditProfileSource: profileSource,
 			AgentRegistry:      s.cfg.AgentRegistry,
+			BurstDetector:      s.burstDetector,
 		},
 	)
 
@@ -1507,8 +1861,8 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		LookupErrorsCounter: LookupErrorsCount(),
 		AuditExportHealthy:  true,
 	}
-	if s.cfg.ActiveProfile != nil {
-		payload.ActiveProfile = s.cfg.ActiveProfile.Name
+	if ap := s.ActiveProfile(); ap != nil {
+		payload.ActiveProfile = ap.Name
 	}
 	if s.store != nil {
 		if n, err := s.store.CountDecisions(); err == nil {
