@@ -278,9 +278,11 @@ func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error)
 		return map[string]any{
 			"log_configured":     false,
 			"webhook_configured": false,
+			"alerts_enabled":     false,
+			"alerts_fired_count": int64(0),
 			"total_events":       int64(0),
 			"note": "audit export disabled (no --audit-log-path / " +
-				"--audit-webhook-url passed to `kbounce run`)",
+				"--audit-webhook-url / --alert-rules passed to `kbounce run`)",
 		}, nil
 	}
 	st := s.cfg.AuditEmitter.Status()
@@ -297,6 +299,9 @@ func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error)
 		"webhook_in_flight":  st.WebhookInFlight,
 		"webhook_last_error": st.WebhookLastError,
 		"total_events":       st.TotalEvents,
+		"alerts_enabled":     st.AlertsEnabled,
+		"alerts_fired_count": st.AlertsFiredCount,
+		"last_alert_pattern": st.LastAlertPattern,
 	}, nil
 }
 

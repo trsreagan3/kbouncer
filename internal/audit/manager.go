@@ -36,6 +36,16 @@ type Status struct {
 	WebhookInFlight   int64  `json:"webhook_in_flight"`
 	WebhookLastError  string `json:"webhook_last_error,omitempty"`
 	TotalEvents       int64  `json:"total_events"`
+
+	// Slice 2 alert-rule engine state. AlertsEnabled is true when a
+	// RuleEngine is wrapping this status's source emitter (the
+	// non-engine *Manager always reports false). AlertsFiredCount is
+	// the cumulative number of alert events the engine has emitted;
+	// LastAlertPattern is the name of the most-recently-fired rule
+	// (empty until any rule fires).
+	AlertsEnabled    bool   `json:"alerts_enabled"`
+	AlertsFiredCount int64  `json:"alerts_fired_count"`
+	LastAlertPattern string `json:"last_alert_pattern,omitempty"`
 }
 
 // Manager fans events out to the JSONL log writer + the HTTPS

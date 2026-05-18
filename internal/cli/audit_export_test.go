@@ -31,6 +31,7 @@ func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
 		1,
 		false,
 		"generic", "", audit.SentinelDefaultTable,
+		"",
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrLicenseRequired,
@@ -49,6 +50,7 @@ func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 		dir+"/audit.jsonl", false,
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
+		"",
 	)
 	require.NoError(t, err, "JSONL log alone should not require an Enterprise license")
 	require.NotNil(t, mgr)
@@ -68,11 +70,31 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 		"", false,
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
+		"",
 	)
 	require.NoError(t, err)
 	assert.Nil(t, mgr, "no flags → no Manager constructed")
 	assert.NotNil(t, closer, "closer should be a no-op, not nil")
 	closer() // must not panic
+}
+
+// TestAuditAlerts_LicensePlaceholderRejects pins the Slice 2 Enterprise
+// license gate for the alert-rule engine. Same placeholder shape as
+// TestAuditWebhook_LicensePlaceholderRejects; both wait on #235.
+func TestAuditAlerts_LicensePlaceholderRejects(t *testing.T) {
+	dir := t.TempDir()
+	_, _, err := buildAuditManager(
+		t.Context(),
+		"", false,
+		"", "", 1, false,
+		"generic", "", audit.SentinelDefaultTable,
+		dir+"/rules.yaml",
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, audit.ErrAlertRulesLicenseRequired,
+		"--alert-rules must return ErrAlertRulesLicenseRequired until license-file plumbing lands")
+	assert.Contains(t, err.Error(), "#235",
+		"error message should direct the operator to the tracking issue")
 }
 
 // TestAuditWebhook_LicenseErrorMessageSurface pins the error

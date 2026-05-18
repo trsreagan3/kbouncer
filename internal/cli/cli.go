@@ -192,6 +192,12 @@ func newRunCmd() *cobra.Command {
 		auditWebhookPreset        string
 		auditWebhookTags          string
 		auditWebhookSentinelTable string
+		// Slice 2 of #252 — suspicious-activity alert rule engine.
+		// YAML config path; built-in defaults active when absent. The
+		// engine wraps the audit Manager so alerts ride the same
+		// JSONL log + HTTPS webhook transport as decision events.
+		// Enterprise-tier (license-gated; placeholder error until #235).
+		auditAlertRulesPath string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -351,12 +357,13 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			// truth regardless. Webhook flags require an Enterprise
 			// license (placeholder error until #235 license-file
 			// plumbing lands).
-			auditMgr, auditCloser, auditErr := buildAuditManager(
+			auditEmitter, auditCloser, auditErr := buildAuditManager(
 				cmd.Context(),
 				auditLogPath, auditLogFsync,
 				auditWebhookURL, auditWebhookToken, auditWebhookBatch,
 				allowInternalWebhook,
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
+				auditAlertRulesPath,
 			)
 			if auditErr != nil {
 				return auditErr
@@ -378,7 +385,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				TLSCertPath:             tlsCertPath,
 				TLSKeyPath:              tlsKeyPath,
 				RequireClientCertCAPath: requireClientCert,
-				AuditEmitter:            auditMgr,
+				AuditEmitter:            auditEmitter,
 			}.Normalize()
 
 			// Cooperative mode + --sync-prompt-on-deny: per spec the
@@ -414,8 +421,8 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				}
 			}
 			fmt.Fprintf(os.Stderr, "audit db: %s\n", st.Path())
-			if auditMgr != nil {
-				status := auditMgr.Status()
+			if auditEmitter != nil {
+				status := auditEmitter.Status()
 				if status.LogConfigured {
 					fmt.Fprintf(os.Stderr,
 						"audit log: %s (fsync=%t)\n", status.LogPath, auditLogFsync)
@@ -431,6 +438,11 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 					fmt.Fprintf(os.Stderr,
 						"audit webhook: %s (preset=%s, token=***, batch=%d)\n",
 						status.WebhookMaskedURL, presetLabel, auditWebhookBatch)
+				}
+				if status.AlertsEnabled {
+					fmt.Fprintf(os.Stderr,
+						"audit alerts: enabled (rules=admin_fallback_burst, pause_long, "+
+							"non_org_profile_install, unusual_high_risk_action)\n")
 				}
 			}
 			fmt.Fprintf(os.Stderr, "profiles: %s\n", resolvedProfilesPath)
@@ -665,6 +677,18 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 		"Log Analytics custom-log table name for the sentinel preset. "+
 			"Becomes the Log-Type header on every POST; Sentinel auto-creates "+
 			"the table on first ingest. Ignored by other presets.")
+	// Slice 2 of #252 — suspicious-activity alert rule engine.
+	cmd.Flags().StringVar(&auditAlertRulesPath, "alert-rules", "",
+		"Path to a YAML file tuning the audit alert-rule engine "+
+			"(admin_fallback_burst / pause_long / non_org_profile_install / "+
+			"unusual_high_risk_action). Set to the empty string (default) to "+
+			"DISABLE the rule engine entirely; set to a path to ENABLE with "+
+			"the YAML's thresholds layered over the built-in defaults (so an "+
+			"empty file enables all four rules with their defaults). Alert "+
+			"events ride the same JSONL log + HTTPS webhook transport as "+
+			"decision events (OCSF class 6003, activity_id 99, "+
+			"activity_name 'anomaly_detected'). ENTERPRISE-tier "+
+			"(license-gated; see #235 for license-file plumbing status).")
 	return cmd
 }
 
@@ -684,9 +708,10 @@ func buildAuditManager(
 	webhookURL, webhookToken string, webhookBatch int,
 	allowInternal bool,
 	webhookPreset, webhookTags, webhookSentinelTable string,
-) (*audit.Manager, func(), error) {
+	alertRulesPath string,
+) (audit.Emitter, func(), error) {
 	noop := func() {}
-	if logPath == "" && webhookURL == "" {
+	if logPath == "" && webhookURL == "" && alertRulesPath == "" {
 		return nil, noop, nil
 	}
 	// Validate the preset name up front so a typo surfaces before
@@ -694,6 +719,12 @@ func buildAuditManager(
 	// run rather than fixing one then hitting the next).
 	if _, err := audit.ParsePreset(webhookPreset); err != nil {
 		return nil, noop, err
+	}
+	// Slice 2 of #252 — alert-rule engine is an Enterprise feature
+	// per [[security-team-audit-export]]. Same placeholder license
+	// gate as the webhook flags; both wait on #235.
+	if alertRulesPath != "" {
+		return nil, noop, audit.ErrAlertRulesLicenseRequired
 	}
 	var logWriter *audit.LogWriter
 	var webhookPusher *audit.WebhookPusher

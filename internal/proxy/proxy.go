@@ -429,6 +429,14 @@ type EvalOptions struct {
 	// resolved upstream URL. Pure-evaluator callers leave both empty.
 	AuditHost     string
 	AuditUpstream string
+
+	// AuditProfileSource carries the active profile's Source URL into
+	// the audit event so the Slice 2 non_org_profile_install rule can
+	// flag decisions backed by a non-allowlisted profile. Empty / "local"
+	// = user-edited (no alert); an https URL = installed via
+	// `kbounce profile install --from URL`. The proxy server populates
+	// it from Config.ActiveProfile.Source.
+	AuditProfileSource string
 }
 
 // EvaluateRequestWithProfile is the K-Slice 7 evaluator. It runs the
@@ -530,7 +538,7 @@ func EvaluateRequestFull(
 			StreamKind:      opts.StreamKind,
 		}
 		decisionID := writeDecision(st, obs, activePause)
-		emitAuditEvent(opts, obs, parsed, "")
+		emitAuditEvent(opts, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -579,7 +587,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceProfile
 			obs.Enforced = effectiveMode == ModeTransparent
 			decisionID := writeDecision(st, obs, activePause)
-			emitAuditEvent(opts, obs, parsed, "")
+			emitAuditEvent(opts, obs, parsed, "", activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -626,7 +634,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceTask
 			obs.Enforced = effectiveMode == ModeTransparent
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-			emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
+			emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -660,7 +668,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = effectiveMode == ModeTransparent
 		decisionID := writeDecisionForTaskMaybe(st, obs, activePause, activeTask)
-		emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask))
+		emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask), activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -677,7 +685,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceTask
 			obs.Enforced = false
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-			emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
+			emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -696,7 +704,7 @@ func EvaluateRequestFull(
 			obs.DecisionSource = SourceGlobal
 			obs.Enforced = false
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-			emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
+			emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
@@ -707,7 +715,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceTask
 		obs.Enforced = effectiveMode == ModeTransparent
 		decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
-		emitAuditEvent(opts, obs, parsed, activeTask.TaskID)
+		emitAuditEvent(opts, obs, parsed, activeTask.TaskID, activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -720,7 +728,7 @@ func EvaluateRequestFull(
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = false
 		decisionID := writeDecision(st, obs, activePause)
-		emitAuditEvent(opts, obs, parsed, "")
+		emitAuditEvent(opts, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
 	}
@@ -738,7 +746,7 @@ func EvaluateRequestFull(
 	obs.Enforced = effectiveMode == ModeTransparent && verdict == VerdictDeny
 
 	decisionID := writeDecision(st, obs, activePause)
-	emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask))
+	emitAuditEvent(opts, obs, parsed, activeTaskID(activeTask), activePause)
 	maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 	return obs
 }
@@ -763,7 +771,7 @@ func activeTaskID(t *tasks.Scope) string {
 // non-blocking by contract (bounded chans + drop-on-overflow on
 // each consumer), so the proxy hot-path never waits on disk or
 // network here.
-func emitAuditEvent(opts EvalOptions, obs *RequestObservation, parsed *parser.ParsedRequest, taskID string) {
+func emitAuditEvent(opts EvalOptions, obs *RequestObservation, parsed *parser.ParsedRequest, taskID string, activePause *store.PauseRow) {
 	if opts.AuditEmitter == nil {
 		return
 	}
@@ -782,6 +790,8 @@ func emitAuditEvent(opts EvalOptions, obs *RequestObservation, parsed *parser.Pa
 		Path:           obs.Path,
 		StreamKind:     obs.StreamKind,
 		TaskID:         taskID,
+		ProfileSource:  opts.AuditProfileSource,
+		AdminFallback:  activePause != nil,
 	}
 	if parsed != nil {
 		in.ParsedVerb = parsed.Verb
@@ -1153,17 +1163,22 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Upstream != nil {
 		upstreamLabel = s.cfg.Upstream.Host()
 	}
+	profileSource := ""
+	if s.cfg.ActiveProfile != nil {
+		profileSource = s.cfg.ActiveProfile.Source
+	}
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
 		s.cfg.ActiveProfile, s.cfg.Cluster,
 		EvalOptions{
-			PromptOnDeny:     s.cfg.PromptOnDeny,
-			SyncPromptOnDeny: syncPromptActive,
-			TaskOwner:        s.cfg.TaskOwner,
-			StreamKind:       string(streamKind),
-			AuditEmitter:     s.cfg.AuditEmitter,
-			AuditHost:        net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
-			AuditUpstream:    upstreamLabel,
+			PromptOnDeny:       s.cfg.PromptOnDeny,
+			SyncPromptOnDeny:   syncPromptActive,
+			TaskOwner:          s.cfg.TaskOwner,
+			StreamKind:         string(streamKind),
+			AuditEmitter:       s.cfg.AuditEmitter,
+			AuditHost:          net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
+			AuditUpstream:      upstreamLabel,
+			AuditProfileSource: profileSource,
 		},
 	)
 

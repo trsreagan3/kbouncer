@@ -101,6 +101,16 @@ const (
 	// emits when its bounded queue overflows. Surfaces as OCSF
 	// activity_id=99 with unmapped.iam_jit.event_type=AUDIT_DROPPED.
 	EventTypeAuditDropped EventType = "AUDIT_DROPPED"
+
+	// EventTypeSecurityAlert is the synthetic marker the Slice 2 rule
+	// engine emits when a sliding-window pattern fires. Surfaces as
+	// OCSF activity_id=99 / activity_name="anomaly_detected" with
+	// unmapped.iam_jit.event_type=ANOMALY_DETECTED. Per
+	// [[security-team-positioning-safety-not-surveillance]] the wire
+	// shape uses NEUTRAL language — "anomaly_detected" rather than
+	// "violation" / "infraction" / "unauthorized" — so a security-team
+	// reader sees an observation, not an accusation.
+	EventTypeSecurityAlert EventType = "ANOMALY_DETECTED"
 )
 
 // OCSF activity_id enum (class 6003 / API Activity).
@@ -224,6 +234,17 @@ type IAMJITExt struct {
 	EventType    string         `json:"event_type,omitempty"`
 	DroppedCount int64          `json:"dropped_count,omitempty"`
 	QueueSize    int64          `json:"queue_size,omitempty"`
+
+	// Slice 2 alert-rule fields (set on EventTypeSecurityAlert events;
+	// omitted otherwise). Pattern names the rule that fired;
+	// WindowSeconds + MatchedEventCount give the analyst the window
+	// the rule evaluated over and how many decisions matched; Suggestion
+	// is a NEUTRAL-language operator hint (e.g. "consider distributing
+	// a profile with broader scope") — never accusatory.
+	Pattern           string `json:"pattern,omitempty"`
+	WindowSeconds     int    `json:"window_seconds,omitempty"`
+	MatchedEventCount int    `json:"matched_event_count,omitempty"`
+	Suggestion        string `json:"suggestion,omitempty"`
 }
 
 // Event is the OCSF v1.1.0 class 6003 (API Activity) wire shape.
@@ -310,6 +331,25 @@ type DecisionInput struct {
 	// JWT subject extraction.
 	PrincipalName string
 	PrincipalUID  string
+
+	// ProfileSource records the provenance URL of the active profile
+	// (empty / "local" when user-edited; an https URL when installed
+	// via `kbounce profile install --from URL`). Threaded through so
+	// the Slice 2 rule engine's non_org_profile_install rule can flag
+	// decision events backed by a profile NOT in the org-approved
+	// allowlist. Mirrors the profile.Profile.Source field 1:1.
+	ProfileSource string
+
+	// AdminFallback marks the decision as an operator-initiated
+	// admin-fallback / pause-bypass — the proxy was running with a
+	// pause window active, so transparent-mode enforcement was demoted
+	// to cooperative. Used by the Slice 2 admin_fallback_burst +
+	// pause_long rules to surface bursts of pause-bypass grants
+	// without conflating them with vanilla cooperative-mode traffic.
+	// The corresponding pause_id lives on the SQLite decisions row
+	// (single source of truth); this is the in-event signal so the
+	// rule engine can stay decoupled from store reads.
+	AdminFallback bool
 }
 
 // FromDecision builds an OCSF class 6003 (API Activity) Event from a
@@ -724,6 +764,12 @@ func buildExt(in DecisionInput) map[string]any {
 	}
 	if in.DecisionSource != "" {
 		ext["decision_source"] = in.DecisionSource
+	}
+	if in.ProfileSource != "" {
+		ext["profile_source"] = in.ProfileSource
+	}
+	if in.AdminFallback {
+		ext["admin_fallback"] = true
 	}
 	if len(ext) == 0 {
 		return nil
