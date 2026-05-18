@@ -137,7 +137,13 @@ type Status struct {
 type Manager struct {
 	log     *LogWriter
 	webhook *WebhookPusher
-	total   atomic.Int64
+	// #285 — optional per-session NDJSON recorder. Nil disables this
+	// channel. When wired, every event is teed to
+	// {dir}/{session_id}.ndjson so the cross-product replay CLI can
+	// walk the session. Synchronous; fail-soft inside Record so disk
+	// failures never propagate into the proxy hot path.
+	recorder *SessionRecorder
+	total    atomic.Int64
 	// heartbeater is the optional liveness Heartbeater bound via
 	// BindHeartbeater so Manager.Status() surfaces the watchdog
 	// fields when the rule engine isn't wrapping this Manager. When
@@ -147,28 +153,30 @@ type Manager struct {
 	heartbeater *Heartbeater
 }
 
-// ManagerOptions configures a Manager. Pass a nil LogWriter or
-// nil WebhookPusher to disable that channel.
+// ManagerOptions configures a Manager. Pass a nil LogWriter, nil
+// WebhookPusher, or nil SessionRecorder to disable that channel.
 type ManagerOptions struct {
-	LogWriter     *LogWriter
-	WebhookPusher *WebhookPusher
+	LogWriter       *LogWriter
+	WebhookPusher   *WebhookPusher
+	SessionRecorder *SessionRecorder
 }
 
 // NewManager constructs a Manager with the given (possibly nil)
-// channels. A Manager with both channels nil is a no-op — Emit
+// channels. A Manager with all channels nil is a no-op — Emit
 // still increments the total counter so the MCP status tool can
 // confirm the proxy was actually called.
 func NewManager(opts ManagerOptions) *Manager {
 	return &Manager{
-		log:     opts.LogWriter,
-		webhook: opts.WebhookPusher,
+		log:      opts.LogWriter,
+		webhook:  opts.WebhookPusher,
+		recorder: opts.SessionRecorder,
 	}
 }
 
-// Emit fans the event out to both channels. Both writes are non-
-// blocking — a full queue on either side drops the event for that
-// channel + increments the channel-local dropped counter; the
-// other channel is unaffected.
+// Emit fans the event out to every wired channel. All writes are
+// non-blocking; a full queue on either side drops the event for that
+// channel + increments the channel-local dropped counter; the other
+// channels are unaffected.
 func (m *Manager) Emit(ctx context.Context, ev Event) {
 	if m == nil {
 		return
@@ -180,6 +188,20 @@ func (m *Manager) Emit(ctx context.Context, ev Event) {
 	if m.webhook != nil {
 		_ = m.webhook.Push(ctx, ev)
 	}
+	// #285 — per-session NDJSON tee. Fail-soft inside Record.
+	if m.recorder != nil {
+		m.recorder.Record(ev)
+	}
+}
+
+// Recorder returns the bound SessionRecorder (nil when none was
+// wired). Callers use this to reach the recorder for the `kbounce
+// session ...` CLI surface without re-discovering the dir from config.
+func (m *Manager) Recorder() *SessionRecorder {
+	if m == nil {
+		return nil
+	}
+	return m.recorder
 }
 
 // Status snapshots the runtime counters.
@@ -312,7 +334,7 @@ func (m *Manager) BindHeartbeater(hb *Heartbeater) {
 	m.heartbeater = hb
 }
 
-// Close stops both worker goroutines. Idempotent.
+// Close stops every wired worker. Idempotent.
 func (m *Manager) Close() {
 	if m == nil {
 		return
@@ -322,6 +344,12 @@ func (m *Manager) Close() {
 	}
 	if m.webhook != nil {
 		m.webhook.Close()
+	}
+	// #285 — recorder shutdown atomic-renames every still-open
+	// session's .partial -> .ndjson. SIGKILL-leftover .partials are
+	// recovered by the next Start() instead.
+	if m.recorder != nil {
+		m.recorder.Stop()
 	}
 }
 

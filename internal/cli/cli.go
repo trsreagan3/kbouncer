@@ -128,6 +128,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newInvestigateCmd())
 	root.AddCommand(newBackupCmd())
 	root.AddCommand(newRestoreCmd())
+	root.AddCommand(newSessionCmd())
 	return root
 }
 
@@ -225,6 +226,9 @@ func newRunCmd() *cobra.Command {
 		// BEFORE downstream validation so license / SSRF / loopback
 		// gates see the preset-resolved values.
 		deploymentPreset string
+		// #285 — per-session NDJSON recordings directory. Empty disables
+		// the channel. Replayable via `iam-jit session replay <FILE>`.
+		recordSessionsDir string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -473,6 +477,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
 				auditAlertRulesPath,
 				auditHeartbeatInterval,
+				recordSessionsDir,
 			)
 			if auditErr != nil {
 				return auditErr
@@ -856,6 +861,12 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"proxy is bound externally. Empty + loopback bind = no auth "+
 			"required (the loopback bind is the trust anchor). Empty + "+
 			"external bind = kbounce refuses to start.")
+	cmd.Flags().StringVar(&recordSessionsDir, "record-sessions-dir", "",
+		"#285 — per-session NDJSON recording directory. When set, every "+
+			"audit event is also written to {dir}/{agent.session_id}.ndjson "+
+			"(one file per agent session). Replayable via `iam-jit session "+
+			"replay <FILE>`. File mode 0o600. Default off; the recorder "+
+			"captures agent identity + operation details so it ships opt-in.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more
@@ -901,9 +912,11 @@ func buildAuditManager(
 	webhookPreset, webhookTags, webhookSentinelTable string,
 	alertRulesPath string,
 	heartbeatInterval time.Duration,
+	recordSessionsDir string,
 ) (audit.Emitter, func() bool, func(), error) {
 	noop := func() {}
-	if logPath == "" && webhookURL == "" && alertRulesPath == "" && heartbeatInterval == 0 {
+	if logPath == "" && webhookURL == "" && alertRulesPath == "" &&
+		heartbeatInterval == 0 && recordSessionsDir == "" {
 		return nil, nil, noop, nil
 	}
 	// Validate the preset name up front so a typo surfaces before
@@ -949,9 +962,28 @@ func buildAuditManager(
 	_ = allowInternal
 	_ = webhookTags
 	_ = webhookSentinelTable
+	// #285 — per-session NDJSON recorder. Default off; only constructed
+	// when the operator passed --record-sessions-dir. Start() creates
+	// the dir + recovers any stale .partial files. Fatal on failure so
+	// an unwritable dir surfaces immediately.
+	var sessRecorder *audit.SessionRecorder
+	if recordSessionsDir != "" {
+		sr, err := audit.NewSessionRecorder(audit.SessionRecorderOptions{
+			Dir:            recordSessionsDir,
+			BouncerProduct: "kbouncer",
+		})
+		if err != nil {
+			return nil, nil, noop, err
+		}
+		if err := sr.Start(); err != nil {
+			return nil, nil, noop, err
+		}
+		sessRecorder = sr
+	}
 	mgr := audit.NewManager(audit.ManagerOptions{
-		LogWriter:     logWriter,
-		WebhookPusher: webhookPusher,
+		LogWriter:       logWriter,
+		WebhookPusher:   webhookPusher,
+		SessionRecorder: sessRecorder,
 	})
 	// Heartbeat wiring. When the rule engine is enabled (which the
 	// license gate currently blocks pre-#235), we'd bind the

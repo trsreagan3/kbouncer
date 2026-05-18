@@ -34,6 +34,7 @@ func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
 		"generic", "", audit.SentinelDefaultTable,
 		"",
 		0,
+		"",
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrLicenseRequired,
@@ -54,6 +55,7 @@ func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 		"generic", "", audit.SentinelDefaultTable,
 		"",
 		0,
+		"",
 	)
 	require.NoError(t, err, "JSONL log alone should not require an Enterprise license")
 	require.NotNil(t, mgr)
@@ -75,6 +77,7 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 		"generic", "", audit.SentinelDefaultTable,
 		"",
 		0,
+		"",
 	)
 	require.NoError(t, err)
 	assert.Nil(t, mgr, "no flags → no Manager constructed")
@@ -94,6 +97,7 @@ func TestAuditAlerts_LicensePlaceholderRejects(t *testing.T) {
 		"generic", "", audit.SentinelDefaultTable,
 		dir+"/rules.yaml",
 		0,
+		"",
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrAlertRulesLicenseRequired,
@@ -120,6 +124,7 @@ func TestAuditHeartbeat_OnEnabledWiresHealthCheckAndEmits(t *testing.T) {
 		"generic", "", audit.SentinelDefaultTable,
 		"",
 		audit.MinHeartbeatInterval,
+		"",
 	)
 	require.NoError(t, err)
 	defer closer()
@@ -148,6 +153,7 @@ func TestAuditHeartbeat_TooSmallIntervalRejected(t *testing.T) {
 		"generic", "", audit.SentinelDefaultTable,
 		"",
 		100*time.Millisecond,
+		"",
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "heartbeat-interval",

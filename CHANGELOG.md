@@ -5,6 +5,25 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Per-session recording (2026-05-19, #285)
+
+- **`kbounce run --record-sessions-dir PATH`** — tees every audit
+  event into a per-session NDJSON file at
+  `{dir}/{agent.session_id}.ndjson`. Each file starts with a `_meta`
+  header (recording_schema_version, session_id, agent_name,
+  bouncer_product, recording_started_at) followed by one OCSF event
+  per line. `.partial` suffix while in-flight; atomic rename to
+  `.ndjson` on clean shutdown or heartbeat-timeout finalisation.
+  File mode 0o600.
+- **`kbounce session list / show / export / purge`** — read-only
+  inspection of recordings. Same subcommand names + flag shape as
+  ibounce / dbounce / gbounce per `[[cross-product-agent-parity]]`.
+- Cross-product **`iam-jit session replay <FILE>`** CLI (lives in
+  iam-roles) consumes kbouncer recordings unchanged via the shared
+  on-disk shape.
+- See `docs/SESSION-REPLAY.md` in iam-roles for the cross-product
+  documentation; the recorder code is `internal/audit/recorder.go`.
+
 ### `--preset security-observe` deployment preset (2026-05-19, #254)
 
 - **`kbounce run --preset security-observe`** — single-flag shortcut
