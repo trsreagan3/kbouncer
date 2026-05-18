@@ -123,6 +123,8 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newVersionCheckCmd())
 	root.AddCommand(newConfigCmd())
 	root.AddCommand(newDiagnosticsCmd())
+	root.AddCommand(newBackupCmd())
+	root.AddCommand(newRestoreCmd())
 	return root
 }
 

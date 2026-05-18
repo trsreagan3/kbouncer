@@ -5,6 +5,45 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### SQLite backup + restore (2026-05-18, #279)
+
+Closes `[[deliberate-feature-completion]]`-#279. Single-file SQLite
+backup + restore for the kbounce store so operators can migrate to
+a new machine, recover from disaster, or preserve the audit trail
+across a risky config change WITHOUT the historical "stop the
+daemon and `cp state.db`" footgun.
+
+- **`kbounce backup --out PATH [--include-audit] [--include-prompts]`**
+  — Online backup via SQLite `VACUUM INTO`; running proxy is not
+  interrupted. Retries on SQLITE_BUSY with exponential backoff so
+  a hot writer doesn't fail the first attempt. Embeds a
+  `kbounce_backup_metadata` table with `kbounce_version`,
+  `created_at`, `source_hostname_hash` (sha256 of hostname,
+  privacy-preserving), `schema_version`, `included_audit`,
+  `included_prompts`. Default excludes audit-firehose tables
+  (`decisions`, `pause_events`, `burst_events`, `pending_prompts`);
+  opt back in with the matching flags. Refuses to clobber an
+  existing output file.
+- **`kbounce restore --in PATH [--dest PATH] [--force]`** —
+  Validates backup metadata first; refuses on `schema_version`
+  mismatch ALWAYS (cross-schema restore is a migration, not a
+  restore); refuses on `kbounce_version` mismatch unless `--force`;
+  refuses if destination DB has rules / tasks rows unless
+  `--force`. Pre-flight probes loopback `/healthz` + refuses if a
+  kbounce listener is detected (`--skip-running-probe` overrides;
+  `--probe-url` retargets). Prints restored row counts + sha256 of
+  the resulting DB file.
+- **OCSF admin-action events** — new `store.backup` (Informational)
+  + `store.restore` (High) AdminAction enum values; both fire when
+  `--audit-log-path` / `KBOUNCER_AUDIT_LOG_PATH` is configured so
+  security teams have a witness for backup + restore operations.
+- **docs/BACKUP-RESTORE.md** — full operator-facing reference
+  including sample migration session.
+- **Cross-product parity** — dbounce ships the same CLI shape
+  (`--out`, `--in`, `--force`, `--include-audit`,
+  `--include-prompts`) + the same metadata-table format per
+  `[[cross-product-agent-parity]]`.
+
 ### Audit-export failure visibility (2026-05-18, #265 Slice 8)
 
 Closes `[[audit-export-failure-visibility]]`. Surfaces export-channel

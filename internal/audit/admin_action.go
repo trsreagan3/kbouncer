@@ -140,6 +140,16 @@ const (
 	// later appearance in a support ticket / agent thread is
 	// traceable. The bundle output path lands in EntityName.
 	AdminActionDiagnosticsBundle AdminAction = "diagnostics.bundle"
+
+	// AdminActionStoreBackup / AdminActionStoreRestore — operator ran
+	// `kbounce backup` / `kbounce restore` (#279). Backup is read-
+	// only against the live store; restore wholesale-replaces the
+	// destination DB file. Recording both gives a security team a
+	// "who copied state off the machine + when?" witness for backup
+	// and a "who replaced the state DB" witness for restore.
+	// EntityName carries the on-disk path of the backup file.
+	AdminActionStoreBackup  AdminAction = "store.backup"
+	AdminActionStoreRestore AdminAction = "store.restore"
 )
 
 // AdminActionActivityID returns the OCSF activity_id (class 6003 enum)
@@ -163,8 +173,15 @@ func AdminActionActivityID(a AdminAction) int {
 	case AdminActionProfileDelete,
 		AdminActionRuleRemove:
 		return ActivityDelete
-	case AdminActionConfigExport, AdminActionDiagnosticsBundle:
+	case AdminActionConfigExport,
+		AdminActionDiagnosticsBundle,
+		AdminActionStoreBackup:
 		return ActivityOther
+	case AdminActionStoreRestore:
+		// Restore wholesale REPLACES the destination DB. CRUD-wise
+		// this is closest to Update (an existing entity's state is
+		// changed) rather than Create (a brand-new one is built).
+		return ActivityUpdate
 	default:
 		return ActivityOther
 	}
@@ -184,6 +201,11 @@ func AdminActionActivityID(a AdminAction) int {
 func AdminActionSeverity(a AdminAction) (int, string) {
 	switch a {
 	case AdminActionLicenseInstall, AdminActionProfileAssign:
+		return SeverityHigh, "High"
+	case AdminActionStoreRestore:
+		// Restore replaces the live state DB; a security team
+		// should review every restore (vs. backup, which is
+		// read-only + routine).
 		return SeverityHigh, "High"
 	default:
 		return SeverityInformational, "Informational"
