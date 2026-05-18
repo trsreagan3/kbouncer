@@ -1304,8 +1304,13 @@ func newProfileShowCmd() *cobra.Command {
 
 // newAuditCmd implements `kbounce audit ...`. Ships `tail` only —
 // the highest-leverage operator workflow ("show me what just happened
-// on the proxy"). Later may add `search`, `export`, and `diff`
-// against a prior known-good baseline.
+// on the proxy"). Later may add `search` and `diff` against a prior
+// known-good baseline.
+//
+// The tail subcommand (see audit_tail.go) covers the full operator-
+// facing surface: paginated rows, live --follow, OCSF-shaped --filter
+// expressions, --summary counts, and --export {jsonl,csv,ocsf-bundle}
+// so a local operator can pipe the same data downstream tools consume.
 func newAuditCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "audit",
@@ -1318,69 +1323,6 @@ the proxy and what verdict each call got.`,
 	}
 	cmd.RunE = parentRequiresSubcommand("audit", cmd)
 	cmd.AddCommand(newAuditTailCmd())
-	return cmd
-}
-
-func newAuditTailCmd() *cobra.Command {
-	var (
-		limit  int
-		dbPath string
-	)
-	cmd := &cobra.Command{
-		Use:   "tail",
-		Short: "Show the most recent N decisions (newest first)",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// UAT-K2 HIGH-K2-03: validate --limit range at parse time.
-			// `--limit 0` silently no-op'd before; `--limit 2000` was
-			// accepted (but the store clamps at 1000 internally). Reject
-			// both with a clear message so operators understand the bound.
-			if limit < 1 || limit > 1000 {
-				return fmt.Errorf("--limit must be in 1-1000 (got %d)", limit)
-			}
-			st, err := store.Open(dbPath)
-			if err != nil {
-				return fmt.Errorf("open store: %w", err)
-			}
-			defer st.Close()
-			rows, err := st.RecentDecisions(limit)
-			if err != nil {
-				return err
-			}
-			if len(rows) == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "(no decisions recorded yet)")
-				return nil
-			}
-			w := cmd.OutOrStdout()
-			fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-9s  %s\n",
-				"AT (UTC)", "MODE", "VERDICT", "SOURCE", "REQUEST")
-			for _, r := range rows {
-				at := r.At.UTC().Format("2006-01-02 15:04:05")
-				src := r.DecisionSource
-				if src == "" {
-					src = "-"
-				}
-				req := r.Method + " " + r.Path
-				if len(req) > 60 {
-					req = req[:57] + "..."
-				}
-				fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-9s  %s\n",
-					at, r.ModeAtDecision, r.DecisionVerdict, src, req)
-				if r.DecisionReason != "" {
-					reason := r.DecisionReason
-					if len(reason) > 80 {
-						reason = reason[:77] + "..."
-					}
-					fmt.Fprintf(w, "%48s  %s\n", "↳", reason)
-				}
-			}
-			return nil
-		},
-	}
-	cmd.Flags().IntVar(&limit, "limit", 50,
-		"Max rows to return (1-1000). Default 50.")
-	cmd.Flags().StringVar(&dbPath, "db", "",
-		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
 	return cmd
 }
 

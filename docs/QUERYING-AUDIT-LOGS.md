@@ -248,3 +248,161 @@ Per the safety-not-surveillance posture,
 tooling. The local JSONL log + SQLite always carry them (operator owns
 those); the HTTPS webhook strips them unless you opt in via
 `--audit-webhook-include-process-tree`.
+
+## Live tail + filtering + summary + export (`kbounce audit tail`)
+
+`kbounce audit tail` is the local-operator view of the same OCSF
+events the SIEM-side queries above key off. The flag set matches the
+cross-product spec — `ibounce audit tail` + `dbounce audit tail`
+ship the same flags, same supported-field catalog, same summary
+groupings, same export formats. An operator who knows one knows them
+all.
+
+```
+kbounce audit tail [--limit N] [--follow]
+                   [--filter EXPR ...]
+                   [--summary]
+                   [--export {jsonl,csv,ocsf-bundle} --out PATH
+                    [--csv-columns col1,col2,...]]
+                   [--db PATH]
+```
+
+### `--follow`
+
+Live tail. Polls the SQLite audit DB every 500ms and prints new
+decisions as they land. Exit with Ctrl-C / SIGINT.
+
+```
+$ kbounce audit tail --follow
+(following kbounce audit DB; Ctrl-C to exit)
+AT (UTC)              MODE         VERDICT  SOURCE     REQUEST
+2026-05-18 14:20:54   transparent  allow    profile    GET /api/v1/namespaces/prod/pods
+2026-05-18 14:20:55   transparent  deny     profile    DELETE /api/v1/namespaces/prod/pods/db-0
+                                                ↳  matched deny rule
+^C
+(follow stopped)
+```
+
+### `--filter EXPR` (repeatable; AND-combined)
+
+Three operators:
+
+| Form | Semantics |
+|---|---|
+| `field=value` | exact string equality |
+| `field~regex` | Go regexp (RE2) match |
+| `field>=N` / `field<=N` | numeric comparison (integer fields only) |
+
+Supported fields (cross-product vocabulary; same in ibounce + dbounce):
+
+- `severity_id` — OCSF severity enum (1=Informational ... 5=Critical)
+- `activity_id` — OCSF activity enum (1=Create, 2=Read, 3=Update, 4=Delete, 99=Other)
+- `status_id` — OCSF status enum (1=Success, 2=Failure, 99=Other)
+- `actor.user.name` — best-effort principal name
+- `api.operation` — K8s verb (e.g. `delete`, `list`)
+- `unmapped.iam_jit.agent.name` — agent identity (see Agent identity caveat below)
+- `unmapped.iam_jit.agent.session_id` — per-MCP-connection UUID v7
+- `unmapped.iam_jit.event_type` — `DECISION` / `SESSION_ENDED` / `HEARTBEAT` / ...
+
+kbounce-specific extensions:
+
+- `resource.namespace` — K8s namespace
+- `resource.name` — `namespace/name` or `name` (cluster-scope)
+- `resource.type` — `kubernetes pod` / `kubernetes secret` / ...
+- `unmapped.iam_jit.verdict` — `ALLOW` / `DENY` / `BYPASS`
+- `unmapped.iam_jit.mode` — `cooperative` / `transparent`
+- `unmapped.iam_jit.profile` — active profile name
+- `unmapped.iam_jit.enforced` — `true` / `false`
+
+Examples:
+
+```
+# DELETE-shaped calls only
+kbounce audit tail --filter 'api.operation=delete'
+
+# DELETEs against prod, regex form
+kbounce audit tail --filter 'api.operation~^delete$' \
+                   --filter 'resource.namespace=prod'
+
+# Anything Medium-severity or worse
+kbounce audit tail --filter 'severity_id>=3'
+```
+
+### `--summary`
+
+Count-summary instead of rows. Four groupings:
+
+```
+$ kbounce audit tail --summary
+audit-tail summary (3 row(s) considered)
+
+BY EVENT_TYPE
+       3  DECISION
+
+BY SEVERITY
+       3  Informational
+
+BY ACTOR
+       3  (unknown)
+
+BY API.OPERATION
+       1  create
+       1  delete
+       1  list
+```
+
+Mutually exclusive with `--follow` (summary is a terminal aggregation;
+follow is open-ended).
+
+### `--export {jsonl,csv,ocsf-bundle} --out PATH`
+
+Bulk-export the filtered row set for downstream tools.
+
+- `--export jsonl` — one OCSF API Activity event per line. Round-trips
+  through `jq`. Mirrors the wire shape your SIEM ingests.
+- `--export csv` — tabular view. Default columns:
+  `timestamp,severity,event_type,actor,operation,verdict,agent.name,agent.session_id`.
+  PII columns (`actor.user.name`, `actor.user.uid`,
+  `agent.process_exe`, `agent.parent_exe`, `agent.user_agent_raw`)
+  are OUT of the default set; opt in by naming them in `--csv-columns`.
+- `--export ocsf-bundle` — single OCSF Detection Finding (class 2004)
+  wrapping the events under `.events[]`. Lets a security team upload
+  a forensic snapshot in one shot via a SIEM batch-import endpoint.
+
+```
+$ kbounce audit tail --filter 'unmapped.iam_jit.verdict=DENY' \
+                     --export jsonl --out denies.jsonl
+wrote 7 row(s) to denies.jsonl (format=jsonl)
+
+$ jq -c 'select(.api.operation=="delete")' denies.jsonl
+```
+
+`--export` composes with `--filter` (filter applies first; export
+writes the survivors).
+
+### Agent identity caveat for SQLite-sourced rows
+
+`kbounce audit tail` reads from the SQLite audit DB, which does NOT
+persist the agent-identity block (agent name + session id are bound
+in memory for the lifetime of the proxy process; only the JSONL log +
+HTTPS webhook persist them). SQLite-sourced rows render
+`unmapped.iam_jit.agent.name = "unknown"`. For agent-scoped queries,
+`jq` over `~/.kbouncer/audit.jsonl` (or your SIEM) is the canonical
+path — the SQLite store is for "what just happened on the proxy"
+local-operator workflows.
+
+### Cross-product parity
+
+| Surface | ibounce | kbounce | dbounce |
+|---|---|---|---|
+| `audit tail --follow` | ships | ships | ships |
+| `audit tail --filter EXPR` | ships | ships | ships |
+| `audit tail --summary` | ships | ships | ships |
+| `audit tail --export {jsonl,csv,ocsf-bundle}` | ships | ships | ships |
+| Supported filter fields | shared catalog above | shared + `resource.namespace`/`.name`/`.type` | shared + dbounce SQL ext |
+
+Per [[cross-product-agent-parity]]: the flag set + supported field
+vocabulary + summary groupings + export formats are identical across
+the suite. Product-specific extension fields (kbounce's
+`resource.namespace`, dbounce's SQL-statement fields) are additive —
+they never replace the shared catalog.

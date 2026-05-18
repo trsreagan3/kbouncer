@@ -5,6 +5,57 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Local-operator `audit tail` UX — follow / filter / summary / export (2026-05-18, #268)
+
+Closes `[[cross-product-agent-parity]]`-#268. `kbounce audit tail`
+grows from "print last N rows" to the full local-operator workflow
+the spec lays out — the same shape `ibounce audit tail` +
+`dbounce audit tail` ship. Per founder direction: this is a SELLING
+surface ("users being able to see a stream of requests coming from
+their agent via UI, or in the terminal will be very helpful for
+selling the product even if its not something new").
+
+- **`--follow`** — live tail the SQLite audit DB; 500ms poll cadence;
+  Ctrl-C / SIGINT exits cleanly. Banner + close-out marker frame the
+  stream so the operator knows the loop is alive.
+- **`--filter EXPR`** — repeatable; AND-combined. Three operators:
+  `field=value` (string equality), `field~regex` (RE2), `field>=N` /
+  `field<=N` (numeric). The filter language operates against the
+  OCSF wire shape (the same one downstream SIEMs key off) so the
+  filter expressions an operator learns locally transfer directly to
+  their Splunk / Datadog / Sentinel queries. Supported field catalog
+  matches the cross-product spec + adds kbounce-native
+  `resource.namespace`/`.name`/`.type` and the
+  `unmapped.iam_jit.{verdict,mode,profile,enforced}` quartet.
+- **`--summary`** — count-summary instead of rows. Four groupings:
+  by `event_type`, `severity`, `actor`, `api.operation`. Mutually
+  exclusive with `--follow` (summary is a terminal aggregation).
+- **`--export {jsonl,csv,ocsf-bundle} --out PATH`** —
+  - `jsonl` round-trips through `jq` (one OCSF API Activity event per
+    line; mirrors the wire shape your SIEM ingests).
+  - `csv` defaults to a conservative column set
+    (`timestamp,severity,event_type,actor,operation,verdict,agent.name,
+    agent.session_id`); PII fields (`actor.user.{name,uid}`,
+    `agent.{process_exe,parent_exe,user_agent_raw}`) are opt-in via
+    `--csv-columns LIST`.
+  - `ocsf-bundle` wraps the events in an OCSF Detection Finding
+    (class 2004) for SIEM batch import.
+- **Agent-identity caveat** — SQLite-sourced rows render
+  `unmapped.iam_jit.agent.name = "unknown"` because the agent block is
+  in-memory only (only the JSONL log + HTTPS webhook persist it).
+  Documented in docs/QUERYING-AUDIT-LOGS.md so operators reach for
+  `jq` over the JSONL stream when they need agent-scoped filtering.
+- **Tests** — 18 new tests in
+  `internal/cli/audit_tail_test.go` cover the filter parser (every
+  operator + the unknown-field error path), --summary counts (incl.
+  empty DB), --follow (printing + cancel), all three export formats
+  with format-validation round-trips, and the
+  `--follow` × `--summary` mutex.
+- **Docs** — `docs/QUERYING-AUDIT-LOGS.md` adds a "Live tail +
+  filtering + summary + export" section with worked examples + the
+  cross-product parity table; README's `audit tail` entry is rewritten
+  to describe the full flag set + links to the deep doc.
+
 ### Cross-product config-export wire reconciliation (2026-05-18, #288)
 
 Closes `[[cross-product-agent-parity]]`-#288. The `kbounce config

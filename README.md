@@ -172,10 +172,32 @@ into `~/.kbouncer/tls/`. Add `ca.crt` to your kubectl context's
   Installed profiles' `source` is the URL; they are read-only at the
   CLI.
 
-### `kbounce audit tail [--limit N]`
+### `kbounce audit tail [--limit N] [--follow] [--filter EXPR ...] [--summary] [--export FORMAT --out PATH]`
 
-Show the most recent N decisions, newest first. `--limit` must be
-1-1000 (rejected at parse time; closes UAT-K2 HIGH-K2-03).
+Show recent decisions; optionally follow live, filter, summarize, or
+export. Per [[cross-product-agent-parity]] the flag set matches
+`ibounce audit tail` + `dbounce audit tail` so an operator who knows
+one knows them all.
+
+- `--limit N` — cap row count (1-1000, default 50; rejected at parse
+  time per UAT-K2 HIGH-K2-03).
+- `--follow` — tail the audit DB live (500ms poll; Ctrl-C to exit).
+  Mutually exclusive with `--summary` and `--export`.
+- `--filter EXPR` — repeatable; AND-combined. Forms: `field=value`,
+  `field~regex`, `field>=N`, `field<=N`. Supported fields include the
+  cross-product catalog (`severity_id`, `activity_id`, `status_id`,
+  `actor.user.name`, `api.operation`, `unmapped.iam_jit.agent.{name,
+  session_id}`, `unmapped.iam_jit.event_type`) plus kbounce-specific
+  extensions (`resource.namespace`, `resource.name`, `resource.type`,
+  `unmapped.iam_jit.{verdict,mode,profile,enforced}`).
+- `--summary` — print count groupings (by event_type, severity,
+  actor, operation) instead of rows.
+- `--export {jsonl,csv,ocsf-bundle} --out PATH` — bulk-export the
+  filtered set. CSV defaults omit PII columns; opt in via
+  `--csv-columns LIST`.
+
+Full filter / export catalog + worked examples + cross-product parity
+table live in [docs/QUERYING-AUDIT-LOGS.md](docs/QUERYING-AUDIT-LOGS.md#live-tail--filtering--summary--export-kbounce-audit-tail).
 
 ### `kbounce rules {add, list, remove}`
 
