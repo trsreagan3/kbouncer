@@ -302,3 +302,126 @@ func TestNormalize_AppliesSyncPromptDefaults(t *testing.T) {
 	assert.Equal(t, DefaultSyncPromptTimeout, c.SyncPromptTimeout)
 	assert.Equal(t, DefaultPolicyDeny, c.SyncPromptDefault)
 }
+
+// Cross-process poll fallback — pins the gap that the in-process #203
+// wake mechanism leaves open. The typical operator runs `kbounce run`
+// and `kbounce prompts answer` in DIFFERENT processes; each process
+// has its own in-memory waiter map, so the answerer's wakeSyncWaiter
+// call hits the wrong map and the proxy goroutine never sees it. The
+// 200ms poll path closes that gap by reading pending_prompts.status
+// from the shared SQLite file.
+
+func TestSyncWait_CrossProcessAnswerPollsToDecision(t *testing.T) {
+	st := freshStore(t)
+	fas := newFakeAPIServer(t, true)
+	up := upstreamFor(t, fas)
+
+	// Second Store handle on the SAME SQLite file simulates a separate
+	// `kbounce prompts answer` process: its own (empty) syncWaiters
+	// map means the in-memory wake is a no-op; only the poll fallback
+	// can resolve the proxy's wait.
+	answerer, err := store.Open(st.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = answerer.Close() })
+
+	s := NewServer(Config{
+		Mode:              ModeTransparent,
+		DefaultPolicy:     DefaultPolicyDeny,
+		SyncPromptOnDeny:  true,
+		SyncPromptTimeout: 3 * time.Second,
+		SyncPromptDefault: DefaultPolicyDeny,
+		Upstream:          up,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	// "Other process" answers via the second store handle.
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			// Poll the persisted table via the second handle — its
+			// in-memory waiter map is empty, so this lookup is the
+			// only thing tying the two processes together.
+			rows, lerr := answerer.ListPendingPrompts(store.PromptStatusPending, 10)
+			if lerr == nil && len(rows) == 1 && rows[0].SyncWaitID != "" {
+				_, _ = answerer.AnswerPendingPrompt(
+					rows[0].ID, store.PromptAnswerKindAlways, "", "other-process",
+				)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	start := time.Now()
+	resp, err := http.Get(ts.URL + "/api/v1/namespaces/default/pods")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"cross-process answer (poll fallback) must surface upstream's status; body=%s",
+		string(body))
+	assert.Equal(t, SyncPromptResolutionAllow, resp.Header.Get(SyncPromptResponseHeader),
+		"poll-fallback wake must resolve as a normal allow")
+	require.Len(t, fas.received, 1, "exactly one upstream call after poll-resolved allow")
+
+	// Latency budget: poll cadence is 200ms; the answerer loop sleeps
+	// 10ms between checks. End-to-end resolution should land well
+	// under 1s and emphatically NOT at the 3s timeout.
+	assert.Less(t, elapsed, 1500*time.Millisecond,
+		"poll fallback should resolve within ~poll-cadence + answerer-loop slack, got %s",
+		elapsed)
+
+	// Waiter slot must be released even though the wake came from poll
+	// (defer ForgetSyncWaiter handles it).
+	assert.Equal(t, 0, st.SyncWaiterCount(), "waiter map must release after poll resolution")
+
+	// No leftover pending row.
+	pending, err := st.ListPendingPrompts(store.PromptStatusPending, 50)
+	require.NoError(t, err)
+	assert.Empty(t, pending, "row should be marked answered, not pending")
+}
+
+func TestSyncWait_CrossProcessPollRespectsTimeout(t *testing.T) {
+	// Same shape, but nobody ever answers. The poll ticker fires
+	// repeatedly + finds the row still pending; the request must
+	// resolve at SyncPromptTimeout with the default-deny verdict.
+	// Pins that the poll loop does NOT mask the timeout path.
+	st := freshStore(t)
+	fas := newFakeAPIServer(t, true)
+	up := upstreamFor(t, fas)
+
+	timeout := 350 * time.Millisecond
+	s := NewServer(Config{
+		Mode:              ModeTransparent,
+		DefaultPolicy:     DefaultPolicyDeny,
+		SyncPromptOnDeny:  true,
+		SyncPromptTimeout: timeout,
+		SyncPromptDefault: DefaultPolicyDeny,
+		Upstream:          up,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	start := time.Now()
+	resp, err := http.Get(ts.URL + "/api/v1/namespaces/default/pods")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"unanswered sync prompt must time out to the default deny")
+	assert.Equal(t, SyncPromptResolutionTimeout, resp.Header.Get(SyncPromptResponseHeader))
+	assert.Empty(t, fas.received, "no upstream call on timeout-deny")
+
+	// Sanity: the response landed AT OR AFTER the timeout, not before
+	// it. Without an upper bound — under load the test runner might
+	// add latency — but we still want to confirm the timeout fired
+	// (not, say, instant deny from a bug in the new poll path).
+	assert.GreaterOrEqual(t, elapsed, timeout,
+		"timeout path must wait at least SyncPromptTimeout, got %s", elapsed)
+
+	assert.Equal(t, 0, st.SyncWaiterCount(), "waiter map must release on timeout")
+}

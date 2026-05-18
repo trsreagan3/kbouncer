@@ -272,3 +272,73 @@ func TestSyncWaiter_ConcurrentRace(t *testing.T) {
 	wg.Wait()
 	assert.Equal(t, 0, s.SyncWaiterCount(), "all waiters must be released")
 }
+
+// GetPendingPromptBySyncWaitID — exercises the lookup helper added for
+// the cross-process poll fallback. The helper underpins the proxy's
+// ability to detect an answer issued from a DIFFERENT process (the
+// typical `kbounce prompts answer` invocation): the in-memory channel
+// wake fires in the answerer's process; the proxy notices via SQLite.
+
+func TestGetPendingPromptBySyncWaitID_ReturnsRow(t *testing.T) {
+	s := freshDB(t)
+	syncID, _, err := s.AddSyncPendingPrompt(PromptInput{
+		DecisionID: 11, Verb: "get", Resource: "pods", DenyReason: "lookup-by-sync-id",
+	})
+	require.NoError(t, err)
+	defer s.ForgetSyncWaiter(syncID)
+
+	row, err := s.GetPendingPromptBySyncWaitID(syncID)
+	require.NoError(t, err)
+	require.NotNil(t, row, "must return the row keyed by sync_wait_id")
+	assert.Equal(t, syncID, row.SyncWaitID)
+	assert.Equal(t, int64(11), row.DecisionID)
+	assert.Equal(t, "get", row.Verb)
+	assert.Equal(t, PromptStatusPending, row.Status,
+		"freshly-added sync prompt must still be pending")
+	assert.Empty(t, row.AnswerKind, "no answer recorded yet")
+}
+
+func TestGetPendingPromptBySyncWaitID_ReturnsNilWhenMissing(t *testing.T) {
+	s := freshDB(t)
+	row, err := s.GetPendingPromptBySyncWaitID("0123456789abcdef0123456789abcdef")
+	require.NoError(t, err, "missing row must NOT be an error (mirrors GetPendingPrompt)")
+	assert.Nil(t, row, "missing row must return nil")
+
+	// Empty id is a defensive short-circuit; document that it returns nil
+	// rather than scanning a NULL match.
+	row, err = s.GetPendingPromptBySyncWaitID("")
+	require.NoError(t, err)
+	assert.Nil(t, row, "empty sync_wait_id must short-circuit to nil")
+}
+
+func TestGetPendingPromptBySyncWaitID_ReflectsAnsweredStatusUpdate(t *testing.T) {
+	// The poll-fallback contract: after AnswerPendingPrompt commits,
+	// a subsequent GetPendingPromptBySyncWaitID must see the new status
+	// + answer_kind. This is what the proxy's 200ms ticker depends on
+	// to detect cross-process resolution.
+	s := freshDB(t)
+	syncID, _, err := s.AddSyncPendingPrompt(PromptInput{
+		DecisionID: 12, Verb: "delete", Resource: "deployments",
+		DenyReason: "status-update-visible",
+	})
+	require.NoError(t, err)
+
+	// Snapshot the row id so we can issue the answer.
+	rows, err := s.ListPendingPrompts(PromptStatusPending, 50)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	rowID := rows[0].ID
+	require.Equal(t, syncID, rows[0].SyncWaitID)
+
+	ok, err := s.AnswerPendingPrompt(rowID, PromptAnswerKindIgnore, "", "operator-bob")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	row, err := s.GetPendingPromptBySyncWaitID(syncID)
+	require.NoError(t, err)
+	require.NotNil(t, row, "answered row must still be findable by sync_wait_id")
+	assert.Equal(t, PromptStatusAnswered, row.Status)
+	assert.Equal(t, PromptAnswerKindIgnore, row.AnswerKind)
+	assert.Equal(t, "operator-bob", row.AnsweredBy)
+	assert.NotEmpty(t, row.AnsweredAt, "answered_at must be populated")
+}

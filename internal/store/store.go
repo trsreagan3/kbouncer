@@ -917,6 +917,42 @@ func (s *Store) GetPendingPrompt(id int64) (*PromptRow, error) {
 	return &p, nil
 }
 
+// GetPendingPromptBySyncWaitID returns the prompt row keyed by its
+// sync_wait_id, or nil if no row matches. Used by the proxy's cross-
+// process poll fallback in handleSyncPromptDeny: when `kbounce run` +
+// `kbounce prompts answer` execute in DIFFERENT processes (the typical
+// operator workflow), AnswerPendingPrompt's in-memory channel wake
+// fires in the answerer's process — invisible to the proxy. The proxy
+// goroutine polls this lookup on a 200ms cadence to detect the
+// persisted status change. Indexed via idx_pending_prompts_sync_wait_id.
+func (s *Store) GetPendingPromptBySyncWaitID(id string) (*PromptRow, error) {
+	if id == "" {
+		return nil, nil
+	}
+	row := s.db.QueryRow(
+		`SELECT id, created_at, decision_id, verb, group_name, version,
+		        resource, namespace, name, deny_reason, status,
+		        COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
+		        COALESCE(answered_by, ''), COALESCE(answered_at, ''),
+		        COALESCE(sync_wait_id, '')
+		 FROM pending_prompts WHERE sync_wait_id = ?`, id,
+	)
+	var p PromptRow
+	err := row.Scan(
+		&p.ID, &p.CreatedAt, &p.DecisionID, &p.Verb, &p.Group, &p.Version,
+		&p.Resource, &p.Namespace, &p.Name, &p.DenyReason, &p.Status,
+		&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
+		&p.SyncWaitID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kbounce: get pending prompt by sync_wait_id: %w", err)
+	}
+	return &p, nil
+}
+
 // PromptAnswerKindAlways / Profile / Ignore are the canonical answer
 // kinds accepted by AnswerPendingPrompt.
 const (

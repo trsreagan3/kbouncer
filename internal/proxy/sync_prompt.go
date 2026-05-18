@@ -112,50 +112,115 @@ func (s *Server) handleSyncPromptDeny(
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	select {
-	case decision := <-ch:
-		if decision.Allow {
-			log.Debug().
-				Str("sync_wait_id", syncID).
-				Str("kind", decision.Kind).
-				Msg("kbounce: sync-prompt resolved ALLOW — forwarding to upstream")
-			w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionAllow)
-			s.forwardSyncPromptAllow(w, r, obs)
-			return true
-		}
-		log.Debug().
-			Str("sync_wait_id", syncID).
-			Str("kind", decision.Kind).
-			Msg("kbounce: sync-prompt resolved DENY — returning 403")
-		w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionDeny)
-		writeK8sForbidden(w, obs)
-		return true
-	case <-timer.C:
-		// Timeout → apply SyncPromptDefault. If default=allow, treat
-		// the call like an answered-allow; otherwise return 403.
-		if s.cfg.SyncPromptDefault == DefaultPolicyAllow {
+	// Cross-process poll fallback. The in-memory waiter channel only
+	// fires when AnswerPendingPrompt runs in the SAME process as the
+	// proxy. The typical operator workflow is `kbounce run` in one
+	// process + `kbounce prompts answer` in another (CLI / MCP / Slack
+	// hook) — the answerer's wakeSyncWaiter call hits a DIFFERENT
+	// in-memory map and the proxy goroutine never sees it. To close
+	// that gap we ALSO poll pending_prompts.status on a 200ms cadence
+	// + map the persisted answer_kind onto a PromptDecision. Both
+	// paths race; the first one wins.
+	//
+	// 200ms strikes the balance between operator-perceived latency
+	// ("I answered, why is kubectl still hung?") and SQLite read
+	// overhead (negligible for an indexed single-row lookup, but no
+	// point hammering it). Mirrors dbounce commit d82ded9.
+	poll := time.NewTicker(200 * time.Millisecond)
+	defer poll.Stop()
+
+	for {
+		select {
+		case decision := <-ch:
+			return s.resolveSyncPromptDecision(w, r, obs, syncID, decision, "in-process channel")
+		case <-poll.C:
+			// Cross-process path: read the row's persisted status. The
+			// answerer UPDATEd the row through the same SQLite file but
+			// couldn't wake our in-memory channel (different process).
+			row, err := s.store.GetPendingPromptBySyncWaitID(syncID)
+			if err != nil {
+				recordLookupError(err, "kbounce: poll sync-prompt status failed")
+				continue
+			}
+			if row == nil || row.Status != store.PromptStatusAnswered {
+				continue
+			}
+			decision := answerToDecision(row)
+			return s.resolveSyncPromptDecision(w, r, obs, syncID, decision, "cross-process poll")
+		case <-timer.C:
+			// Timeout → apply SyncPromptDefault. If default=allow, treat
+			// the call like an answered-allow; otherwise return 403.
+			if s.cfg.SyncPromptDefault == DefaultPolicyAllow {
+				log.Info().
+					Str("sync_wait_id", syncID).
+					Dur("timeout", timeout).
+					Msg("kbounce: sync-prompt timeout; default=allow → forwarding")
+				w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionTimeout+"-allow")
+				s.forwardSyncPromptAllow(w, r, obs)
+				return true
+			}
 			log.Info().
 				Str("sync_wait_id", syncID).
 				Dur("timeout", timeout).
-				Msg("kbounce: sync-prompt timeout; default=allow → forwarding")
-			w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionTimeout+"-allow")
-			s.forwardSyncPromptAllow(w, r, obs)
+				Msg("kbounce: sync-prompt timeout; default=deny → returning 403")
+			w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionTimeout)
+			writeK8sForbidden(w, obs)
+			return true
+		case <-r.Context().Done():
+			// Inbound client gave up; nothing to write — the connection is
+			// torn down. Still need to release the waiter slot (deferred).
+			log.Debug().
+				Str("sync_wait_id", syncID).
+				Msg("kbounce: sync-prompt request context cancelled before answer")
 			return true
 		}
-		log.Info().
-			Str("sync_wait_id", syncID).
-			Dur("timeout", timeout).
-			Msg("kbounce: sync-prompt timeout; default=deny → returning 403")
-		w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionTimeout)
-		writeK8sForbidden(w, obs)
-		return true
-	case <-r.Context().Done():
-		// Inbound client gave up; nothing to write — the connection is
-		// torn down. Still need to release the waiter slot (deferred).
+	}
+}
+
+// resolveSyncPromptDecision writes the response for a resolved
+// PromptDecision (from either the in-process channel OR the cross-
+// process poll). Returns true since the response is fully written.
+// Extracted so the two wake paths emit identical headers + forwarding.
+func (s *Server) resolveSyncPromptDecision(
+	w http.ResponseWriter,
+	r *http.Request,
+	obs *RequestObservation,
+	syncID string,
+	decision store.PromptDecision,
+	source string,
+) bool {
+	if decision.Allow {
 		log.Debug().
 			Str("sync_wait_id", syncID).
-			Msg("kbounce: sync-prompt request context cancelled before answer")
+			Str("kind", decision.Kind).
+			Str("wake_source", source).
+			Msg("kbounce: sync-prompt resolved ALLOW — forwarding to upstream")
+		w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionAllow)
+		s.forwardSyncPromptAllow(w, r, obs)
 		return true
+	}
+	log.Debug().
+		Str("sync_wait_id", syncID).
+		Str("kind", decision.Kind).
+		Str("wake_source", source).
+		Msg("kbounce: sync-prompt resolved DENY — returning 403")
+	w.Header().Set(SyncPromptResponseHeader, SyncPromptResolutionDeny)
+	writeK8sForbidden(w, obs)
+	return true
+}
+
+// answerToDecision projects a persisted prompt row's answer_kind into
+// the binary allow/deny PromptDecision the proxy needs. Mirrors the
+// kind→Allow mapping AnswerPendingPrompt does for the in-process wake
+// (always|profile → allow, ignore → deny). Used by the cross-process
+// poll fallback where we only see the row, not the original decision.
+func answerToDecision(row *store.PromptRow) store.PromptDecision {
+	allow := row.AnswerKind == store.PromptAnswerKindAlways ||
+		row.AnswerKind == store.PromptAnswerKindProfile
+	return store.PromptDecision{
+		Allow:      allow,
+		Kind:       row.AnswerKind,
+		AnsweredBy: row.AnsweredBy,
 	}
 }
 
