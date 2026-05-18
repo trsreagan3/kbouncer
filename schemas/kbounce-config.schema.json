@@ -19,9 +19,9 @@
   ],
   "properties": {
     "schema_version": {
-      "description": "Wire-format version. Currently 1.",
-      "type": "integer",
-      "enum": [1]
+      "description": "Wire-format version. Currently \"1.0\" (string semver) per the #288 cross-product reconciliation. Pre-#288 exports carrying `schema_version: 1` (int) are accepted by the importer (normalized + a stderr deprecation warning is printed). Future minor versions add fields without bumping; major bumps land as \"2.0\" with a clear cross-binary error.",
+      "type": "string",
+      "enum": ["1.0"]
     },
     "product": {
       "description": "Product name. Must be \"kbounce\" for a kbounce import.",

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "product": "kbounce",
+  "exported_at": "2026-05-17T00:00:00Z",
+  "binary_version": "v0.9.0-pre-288",
+  "profiles": [],
+  "rules": [
+    {
+      "pattern": "pods:get",
+      "effect": "allow"
+    }
+  ],
+  "tasks": [],
+  "presets": [],
+  "audit_export": {
+    "token_masked": false
+  },
+  "license_pointer": "",
+  "runtime_config": {}
+}

@@ -19,9 +19,9 @@
   ],
   "properties": {
     "schema_version": {
-      "description": "Wire-format version. Currently 1.",
-      "type": "integer",
-      "enum": [1]
+      "description": "Wire-format version. Currently \"1.0\" (string semver) per the #288 cross-product reconciliation. Pre-#288 exports carrying `schema_version: 1` (int) are normalized to \"1.0\" by the importer before schema validation, so this enum only lists the canonical string form. Backwards compat for the int form lives in normalizeLegacySchemaVersion.",
+      "type": "string",
+      "enum": ["1.0"]
     },
     "product": {
       "description": "Product name. Must be \"kbounce\" for a kbounce import.",

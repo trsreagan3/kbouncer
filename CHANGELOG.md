@@ -5,6 +5,33 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Cross-product config-export wire reconciliation (2026-05-18, #288)
+
+Closes `[[cross-product-agent-parity]]`-#288. The `kbounce config
+export/import` wire shape now matches ibounce + gbounce + dbounce
+exactly so a single cross-product backup workflow targets every Bounce
+product with one CLI shape.
+
+- **`schema_version`** is now `"1.0"` (string semver) instead of `1`
+  (int). Bumps to `"1.1"` (additive) or `"2.0"` (breaking) preserve
+  the parser shape across version drift.
+- **`--in PATH`** is the primary `config import` flag (matches
+  ibounce + gbounce + dbounce). `--from PATH` stays as a DEPRECATED
+  alias — still works, prints a stderr deprecation warning.
+- **Backwards compat** — pre-#288 exports with `schema_version: 1`
+  (int) import cleanly into the new binary. The importer normalizes
+  the field to `"1.0"` before schema validation runs + prints a
+  stderr deprecation warning. The compat window stays open across
+  the full v1.x line.
+- **Testdata fixture** —
+  `internal/cli/testdata/legacy-int-schema_version.json` pins a
+  pre-#288 export as a regression watchdog; a future schema-validator
+  change cannot silently drop legacy compat without the new test
+  surfacing the regression.
+- **Docs** — new `docs/CONFIG-EXPORT-IMPORT.md` covers the wire shape,
+  the CLI flags, the cross-product parity contract, and the
+  backwards-compat window.
+
 ### SQLite backup + restore (2026-05-18, #279)
 
 Closes `[[deliberate-feature-completion]]`-#279. Single-file SQLite

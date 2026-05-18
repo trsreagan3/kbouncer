@@ -369,7 +369,8 @@ func TestDiagnosticsBundle_RedactsConfigSecrets(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(cfgRaw), &exp),
 		"02-config-redacted.json must be a valid ConfigExport")
 	assert.Equal(t, "kbounce", exp.Product)
-	assert.Equal(t, 1, exp.SchemaVersion)
+	assert.Equal(t, "1.0", exp.SchemaVersion,
+		"diagnostics bundle config must use the post-#288 string semver")
 }
 
 func TestDiagnosticsBundle_EnvKeysOnlyNoValues(t *testing.T) {

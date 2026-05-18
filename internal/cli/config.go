@@ -11,12 +11,18 @@
 // What ships:
 //
 //   kbounce config export [--out PATH] [--with-secrets | --redact-secrets]
-//   kbounce config import --from PATH [--dry-run] [--merge | --replace] [--yes]
+//   kbounce config import --in PATH [--dry-run] [--merge | --replace] [--yes]
+//
+// (The legacy `--from PATH` flag is preserved as a DEPRECATED alias for
+// `--in PATH` per #288 — it still works but prints a stderr deprecation
+// warning. New scripts should use `--in PATH` to match ibounce + gbounce +
+// dbounce; one cross-product backup script can target every Bounce
+// product with the same flag name.)
 //
 // Wire shape (load-bearing for cross-product future):
 //
 //   {
-//     "schema_version": 1,
+//     "schema_version": "1.0",
 //     "product": "kbounce",
 //     "exported_at": "<ISO-8601 UTC>",
 //     "binary_version": "<from cli.version>",
@@ -74,9 +80,18 @@ import (
 )
 
 // ConfigSchemaVersion is the wire-format version of the export JSON.
-// Bumped only on breaking changes; additive changes leave it at 1 so
-// older importers degrade gracefully (unknown fields ignored).
-const ConfigSchemaVersion = 1
+// String semver per the #288 cross-product reconciliation: lets us bump
+// "1.0" → "1.1" (additive) vs "2.0" (breaking) without changing the
+// parser shape. Matches the ibounce + gbounce + dbounce shape so a
+// customer's single cross-product backup parser handles every Bounce
+// product identically.
+const ConfigSchemaVersion = "1.0"
+
+// LegacyIntSchemaVersion is the pre-#288 wire value (raw int 1). New
+// exports always emit the string form, but importers accept the int
+// form indefinitely (printing a stderr deprecation warning) so old
+// exports on disk stay readable across binary upgrades.
+const LegacyIntSchemaVersion = 1
 
 // ConfigProduct is the product name stamped into every export.
 // Refusing imports whose `product` field doesn't match is the
@@ -97,7 +112,7 @@ var embeddedConfigSchema []byte
 // expected by `config import`. JSON tags are the wire shape — Go field
 // names are free to evolve as long as the tags stay stable.
 type ConfigExport struct {
-	SchemaVersion  int                    `json:"schema_version"`
+	SchemaVersion  string                 `json:"schema_version"`
 	Product        string                 `json:"product"`
 	ExportedAt     string                 `json:"exported_at"`
 	BinaryVersion  string                 `json:"binary_version"`
@@ -611,6 +626,10 @@ type ImportOptions struct {
 	Mode ImportMode
 	// DryRun, when true, computes the diff but does NOT mutate state.
 	DryRun bool
+	// DeprecationOut receives wire-shape deprecation warnings (legacy
+	// int schema_version, etc.). nil discards them; the CLI surface
+	// wires cmd.ErrOrStderr() so an operator sees the heads-up.
+	DeprecationOut io.Writer
 }
 
 // LoadAndValidate reads + JSON-decodes + schema-validates the import
@@ -618,10 +637,45 @@ type ImportOptions struct {
 // are surfaced with a list of validation failures so the operator can
 // fix the file. The `product` check is the load-bearing "you can't
 // import a dbounce export into kbounce" guard.
+//
+// Cross-product reconciliation (#288): accepts BOTH the new
+// `schema_version: "1.0"` (string) shape AND the pre-#288
+// `schema_version: 1` (int) shape. The int form is rewritten in-place
+// to the canonical string form before schema validation runs (so the
+// schema can require the string-shape contract going forward), and a
+// deprecation warning is written to `deprecationOut` when supplied.
+// The wire deprecation window stays open across the whole v1.x line
+// per [[push-policy-public-repo]]-adjacent compat rules — old exports
+// on disk must keep importing cleanly indefinitely.
 func LoadAndValidate(r io.Reader) (*ConfigExport, error) {
+	return loadAndValidate(r, nil)
+}
+
+// loadAndValidate is the unexported workhorse. `deprecationOut`
+// receives any deprecation warnings (legacy int schema_version etc.);
+// nil discards them. Tests + CLI wire a real writer; library callers
+// who don't care pass nil via the LoadAndValidate alias.
+func loadAndValidate(r io.Reader, deprecationOut io.Writer) (*ConfigExport, error) {
 	raw, err := io.ReadAll(io.LimitReader(r, 64<<20)) // 64 MiB cap
 	if err != nil {
 		return nil, fmt.Errorf("read import: %w", err)
+	}
+
+	// Pre-normalize the wire shape: pre-#288 exports carry
+	// `schema_version: 1` (int). Rewrite to `"1.0"` so the schema
+	// validator + downstream Go decoder see the canonical shape. A
+	// deprecation warning is emitted on the supplied writer so a
+	// scripted operator sees the heads-up exactly once per import.
+	normalized, legacyIntSeen, nerr := normalizeLegacySchemaVersion(raw)
+	if nerr != nil {
+		return nil, nerr
+	}
+	if legacyIntSeen && deprecationOut != nil {
+		fmt.Fprintln(deprecationOut,
+			"kbounce: deprecation: import uses legacy `schema_version: 1` "+
+				"(int) shape; this kbounce understands it but future major "+
+				"versions will refuse it. Re-export with this binary to "+
+				"upgrade to `schema_version: \"1.0\"` (string).")
 	}
 
 	// Schema validation FIRST so structural errors surface with the
@@ -629,18 +683,18 @@ func LoadAndValidate(r io.Reader) (*ConfigExport, error) {
 	// minimal in-house JSON-Schema subset (no third-party deps per
 	// the slice constraints); it validates the required fields +
 	// type tags that the wire contract depends on.
-	if errs := validateConfigJSON(raw, embeddedConfigSchema); len(errs) > 0 {
+	if errs := validateConfigJSON(normalized, embeddedConfigSchema); len(errs) > 0 {
 		return nil, fmt.Errorf("schema validation failed:\n  - %s",
 			strings.Join(errs, "\n  - "))
 	}
 
 	var exp ConfigExport
-	if err := json.Unmarshal(raw, &exp); err != nil {
+	if err := json.Unmarshal(normalized, &exp); err != nil {
 		return nil, fmt.Errorf("parse import JSON: %w", err)
 	}
 	if exp.SchemaVersion != ConfigSchemaVersion {
 		return nil, fmt.Errorf(
-			"schema_version mismatch: import has %d, this kbounce expects %d",
+			"schema_version mismatch: import has %q, this kbounce expects %q",
 			exp.SchemaVersion, ConfigSchemaVersion)
 	}
 	if exp.Product != ConfigProduct {
@@ -650,6 +704,65 @@ func LoadAndValidate(r io.Reader) (*ConfigExport, error) {
 			exp.Product, ConfigProduct)
 	}
 	return &exp, nil
+}
+
+// normalizeLegacySchemaVersion inspects the wire payload for a
+// pre-#288 `schema_version: 1` (int) field and, if present, rewrites
+// it in place to the canonical `"1.0"` (string) form. Returns the
+// (possibly modified) payload + a flag indicating whether a legacy int
+// shape was actually seen. Payloads that already carry the string form
+// pass through unchanged.
+//
+// We do the rewrite at the JSON level (not the typed-decode level) so
+// the schema validator + the typed decoder both see the canonical
+// shape downstream. Any int > 1 is treated as "unknown future schema"
+// and rejected so a customer running an older binary against a newer
+// export gets a clear refusal instead of silently truncating fields.
+func normalizeLegacySchemaVersion(raw []byte) ([]byte, bool, error) {
+	var head map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &head); err != nil {
+		// Defer the descriptive error to the schema validator — it
+		// surfaces "payload is not valid JSON" with the same error.
+		return raw, false, nil
+	}
+	v, present := head["schema_version"]
+	if !present {
+		return raw, false, nil
+	}
+	// String shape: nothing to do.
+	var asString string
+	if err := json.Unmarshal(v, &asString); err == nil {
+		return raw, false, nil
+	}
+	// Int shape: must equal the legacy known value (1). Anything else
+	// is rejected at this layer — the schema validator's enum check
+	// would also catch it, but a typed error here surfaces the issue
+	// with a more operator-actionable message.
+	var asInt int
+	if err := json.Unmarshal(v, &asInt); err != nil {
+		return raw, false, nil // Let the schema validator's type check fire.
+	}
+	if asInt != LegacyIntSchemaVersion {
+		return nil, false, fmt.Errorf(
+			"schema_version mismatch: import has legacy int %d, this kbounce "+
+				"understands legacy int %d (which it rewrites to %q) — re-export "+
+				"with a matching kbounce binary",
+			asInt, LegacyIntSchemaVersion, ConfigSchemaVersion)
+	}
+	// Rewrite the field in the parsed map and re-marshal. JSON object
+	// key order is not preserved across encode/decode, but downstream
+	// consumers (schema validator + typed decoder) treat the object as
+	// unordered — no consumer in this file depends on key order.
+	canon, err := json.Marshal(ConfigSchemaVersion)
+	if err != nil {
+		return nil, false, fmt.Errorf("re-marshal schema_version: %w", err)
+	}
+	head["schema_version"] = canon
+	out, err := json.Marshal(head)
+	if err != nil {
+		return nil, false, fmt.Errorf("re-marshal payload: %w", err)
+	}
+	return out, true, nil
 }
 
 // applyImport is the one-shot import worker called by the cobra
@@ -669,7 +782,7 @@ func applyImport(opts ImportOptions) (*ImportDiff, *ConfigExport, error) {
 			ImportModeMerge, ImportModeReplace, mode)
 	}
 
-	exp, err := LoadAndValidate(opts.Source)
+	exp, err := loadAndValidate(opts.Source, opts.DeprecationOut)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -863,7 +976,8 @@ func writeProfilesForImport(path string, imported []ConfigProfile, mode ImportMo
 
 func newConfigImportCmd() *cobra.Command {
 	var (
-		fromPath     string
+		inPath       string
+		fromPath     string // deprecated alias for --in per #288
 		dryRun       bool
 		mergeFlag    bool
 		replaceFlag  bool
@@ -873,14 +987,20 @@ func newConfigImportCmd() *cobra.Command {
 		auditLogPath string
 	)
 	cmd := &cobra.Command{
-		Use:   "import --from PATH [--dry-run] [--merge | --replace]",
+		Use:   "import --in PATH [--dry-run] [--merge | --replace]",
 		Short: "Import a previously-exported kbounce config",
 		Long: `Import a previously-exported kbounce config JSON.
 
 Validates schema_version + product (refuses to import a dbounce /
-ibounce export into kbounce). Schema-validates the JSON body against
-the published ` + "`schemas/kbounce-config.schema.json`" + ` so malformed
-input is rejected BEFORE any state mutation.
+ibounce / gbounce export into kbounce). Schema-validates the JSON
+body against the published ` + "`schemas/kbounce-config.schema.json`" + `
+so malformed input is rejected BEFORE any state mutation.
+
+Cross-product flag parity per #288: ` + "`--in PATH`" + ` is the
+primary form (matches ibounce + gbounce + dbounce so one cross-product
+backup script can target every Bounce product). ` + "`--from PATH`" + `
+is preserved as a DEPRECATED alias — it still works but prints a
+stderr deprecation warning.
 
 Modes:
 
@@ -903,8 +1023,24 @@ Admin-action OCSF event fires on every import.`,
 				return errors.New(
 					"kbounce: --merge and --replace are mutually exclusive")
 			}
-			if fromPath == "" {
-				return errors.New("kbounce: --from PATH is required")
+			// Resolve the source path from --in (primary) or --from
+			// (deprecated alias per #288). Both set: refuse with a
+			// clear message; neither set: require --in.
+			source := inPath
+			if source == "" && fromPath != "" {
+				source = fromPath
+				fmt.Fprintln(cmd.ErrOrStderr(),
+					"kbounce: deprecation: --from PATH is renamed to --in PATH "+
+						"for cross-product parity (ibounce + gbounce + dbounce all use "+
+						"--in). The --from alias still works but will be removed in a "+
+						"future major version. Update your scripts to --in PATH.")
+			} else if inPath != "" && fromPath != "" {
+				return errors.New(
+					"kbounce: --in and --from are aliases for the same flag; pass " +
+						"exactly one (prefer --in; --from is deprecated)")
+			}
+			if source == "" {
+				return errors.New("kbounce: --in PATH is required")
 			}
 
 			mode := ImportModeMerge
@@ -917,19 +1053,20 @@ Admin-action OCSF event fires on every import.`,
 				}
 			}
 
-			f, err := os.Open(fromPath)
+			f, err := os.Open(source)
 			if err != nil {
-				return fmt.Errorf("open %q: %w", fromPath, err)
+				return fmt.Errorf("open %q: %w", source, err)
 			}
 			defer f.Close()
 
 			diff, exp, err := applyImport(ImportOptions{
-				Source:       f,
-				SourceName:   fromPath,
-				ProfilesPath: profilesPath,
-				DBPath:       dbPath,
-				Mode:         mode,
-				DryRun:       dryRun,
+				Source:         f,
+				SourceName:     source,
+				ProfilesPath:   profilesPath,
+				DBPath:         dbPath,
+				Mode:           mode,
+				DryRun:         dryRun,
+				DeprecationOut: cmd.ErrOrStderr(),
 			})
 			if err != nil {
 				return err
@@ -966,7 +1103,7 @@ Admin-action OCSF event fires on every import.`,
 			snapshot := map[string]any{
 				"schema_version":  exp.SchemaVersion,
 				"product":         exp.Product,
-				"source":          fromPath,
+				"source":          source,
 				"mode":            string(mode),
 				"profiles_added":  diff.ProfilesAdded,
 				"rules_added":     diff.RulesAdded,
@@ -976,21 +1113,28 @@ Admin-action OCSF event fires on every import.`,
 				Action:     audit.AdminActionConfigImport,
 				Actor:      currentActor(),
 				EntityKind: "config",
-				EntityName: fromPath,
+				EntityName: source,
 				Source:     audit.AdminActionSourceCLI,
 				Before:     nil,
 				After:      snapshot,
 				ExtraExt: map[string]any{
-					"source": fromPath,
+					"source": source,
 					"mode":   string(mode),
 				},
 			})
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&inPath, "in", "",
+		"Path to the export JSON to import. Required (or pass the "+
+			"deprecated --from alias).")
 	cmd.Flags().StringVar(&fromPath, "from", "",
-		"Path to the export JSON to import. Required.")
-	_ = cmd.MarkFlagRequired("from")
+		"DEPRECATED: pre-#288 alias for --in PATH. Still works, prints "+
+			"a stderr deprecation warning. Update scripts to --in.")
+	// Cobra's MarkDeprecated hides the flag from --help; we keep it
+	// visible so an operator who runs `kbounce config import --help`
+	// after migrating from an older binary sees the explicit note
+	// rather than wondering where --from went.
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false,
 		"Show what would change without mutating state.")
 	cmd.Flags().BoolVar(&mergeFlag, "merge", false,
