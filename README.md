@@ -312,6 +312,21 @@ Prints `kbounce <version> (commit X, built Y)`. Set at build time via
 -X github.com/trsreagan3/kbouncer/internal/cli.commit=$(git rev-parse HEAD)
 -X github.com/trsreagan3/kbouncer/internal/cli.buildTime=$(date -u +%FT%TZ)"`.
 
+### `kbounce diagnostics bundle` (alias: `kbounce diag bundle`)
+
+One-shot ZIP capturing the operator's redacted config + audit-log
+tail + `/healthz` snapshot + system info, suitable for sharing with
+support OR pasting to a Claude agent for analysis. Strictly
+read-only (no store / profile / audit-log mutations); the only
+network call is a single LOCAL `/healthz` GET on the loopback port.
+Default output: `./kbounce-diagnostics-{ISO8601-UTC}.zip` (`0o600`).
+Override with `--out PATH`. Audit-webhook tokens, license bytes,
+webhook URLs, user identifiers, hostnames, and env-var VALUES are
+all redacted or hashed before the bundle is written.
+
+See [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) for the full
+contents, redaction policy, and the `--no-audit` flag's purpose.
+
 ---
 
 ## Liveness probe

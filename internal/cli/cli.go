@@ -122,6 +122,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newMCPCmd())
 	root.AddCommand(newVersionCheckCmd())
 	root.AddCommand(newConfigCmd())
+	root.AddCommand(newDiagnosticsCmd())
 	return root
 }
 

@@ -131,6 +131,15 @@ const (
 	// point lives here so the #275 PR is one-line.
 	AdminActionConfigImport AdminAction = "config.import"
 	AdminActionConfigExport AdminAction = "config.export"
+
+	// AdminActionDiagnosticsBundle — operator produced a diagnostics
+	// bundle via `kbounce diagnostics bundle` (#277). The bundle is a
+	// support-package ZIP with redacted config + audit-log tail +
+	// health snapshot; recording the action gives a security team a
+	// witness for "who pulled diagnostics + when?" so the bundle's
+	// later appearance in a support ticket / agent thread is
+	// traceable. The bundle output path lands in EntityName.
+	AdminActionDiagnosticsBundle AdminAction = "diagnostics.bundle"
 )
 
 // AdminActionActivityID returns the OCSF activity_id (class 6003 enum)
@@ -154,7 +163,7 @@ func AdminActionActivityID(a AdminAction) int {
 	case AdminActionProfileDelete,
 		AdminActionRuleRemove:
 		return ActivityDelete
-	case AdminActionConfigExport:
+	case AdminActionConfigExport, AdminActionDiagnosticsBundle:
 		return ActivityOther
 	default:
 		return ActivityOther
