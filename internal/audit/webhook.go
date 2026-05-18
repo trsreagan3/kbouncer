@@ -245,7 +245,7 @@ func (wp *WebhookPusher) sendOnce(ctx context.Context, body []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+wp.token)
-	req.Header.Set("User-Agent", "kbounce-audit/"+SchemaVersion)
+	req.Header.Set("User-Agent", "kbounce-audit/"+OCSFSchemaVersion)
 	resp, err := wp.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("post: %w", err)

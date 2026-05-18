@@ -71,19 +71,27 @@ func TestAuditExport_ProxyDecideFansToLogAndWebhook(t *testing.T) {
 		})
 	require.NotNil(t, obs)
 
-	// Log file gets the event.
+	// Log file gets the event in OCSF wire shape.
 	require.Eventually(t, func() bool {
 		return lw.Total() == 1
 	}, 3*time.Second, 10*time.Millisecond, "log writer should receive 1 event")
 	raw, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	require.NotEmpty(t, raw)
-	var ev audit.Event
-	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &ev))
-	assert.Equal(t, "kbounce", ev.Product)
-	assert.Equal(t, "127.0.0.1:8766", ev.Host)
-	assert.Equal(t, "kubernetes.default.svc", ev.Upstream)
-	assert.Equal(t, audit.EventTypeDecision, ev.EventType)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &m))
+	assert.Equal(t, float64(6003), m["class_uid"])
+	meta := m["metadata"].(map[string]any)
+	prod := meta["product"].(map[string]any)
+	assert.Equal(t, "kbounce", prod["name"])
+	assert.Equal(t, "iam-jit", prod["vendor_name"])
+	// src_endpoint surfaces the proxy bind host:port; dst_endpoint
+	// surfaces the upstream apiserver. Both required by OCSF.
+	src := m["src_endpoint"].(map[string]any)
+	assert.Equal(t, "127.0.0.1", src["ip"])
+	assert.Equal(t, float64(8766), src["port"])
+	dst := m["dst_endpoint"].(map[string]any)
+	assert.Equal(t, "kubernetes.default.svc", dst["hostname"])
 
 	// Webhook gets the event.
 	require.Eventually(t, func() bool {

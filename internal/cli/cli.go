@@ -79,6 +79,10 @@ var buildTime = "unknown"
 // command wiring + makes drift between the two binaries impossible.
 func Main() {
 	proxy.EnsureLogger()
+	// Thread the linker-stamped binary version into the audit-export
+	// OCSF metadata.product.version field. Done here (one site) so
+	// audit/event.go doesn't have to import cli (avoiding a cycle).
+	audit.SetBuildVersion(version)
 	if err := newRootCmd().Execute(); err != nil {
 		// cobra already prints to stderr; exit 1 so shell scripts can
 		// distinguish success.

@@ -42,16 +42,19 @@ func TestLogWriter_CreatesPathAppendsValidJSONL(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
 
-	// Each line is valid JSON.
+	// Each line is valid JSON conforming to the OCSF wire shape.
 	raw, err := os.ReadFile(path)
 	require.NoError(t, err)
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	require.Len(t, lines, 3)
 	for _, line := range lines {
-		var ev Event
-		require.NoError(t, json.Unmarshal([]byte(line), &ev))
-		assert.Equal(t, "kbounce", ev.Product)
-		assert.Equal(t, EventTypeDecision, ev.EventType)
+		var m map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &m))
+		assert.Equal(t, float64(6003), m["class_uid"])
+		meta := m["metadata"].(map[string]any)
+		prod := meta["product"].(map[string]any)
+		assert.Equal(t, "kbounce", prod["name"])
+		assert.Equal(t, "iam-jit", prod["vendor_name"])
 	}
 }
 
