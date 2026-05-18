@@ -828,3 +828,76 @@ func TestProxy_AgentBlock_NoUAFallsThroughToUnknown(t *testing.T) {
 	assert.Equal(t, audit.AgentNameUnknown, ev.Unmapped.IAMJIT.Agent.Name)
 	assert.Equal(t, audit.DetectionSourceUnknown, ev.Unmapped.IAMJIT.Agent.DetectedFrom)
 }
+
+// TestProxy_AgentIdentity_PersistedToSQLite is the #289 hot-path
+// guard: an inbound request whose agent identity resolves to a
+// non-empty AgentInfo (here via the MCP-session-id header) MUST
+// land that identity in the decisions table columns added in v8.
+// Closes the kbounce-agent-identity-sqlite-gap memo: the SQLite
+// channel is no longer the one channel that drops identity.
+func TestProxy_AgentIdentity_PersistedToSQLite(t *testing.T) {
+	st := freshStore(t)
+	reg := audit.NewRegistry()
+	sid := audit.NewSessionID()
+	reg.Register(sid, audit.AgentInfo{
+		Name:         "claude-code",
+		Version:      "1.2.3",
+		SessionID:    sid,
+		DetectedFrom: audit.DetectionSourceMCPClientInfo,
+	})
+
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+		AgentRegistry: reg,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/pods", nil)
+	require.NoError(t, err)
+	req.Header.Set(SessionHeaderName, sid)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	// Read it back via the public store API — this is the same path
+	// audit-tail, investigate, /audit/events, and the web UI all
+	// compose with.
+	rows, err := st.RecentDecisions(10)
+	require.NoError(t, err)
+	require.NotEmpty(t, rows, "proxy should have recorded the decision row")
+	assert.Equal(t, "claude-code", rows[0].AgentName,
+		"agent name from registry MUST be persisted in decisions.agent_name")
+	assert.Equal(t, sid, rows[0].AgentSessionID,
+		"session id MUST be persisted in decisions.agent_session_id")
+}
+
+// TestProxy_AgentIdentity_AnonRequestLeavesColumnsEmpty covers the
+// negative path: when no detection source fires, the SQLite columns
+// stay empty (round-tripped as "" because the read path
+// COALESCE-defaults NULL → ""). The cross-surface OCSF view will
+// surface the default-unknown agent block — accurate, not synthetic.
+func TestProxy_AgentIdentity_AnonRequestLeavesColumnsEmpty(t *testing.T) {
+	st := freshStore(t)
+	s := NewServer(Config{
+		Mode:          ModeCooperative,
+		DefaultPolicy: DefaultPolicyAllow,
+	}, st)
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/pods", nil)
+	require.NoError(t, err)
+	req.Header.Set("User-Agent", "") // no fingerprintable identity
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	rows, err := st.RecentDecisions(10)
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+	assert.Empty(t, rows[0].AgentName,
+		"empty agent name MUST round-trip as empty (column underneath is NULL)")
+	assert.Empty(t, rows[0].AgentSessionID)
+}

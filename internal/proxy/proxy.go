@@ -637,7 +637,7 @@ func EvaluateRequestFull(
 			DecisionSource:  SourceUnclassifiable,
 			StreamKind:      opts.StreamKind,
 		}
-		decisionID := writeDecision(st, obs, activePause)
+		decisionID := writeDecision(st, obs, activePause, agentInfo)
 		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
@@ -686,7 +686,7 @@ func EvaluateRequestFull(
 			obs.DecisionReason = pv.Reason
 			obs.DecisionSource = SourceProfile
 			obs.Enforced = effectiveMode == ModeTransparent
-			decisionID := writeDecision(st, obs, activePause)
+			decisionID := writeDecision(st, obs, activePause, agentInfo)
 			emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
@@ -733,7 +733,7 @@ func EvaluateRequestFull(
 				activeTask.TaskID, td.Rule.Pattern)
 			obs.DecisionSource = SourceTask
 			obs.Enforced = effectiveMode == ModeTransparent
-			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID, agentInfo)
 			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
@@ -767,7 +767,7 @@ func EvaluateRequestFull(
 			"explicit-deny rule (pattern %q)", globalMatch.Rule.Pattern)
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = effectiveMode == ModeTransparent
-		decisionID := writeDecisionForTaskMaybe(st, obs, activePause, activeTask)
+		decisionID := writeDecisionForTaskMaybe(st, obs, activePause, activeTask, agentInfo)
 		emitAuditEvent(opts, agentInfo, obs, parsed, activeTaskID(activeTask), activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
@@ -784,7 +784,7 @@ func EvaluateRequestFull(
 				activeTask.TaskID, ta.Rule.Pattern)
 			obs.DecisionSource = SourceTask
 			obs.Enforced = false
-			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID, agentInfo)
 			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
@@ -803,7 +803,7 @@ func EvaluateRequestFull(
 				globalMatch.Rule.Pattern, activeTask.TaskID)
 			obs.DecisionSource = SourceGlobal
 			obs.Enforced = false
-			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID, agentInfo)
 			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
@@ -814,7 +814,7 @@ func EvaluateRequestFull(
 			activeTask.TaskID)
 		obs.DecisionSource = SourceTask
 		obs.Enforced = effectiveMode == ModeTransparent
-		decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+		decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID, agentInfo)
 		emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
@@ -827,7 +827,7 @@ func EvaluateRequestFull(
 			"explicit-allow rule (pattern %q)", globalMatch.Rule.Pattern)
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = false
-		decisionID := writeDecision(st, obs, activePause)
+		decisionID := writeDecision(st, obs, activePause, agentInfo)
 		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
@@ -845,7 +845,7 @@ func EvaluateRequestFull(
 	obs.DecisionSource = SourceDefault
 	obs.Enforced = effectiveMode == ModeTransparent && verdict == VerdictDeny
 
-	decisionID := writeDecision(st, obs, activePause)
+	decisionID := writeDecision(st, obs, activePause, agentInfo)
 	emitAuditEvent(opts, agentInfo, obs, parsed, activeTaskID(activeTask), activePause)
 	maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 	return obs
@@ -1140,8 +1140,13 @@ func maybeEnqueuePrompt(
 // activePause threads the pause window id (if any) so the decision
 // row links back to the pause via decisions.pause_id — single-JOIN
 // post-hoc review ("what calls happened inside pause N?").
-func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.PauseRow) int64 {
-	return writeDecisionForTask(st, obs, activePause, "")
+//
+// agent carries the fingerprinted AgentInfo so the persisted row
+// retains the same identity the JSONL log + webhook see (#289 closes
+// the kbounce-agent-identity-sqlite-gap). Empty AgentInfo →
+// agent_name + agent_session_id columns stay NULL.
+func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, agent audit.AgentInfo) int64 {
+	return writeDecisionForTask(st, obs, activePause, "", agent)
 }
 
 // writeDecisionForTask is the task-id-aware variant of writeDecision.
@@ -1151,7 +1156,15 @@ func writeDecision(st *store.Store, obs *RequestObservation, activePause *store.
 // Side effect: also stores the assigned id back onto obs.DecisionID
 // so the handle() sync-prompt path can read it without round-tripping
 // through the return value.
-func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, taskID string) int64 {
+//
+// agent: per-call AgentInfo persisted into decisions.agent_name +
+// decisions.agent_session_id (#289). Only the name + session id make
+// it to SQLite — version + process_exe + parent_exe + raw_user_agent
+// stay in the live JSONL/webhook stream (operator owns the local
+// stream at full fidelity; the SQLite columns are the minimum needed
+// for the post-hoc queryable identity surface used by audit-tail /
+// investigate / web UI / /audit/events).
+func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, taskID string, agent audit.AgentInfo) int64 {
 	if st == nil {
 		return 0
 	}
@@ -1177,6 +1190,8 @@ func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause 
 		TaskID:            taskID,
 		IsStream:          obs.StreamKind != "",
 		StreamKind:        obs.StreamKind,
+		AgentName:         agent.Name,
+		AgentSessionID:    agent.SessionID,
 	}
 	if activePause != nil {
 		pid := activePause.ID
@@ -1194,11 +1209,11 @@ func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause 
 // writeDecisionForTaskMaybe is a convenience wrapper that passes the
 // task id when an active task exists, "" otherwise. Used by the
 // global-deny branch where a task may or may not be active.
-func writeDecisionForTaskMaybe(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, activeTask *tasks.Scope) int64 {
+func writeDecisionForTaskMaybe(st *store.Store, obs *RequestObservation, activePause *store.PauseRow, activeTask *tasks.Scope, agent audit.AgentInfo) int64 {
 	if activeTask == nil {
-		return writeDecisionForTask(st, obs, activePause, "")
+		return writeDecisionForTask(st, obs, activePause, "", agent)
 	}
-	return writeDecisionForTask(st, obs, activePause, activeTask.TaskID)
+	return writeDecisionForTask(st, obs, activePause, activeTask.TaskID, agent)
 }
 
 func normalizeMode(m Mode) Mode {

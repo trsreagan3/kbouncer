@@ -220,6 +220,13 @@ func filterAuditEventsByTime(events []audit.Event, since, until *time.Time) []au
 // decisionRowsToEvents wraps a slice of SQLite DecisionRows as OCSF
 // Events via the canonical FromDecision builder so the resulting
 // events match what the JSONL log / webhook pipeline emits.
+//
+// Per #289 the agent name + session id are read from the persisted
+// columns and surfaced under unmapped.iam_jit.agent — same wire
+// shape ibounce + dbounce + gbounce ship per
+// [[cross-product-agent-parity]]. DetectedFrom is best-effort
+// reconstructed from the persisted shape (session id → MCP; name
+// alone → user-agent).
 func decisionRowsToEvents(rows []store.DecisionRow) []audit.Event {
 	out := make([]audit.Event, 0, len(rows))
 	for _, r := range rows {
@@ -244,10 +251,35 @@ func decisionRowsToEvents(rows []store.DecisionRow) []audit.Event {
 			IsDryRun:          r.IsDryRun,
 			StreamKind:        r.StreamKind,
 			TaskID:            r.TaskID,
+			Agent:             agentInfoFromDecisionRow(r),
 		}
 		out = append(out, audit.FromDecision(in))
 	}
 	return out
+}
+
+// agentInfoFromDecisionRow rebuilds AgentInfo from the persisted
+// columns. Mirror of cli.agentInfoFromRow (the two packages can't
+// share a helper without an import cycle: audit_events.go is in
+// proxy/, audit_tail.go is in cli/, both depend on audit + store).
+// Kept byte-identical to preserve the cross-surface guarantee that
+// /audit/events + the web UI + audit-tail + investigate all surface
+// the same agent block for the same row.
+func agentInfoFromDecisionRow(r store.DecisionRow) audit.AgentInfo {
+	if r.AgentName == "" && r.AgentSessionID == "" {
+		return audit.AgentInfo{}
+	}
+	info := audit.AgentInfo{
+		Name:      r.AgentName,
+		SessionID: r.AgentSessionID,
+	}
+	switch {
+	case r.AgentSessionID != "":
+		info.DetectedFrom = audit.DetectionSourceMCPClientInfo
+	case r.AgentName != "" && r.AgentName != audit.AgentNameUnknown:
+		info.DetectedFrom = audit.DetectionSourceUserAgent
+	}
+	return info
 }
 
 // auditEventsBundle is the on-wire shape for ?format=ocsf-bundle.

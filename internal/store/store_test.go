@@ -169,3 +169,195 @@ func TestRecentDecisions_PreservesProfileNameAndRuleID(t *testing.T) {
 	assert.Equal(t, int64(17), *r.MatchedRuleID)
 	assert.True(t, r.Enforced)
 }
+
+// ----------------------------------------------------------------------
+// #289 — agent identity persisted in the decisions table.
+// ----------------------------------------------------------------------
+
+// TestSchemaVersion_AtLeastV8 pins the migration bump. Closes the
+// kbounce-agent-identity-sqlite-gap: the schema MUST be v8+ for the
+// new decisions.agent_name + decisions.agent_session_id columns to
+// be in place.
+func TestSchemaVersion_AtLeastV8(t *testing.T) {
+	assert.GreaterOrEqual(t, SchemaVersion, 8,
+		"#289 added decisions.agent_name + agent_session_id; schema must be v8+")
+}
+
+// TestRecordDecision_PersistsAgentIdentity rules in the happy path:
+// when AgentName + AgentSessionID are populated on the insert,
+// RecentDecisions reads them back. This is the cross-product parity
+// guarantee with ibounce + dbounce + gbounce per
+// [[cross-product-agent-parity]].
+func TestRecordDecision_PersistsAgentIdentity(t *testing.T) {
+	s := freshDB(t)
+	_, err := s.RecordDecision(DecisionRow{
+		Method:          "POST",
+		Path:            "/api/v1/namespaces/default/pods",
+		ParsedVerb:      "create",
+		ParsedResource:  "pods",
+		ParsedNamespace: "default",
+		DecisionVerdict: "allow",
+		DecisionReason:  "default policy: allow (no rule matched)",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "claude-code",
+		AgentSessionID:  "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+	})
+	require.NoError(t, err)
+
+	rows, err := s.RecentDecisions(10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "claude-code", rows[0].AgentName)
+	assert.Equal(t, "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+		rows[0].AgentSessionID)
+}
+
+// TestRecordDecision_AnonymousAgentKeepsColumnsNull confirms that an
+// insert with empty AgentName + AgentSessionID writes NULLs (verified
+// indirectly by the empty-string read back, since nullableString
+// converts "" → SQL NULL on the way in + COALESCE renders NULL → ""
+// on the way out). Per the migration comment: NULL is accurate for
+// requests where no detection source fired.
+func TestRecordDecision_AnonymousAgentKeepsColumnsNull(t *testing.T) {
+	s := freshDB(t)
+	_, err := s.RecordDecision(DecisionRow{
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "allow",
+		DecisionReason:  "default policy",
+		ModeAtDecision:  "cooperative",
+	})
+	require.NoError(t, err)
+
+	rows, err := s.RecentDecisions(10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Empty(t, rows[0].AgentName,
+		"empty AgentName must round-trip as empty (SQL NULL underneath)")
+	assert.Empty(t, rows[0].AgentSessionID,
+		"empty AgentSessionID must round-trip as empty (SQL NULL underneath)")
+
+	// Direct PRAGMA check: confirm the underlying column values are
+	// in fact NULL, not the empty string. Guards against a future
+	// regression where someone "helpfully" stamps "" instead of NULL.
+	var (
+		nameNull    bool
+		sessionNull bool
+	)
+	row := s.db.QueryRow(
+		`SELECT agent_name IS NULL, agent_session_id IS NULL FROM decisions LIMIT 1`)
+	require.NoError(t, row.Scan(&nameNull, &sessionNull))
+	assert.True(t, nameNull, "agent_name should be SQL NULL for anon rows")
+	assert.True(t, sessionNull,
+		"agent_session_id should be SQL NULL for anon rows")
+}
+
+// TestRecordDecision_AgentNameWithoutSession covers the user-agent
+// detection path: a fingerprinted name (kubectl, helm, ...) without
+// an MCP session id. Columns surface name populated, session empty.
+func TestRecordDecision_AgentNameWithoutSession(t *testing.T) {
+	s := freshDB(t)
+	_, err := s.RecordDecision(DecisionRow{
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "allow",
+		DecisionReason:  "default policy",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "kubectl",
+	})
+	require.NoError(t, err)
+
+	rows, err := s.RecentDecisions(10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "kubectl", rows[0].AgentName)
+	assert.Empty(t, rows[0].AgentSessionID)
+}
+
+// TestMigration_AddsAgentColumnsToExistingDB simulates the upgrade
+// path: open a v7-shaped database (no agent columns), close it,
+// re-open it, and confirm the v8 ALTERs landed without losing the
+// pre-existing row. Per [[creates-never-mutates]]: old data
+// preserved across the additive migration.
+func TestMigration_AddsAgentColumnsToExistingDB(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "kbouncer-migrate.db")
+
+	// First open: lands at the current SchemaVersion. Insert one row
+	// with the legacy field set (no agent identity — emulates pre-#289
+	// data shape).
+	s1, err := Open(dbPath)
+	require.NoError(t, err)
+	_, err = s1.RecordDecision(DecisionRow{
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "allow",
+		DecisionReason:  "legacy row before agent columns",
+		ModeAtDecision:  "cooperative",
+	})
+	require.NoError(t, err)
+
+	// Drop the agent columns + roll schema_version back to 7 to make
+	// this DB look like a pre-#289 backup on disk. SQLite < 3.35
+	// can't DROP COLUMN; we rebuild the table without the new
+	// columns (the manual equivalent of "this DB was created before
+	// the v8 migration shipped"). Then we re-open + assert the
+	// migration re-adds the columns + preserves the row.
+	_, err = s1.db.Exec(`UPDATE schema_version SET version = 7`)
+	require.NoError(t, err)
+	_, err = s1.db.Exec(`ALTER TABLE decisions DROP COLUMN agent_name`)
+	require.NoError(t, err)
+	_, err = s1.db.Exec(`ALTER TABLE decisions DROP COLUMN agent_session_id`)
+	require.NoError(t, err)
+	require.NoError(t, s1.Close())
+
+	// Re-open: addColumnIfMissing should detect the missing columns
+	// + re-ALTER them in; schema_version should bump back to v8+.
+	s2, err := Open(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s2.Close() })
+
+	var ver int
+	require.NoError(t,
+		s2.db.QueryRow(`SELECT version FROM schema_version`).Scan(&ver))
+	assert.GreaterOrEqual(t, ver, 8,
+		"re-open MUST bump schema_version to v8+ via the additive migration")
+
+	// Pre-existing row preserved + new columns surface as NULL/empty.
+	rows, err := s2.RecentDecisions(10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "pre-#289 row must survive the migration")
+	assert.Equal(t, "legacy row before agent columns",
+		rows[0].DecisionReason)
+	assert.Empty(t, rows[0].AgentName,
+		"legacy row must show empty agent name (column was NULL)")
+	assert.Empty(t, rows[0].AgentSessionID,
+		"legacy row must show empty session id (column was NULL)")
+
+	// And the new column accepts inserts post-migration.
+	_, err = s2.RecordDecision(DecisionRow{
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "allow",
+		DecisionReason:  "post-migration row",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "claude-code",
+		AgentSessionID:  "01956c44-c5c1-7c31-9bca-7c0aaa000099",
+	})
+	require.NoError(t, err)
+	rows, err = s2.RecentDecisions(10)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	assert.Equal(t, "claude-code", rows[0].AgentName,
+		"newest-first ordering should put the post-migration row first")
+	assert.Equal(t, "01956c44-c5c1-7c31-9bca-7c0aaa000099",
+		rows[0].AgentSessionID)
+}

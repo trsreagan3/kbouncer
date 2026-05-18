@@ -324,3 +324,93 @@ func TestAuditEvents_NonGETMethodRejected(t *testing.T) {
 		t.Errorf("status = %d (want 405)", resp.StatusCode)
 	}
 }
+
+// TestAuditEvents_SurfacesPersistedAgentIdentity confirms that the
+// /audit/events HTTP surface (the same wire feed the #272 web UI
+// long-polls) carries the agent_name + agent_session_id columns
+// added in #289 under the OCSF unmapped.iam_jit.agent block — same
+// shape ibounce + dbounce + gbounce ship per
+// [[cross-product-agent-parity]].
+func TestAuditEvents_SurfacesPersistedAgentIdentity(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	at := time.Now().UTC().Truncate(time.Second)
+	_, err = st.RecordDecision(store.DecisionRow{
+		At:              at,
+		Method:          "POST",
+		Path:            "/api/v1/namespaces/default/pods",
+		ParsedVerb:      "create",
+		ParsedResource:  "pods",
+		ParsedNamespace: "default",
+		DecisionVerdict: "ALLOW",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "claude-code",
+		AgentSessionID:  "01956c44-c5c1-7c31-9bca-7c0aaa0000ab",
+	})
+	if err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+
+	srv := httptest.NewServer(auditEventsHandler(st, ""))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "?limit=10")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (want 200)", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	// JSONL: one event per line; we wrote one row.
+	line := strings.TrimSpace(string(body))
+	if line == "" {
+		t.Fatalf("expected one JSONL line; got empty body")
+	}
+
+	var ev map[string]any
+	if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		t.Fatalf("unmarshal: %v (body=%q)", err, line)
+	}
+	unmapped, _ := ev["unmapped"].(map[string]any)
+	if unmapped == nil {
+		t.Fatalf("unmapped missing; ev=%v", ev)
+	}
+	iamjit, _ := unmapped["iam_jit"].(map[string]any)
+	if iamjit == nil {
+		t.Fatalf("unmapped.iam_jit missing; unmapped=%v", unmapped)
+	}
+	agent, _ := iamjit["agent"].(map[string]any)
+	if agent == nil {
+		t.Fatalf("unmapped.iam_jit.agent missing; iam_jit=%v", iamjit)
+	}
+	if got := agent["name"]; got != "claude-code" {
+		t.Errorf("agent.name = %v; want claude-code", got)
+	}
+	if got := agent["session_id"]; got != "01956c44-c5c1-7c31-9bca-7c0aaa0000ab" {
+		t.Errorf("agent.session_id = %v; want 01956c44-...0000ab", got)
+	}
+	// actor.user.name should also mirror the agent name (cross-product
+	// spec — analysts can pivot from agent block to principal query).
+	actor, _ := ev["actor"].(map[string]any)
+	if actor == nil {
+		t.Fatalf("actor missing; ev=%v", ev)
+	}
+	user, _ := actor["user"].(map[string]any)
+	if user == nil {
+		t.Fatalf("actor.user missing; actor=%v", actor)
+	}
+	if got := user["name"]; got != "claude-code" {
+		t.Errorf("actor.user.name = %v; want claude-code", got)
+	}
+}

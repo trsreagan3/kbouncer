@@ -1211,19 +1211,37 @@ func buildExt(in DecisionInput) map[string]any {
 }
 
 // buildActor returns the OCSF actor object — populated from the K8s
-// principal when extracted, otherwise from the task scope id (the
-// closest proxy-level analog to a session), otherwise nil so the
-// omitempty json tag drops the field entirely.
+// principal when extracted, otherwise from the agent identity (per
+// [[agent-identity-in-audit]]: the fingerprinted CALLING client is
+// the actor when no bearer-token subject is available), otherwise
+// from the task scope id (the closest proxy-level analog to a
+// session), otherwise nil so the omitempty json tag drops the field
+// entirely.
+//
+// Cross-product spec ([[cross-product-agent-parity]]):
+//
+//	event.Actor.User.Name = agent_name when PrincipalName is empty
+//	  → an analyst grepping actor.user.name = "claude-code" against
+//	    a SIEM corpus gets every call the agent made regardless of
+//	    whether kbounce had K8s-subject extraction.
+//	event.Unmapped.iam_jit.agent.{name,session_id} always populated
+//	  → the same identity surfaces under the iam-jit-native block
+//	    too (cross-product invariant).
 //
 // Slice 1 does not yet extract the inbound bearer-token subject;
-// PrincipalName/PrincipalUID stay "" and actor.user is omitted.
-// Slice 2 wires SPIFFE / JWT subject extraction per
-// [[security-team-audit-export]].
+// PrincipalName/PrincipalUID stay "" and actor.user falls back to
+// agent_name when that's known. Slice 2 wires SPIFFE / JWT subject
+// extraction per [[security-team-audit-export]]; when a real
+// principal is present it takes precedence.
 func buildActor(in DecisionInput) *OCSFActor {
 	actor := &OCSFActor{}
 	any := false
-	if in.PrincipalName != "" || in.PrincipalUID != "" {
+	switch {
+	case in.PrincipalName != "" || in.PrincipalUID != "":
 		actor.User = &OCSFUser{Name: in.PrincipalName, UID: in.PrincipalUID}
+		any = true
+	case in.Agent.Name != "" && in.Agent.Name != AgentNameUnknown:
+		actor.User = &OCSFUser{Name: in.Agent.Name}
 		any = true
 	}
 	if in.TaskID != "" {

@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/store"
 )
 
@@ -638,6 +639,173 @@ func TestAuditTail_CrossProductFieldSet(t *testing.T) {
 func TestAuditTail_FollowPollIntervalMatchesSpec(t *testing.T) {
 	assert.Equal(t, 500*time.Millisecond, followPollInterval,
 		"per [[cross-product-agent-parity]] every Bounce ships --follow at 500ms")
+}
+
+// TestDecisionRowToEvent_SurfacesPersistedAgentIdentity covers the
+// #289 cross-surface guarantee: when SQLite carries the agent name +
+// session id (the columns added in v8), the wrapped OCSF event
+// surfaces both under unmapped.iam_jit.agent AND under
+// actor.user.name. Same wire shape ibounce + dbounce + gbounce
+// emit per [[cross-product-agent-parity]].
+func TestDecisionRowToEvent_SurfacesPersistedAgentIdentity(t *testing.T) {
+	row := store.DecisionRow{
+		At:              time.Now().UTC(),
+		Method:          "POST",
+		Path:            "/api/v1/namespaces/default/pods",
+		ParsedVerb:      "create",
+		ParsedResource:  "pods",
+		ParsedNamespace: "default",
+		DecisionVerdict: "allow",
+		DecisionReason:  "default policy",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "claude-code",
+		AgentSessionID:  "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+	}
+	ev := decisionRowToEvent(row)
+
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent,
+		"agent block must always be present per cross-product invariant")
+	assert.Equal(t, "claude-code", ev.Unmapped.IAMJIT.Agent.Name)
+	assert.Equal(t, "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+		ev.Unmapped.IAMJIT.Agent.SessionID)
+	assert.Equal(t, audit.DetectionSourceMCPClientInfo,
+		ev.Unmapped.IAMJIT.Agent.DetectedFrom,
+		"session id populated → reconstruct as MCP-clientinfo source")
+
+	// Actor.User.Name mirrors the agent name (cross-product spec).
+	require.NotNil(t, ev.Actor, "actor must be present for non-anon agent")
+	require.NotNil(t, ev.Actor.User)
+	assert.Equal(t, "claude-code", ev.Actor.User.Name)
+}
+
+// TestDecisionRowToEvent_AnonymousRowKeepsActorEmpty covers the
+// fall-through path: a row with no persisted identity surfaces the
+// default {name:"unknown", detected_from:"unknown"} agent block AND
+// leaves Actor.User unpopulated (so SIEM principal queries don't
+// get polluted with "unknown" noise). Same behavior pre-#289 rows
+// see after the migration.
+func TestDecisionRowToEvent_AnonymousRowKeepsActorEmpty(t *testing.T) {
+	row := store.DecisionRow{
+		At:              time.Now().UTC(),
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "allow",
+		DecisionReason:  "default policy",
+		ModeAtDecision:  "cooperative",
+		// AgentName + AgentSessionID intentionally empty
+	}
+	ev := decisionRowToEvent(row)
+
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	assert.Equal(t, audit.AgentNameUnknown, ev.Unmapped.IAMJIT.Agent.Name)
+	assert.Equal(t, audit.DetectionSourceUnknown,
+		ev.Unmapped.IAMJIT.Agent.DetectedFrom)
+	assert.Empty(t, ev.Unmapped.IAMJIT.Agent.SessionID)
+	assert.Nil(t, ev.Actor,
+		"anonymous row must NOT populate actor.user — would pollute SIEM principal queries")
+}
+
+// TestDecisionRowToEvent_UserAgentOnlyShape covers the kubectl /
+// helm / client-go path: a fingerprinted name with no MCP session
+// id. DetectedFrom rebuilds as user_agent (the only path that yields
+// a known name without a session id).
+func TestDecisionRowToEvent_UserAgentOnlyShape(t *testing.T) {
+	row := store.DecisionRow{
+		At:              time.Now().UTC(),
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "allow",
+		DecisionReason:  "default policy",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "kubectl",
+	}
+	ev := decisionRowToEvent(row)
+
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	assert.Equal(t, "kubectl", ev.Unmapped.IAMJIT.Agent.Name)
+	assert.Empty(t, ev.Unmapped.IAMJIT.Agent.SessionID,
+		"no session id should round-trip empty")
+	assert.Equal(t, audit.DetectionSourceUserAgent,
+		ev.Unmapped.IAMJIT.Agent.DetectedFrom,
+		"name without session id → reconstruct as user-agent source")
+	require.NotNil(t, ev.Actor)
+	require.NotNil(t, ev.Actor.User)
+	assert.Equal(t, "kubectl", ev.Actor.User.Name)
+}
+
+// TestAuditTail_SmokeTest_AgentIdentitySurfacesEndToEnd is the
+// integration-style guard the #289 spec asks for: insert two rows
+// with different agent identities into SQLite, run the `audit tail`
+// pipeline against them via the public API used by the CLI, +
+// assert that BOTH the SQLite read path AND the OCSF-event wrapping
+// preserve the agent identity. Closes the parity gap the memo
+// flags (audit-tail, investigate, /audit/events, web UI all share
+// this code path).
+func TestAuditTail_SmokeTest_AgentIdentitySurfacesEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "kb.db")
+	st, err := store.Open(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	_, err = st.RecordDecision(store.DecisionRow{
+		At:              now.Add(1 * time.Millisecond),
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "allow",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "claude-code",
+		AgentSessionID:  "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+	})
+	require.NoError(t, err)
+	_, err = st.RecordDecision(store.DecisionRow{
+		At:              now.Add(2 * time.Millisecond),
+		Method:          "GET",
+		Path:            "/api/v1/nodes",
+		ParsedVerb:      "list",
+		ParsedResource:  "nodes",
+		DecisionVerdict: "allow",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "kubectl",
+	})
+	require.NoError(t, err)
+
+	rows, err := st.RecentDecisions(10)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+
+	// Walk both rows through decisionRowToEvent (the same helper
+	// `audit tail` + investigate + /audit/events compose with).
+	events := make([]audit.Event, 0, 2)
+	for _, r := range rows {
+		events = append(events, decisionRowToEvent(r))
+	}
+
+	// Rows are newest-first → events[0] is kubectl, events[1] is claude.
+	mcpEvent := events[1]
+	uaEvent := events[0]
+
+	require.NotNil(t, mcpEvent.Unmapped.IAMJIT.Agent)
+	assert.Equal(t, "claude-code", mcpEvent.Unmapped.IAMJIT.Agent.Name)
+	assert.Equal(t, "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+		mcpEvent.Unmapped.IAMJIT.Agent.SessionID)
+	require.NotNil(t, mcpEvent.Actor)
+	require.NotNil(t, mcpEvent.Actor.User)
+	assert.Equal(t, "claude-code", mcpEvent.Actor.User.Name)
+
+	require.NotNil(t, uaEvent.Unmapped.IAMJIT.Agent)
+	assert.Equal(t, "kubectl", uaEvent.Unmapped.IAMJIT.Agent.Name)
+	assert.Empty(t, uaEvent.Unmapped.IAMJIT.Agent.SessionID)
+	require.NotNil(t, uaEvent.Actor)
+	require.NotNil(t, uaEvent.Actor.User)
+	assert.Equal(t, "kubectl", uaEvent.Actor.User.Name)
 }
 
 // noopFmtUsage avoids the unused fmt import if the future test set

@@ -273,6 +273,76 @@ func TestFromDecision_PrincipalPopulatesActorUser(t *testing.T) {
 	assert.Equal(t, "uid-abc-123", ev.Actor.User.UID)
 }
 
+// TestFromDecision_AgentPopulatesActorUserName pins the #289 cross-
+// product spec: when no K8s principal is extracted (Slice 1 default),
+// the fingerprinted agent name fills actor.user.name so a SIEM query
+// on `actor.user.name = "claude-code"` returns every call the agent
+// made — same shape ibounce + dbounce + gbounce ship per
+// [[cross-product-agent-parity]]. The full agent block under
+// unmapped.iam_jit.agent is ALSO present (cross-product invariant).
+func TestFromDecision_AgentPopulatesActorUserName(t *testing.T) {
+	ev := FromDecision(DecisionInput{
+		Verdict: "allow",
+		Agent: AgentInfo{
+			Name:         "claude-code",
+			SessionID:    "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+			DetectedFrom: DetectionSourceMCPClientInfo,
+		},
+	})
+	require.NotNil(t, ev.Actor, "actor must be present when agent identity known")
+	require.NotNil(t, ev.Actor.User)
+	assert.Equal(t, "claude-code", ev.Actor.User.Name)
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent,
+		"unmapped agent block must be present too — cross-product invariant")
+	assert.Equal(t, "claude-code", ev.Unmapped.IAMJIT.Agent.Name)
+	assert.Equal(t, "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+		ev.Unmapped.IAMJIT.Agent.SessionID)
+}
+
+// TestFromDecision_PrincipalWinsOverAgent confirms the precedence
+// rule: when both a real K8s subject AND a fingerprinted agent are
+// present, the K8s subject takes Actor.User (it's higher-fidelity);
+// the agent block still surfaces under unmapped.iam_jit.agent so
+// the agent identity isn't lost.
+func TestFromDecision_PrincipalWinsOverAgent(t *testing.T) {
+	ev := FromDecision(DecisionInput{
+		Verdict:       "allow",
+		PrincipalName: "alice@example.com",
+		PrincipalUID:  "uid-abc",
+		Agent: AgentInfo{
+			Name:         "claude-code",
+			DetectedFrom: DetectionSourceMCPClientInfo,
+		},
+	})
+	require.NotNil(t, ev.Actor)
+	require.NotNil(t, ev.Actor.User)
+	assert.Equal(t, "alice@example.com", ev.Actor.User.Name,
+		"K8s principal must win over agent fingerprint when both set")
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent)
+	assert.Equal(t, "claude-code", ev.Unmapped.IAMJIT.Agent.Name,
+		"agent block must still surface so identity isn't lost")
+}
+
+// TestFromDecision_UnknownAgentLeavesActorEmpty confirms the negative
+// path: an empty / unknown agent does NOT inject "unknown" into
+// actor.user.name (that would pollute SIEM principal queries with
+// agent-fallback noise). Actor stays nil; the agent block still
+// surfaces in the unmapped section with the default unknown shape.
+func TestFromDecision_UnknownAgentLeavesActorEmpty(t *testing.T) {
+	ev := FromDecision(DecisionInput{
+		Verdict: "allow",
+		Agent: AgentInfo{
+			Name:         AgentNameUnknown,
+			DetectedFrom: DetectionSourceUnknown,
+		},
+	})
+	assert.Nil(t, ev.Actor,
+		"unknown agent must NOT inject 'unknown' into actor.user.name")
+	require.NotNil(t, ev.Unmapped.IAMJIT.Agent,
+		"agent block still present with the default-unknown shape")
+	assert.Equal(t, AgentNameUnknown, ev.Unmapped.IAMJIT.Agent.Name)
+}
+
 // TestFromDecision_HostOnlyEndpointParses covers a hostname-only
 // Upstream (no port) — surfaces hostname only, port stays 0
 // (omitempty drops it from wire).

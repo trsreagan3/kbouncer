@@ -5,6 +5,52 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Persist agent identity in the SQLite decisions table (2026-05-18, #289)
+
+Closes the `[[kbounce-agent-identity-sqlite-gap]]` parity gap: until
+now, the JSONL audit log + HTTPS webhook persisted the per-call
+agent name + per-MCP-session id, but the SQLite `decisions` table
+dropped them. The four read surfaces backed by SQLite — `kbounce
+audit tail`, `kbounce investigate`, `GET /audit/events` (#271), and
+the web UI (#272) — all rendered `agent.name="unknown"` even when
+the in-memory identity was high-fidelity. Schema bumped to v8: two
+additive `ALTER TABLE decisions ADD COLUMN` statements
+(`agent_name`, `agent_session_id`); both nullable. Pre-#289 rows
+keep NULL columns + surface as the default
+`{name:"unknown", detected_from:"unknown"}` agent block — accurate,
+since we never had the identity to record. No backfill, no
+destructive ops, no network calls. The fingerprinted `AgentInfo`
+already resolved at the proxy hot-path is now threaded through
+`writeDecision`/`writeDecisionForTask`/`writeDecisionForTaskMaybe`
+into the row. The four read surfaces compose for free through the
+shared `FromDecision` wrapper: `unmapped.iam_jit.agent.{name,
+session_id}` always populated, `actor.user.name` mirrors
+`agent_name` when no K8s principal is extracted (Slice 1 default).
+Closes the cross-product parity gap with ibounce + dbounce +
+gbounce per `[[cross-product-agent-parity]]`.
+
+New tests: schema-version bump pin, insert-with-agent round-trip,
+anonymous-row NULL-column guard, user-agent-only shape,
+forward-migration data-preservation test (drops the v8 columns,
+rolls schema_version back to 7, re-opens, asserts the additive
+migration re-adds the columns + preserves the legacy row),
+proxy-hot-path SQLite persistence guard, `/audit/events` JSONL
+shape guard, three `audit/event.go` precedence tests
+(agent → actor.user.name, principal wins over agent, unknown agent
+leaves actor empty), three CLI `decisionRowToEvent` round-trip
+tests, end-to-end `audit tail` smoke test covering both
+MCP-session and user-agent shapes.
+
+Files: `internal/store/store.go` (schema + DecisionRow +
+RecordDecision + RecentDecisions), `internal/store/store_test.go`,
+`internal/audit/event.go` (buildActor precedence),
+`internal/audit/event_test.go`, `internal/proxy/proxy.go`
+(write-helper threading), `internal/proxy/proxy_test.go`,
+`internal/proxy/audit_events.go` (read-path agent rebuild),
+`internal/proxy/audit_events_test.go`,
+`internal/cli/audit_tail.go` (read-path agent rebuild +
+file-doc), `internal/cli/audit_tail_test.go`.
+
 ### Live audit-stream web UI at `GET /` (2026-05-18, #272)
 
 kbounce now serves a minimal vanilla-JS web UI at `GET /` on its

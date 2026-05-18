@@ -54,7 +54,13 @@ import (
 //	6 — add pending_prompts.sync_wait_id (#203 synchronous deny-prompt v1.1)
 //	7 — add rules.expires_at + rules.created_by + bulk-answer state tables
 //	    (bulk-prompt-answer-ux: burst events + profile-switch reload signal)
-const SchemaVersion = 7
+//	8 — add decisions.agent_name + decisions.agent_session_id (#289 closes
+//	    the kbounce-agent-identity-sqlite-gap with the existing parity
+//	    shape used by ibounce / dbounce / gbounce — both columns NULL on
+//	    pre-#289 rows, which the read path surfaces as the default
+//	    {name:"unknown", detected_from:"unknown"} agent block; old data
+//	    is preserved per [[creates-never-mutates]])
+const SchemaVersion = 8
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
@@ -371,6 +377,32 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("kbounce: create profile_reload_signal: %w", err)
 	}
 
+	// v8 additive migration (#289 — close the kbounce-agent-identity-
+	// sqlite-gap): persist the agent name + per-MCP-session id alongside
+	// every decision row. The JSONL audit log + HTTPS webhook already
+	// carry these (bound in memory at proxy hot-path); SQLite was the
+	// one channel that dropped them, which made anything reading SQLite
+	// directly (audit-tail, investigate, /audit/events, the web UI)
+	// always render `agent.name="unknown"` even when the in-memory
+	// identity was high-fidelity.
+	//
+	// Both columns nullable: pre-#289 rows stay NULL and the read path
+	// (RecentDecisions → decisionRowsToEvents → FromDecision) treats
+	// empty AgentInfo as "fall through to the default unknown block"
+	// — which is the ACCURATE label for rows that were recorded before
+	// we had the identity to store. NO backfill — synthesizing a fake
+	// identity for retroactive rows would violate
+	// [[scorer-is-ground-truth]] (pretending to know is not honest).
+	//
+	// Closes the cross-product parity gap with ibounce + dbounce +
+	// gbounce per [[cross-product-agent-parity]].
+	if err := s.addColumnIfMissing("decisions", "agent_name", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("decisions", "agent_session_id", "TEXT"); err != nil {
+		return err
+	}
+
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it
 	// idempotent on re-open.
 	var ver int
@@ -434,6 +466,18 @@ type DecisionRow struct {
 	// streaming). Lets a reviewer filter the audit log to just the
 	// streaming events without re-parsing URL shapes.
 	StreamKind string
+	// AgentName added in #289 (closes the kbounce-agent-identity-sqlite-
+	// gap). The fingerprinted agent name at decision time ("claude-code",
+	// "kubectl", "client-go", "unknown", ...). Empty when no detection
+	// source fired AND for rows recorded before #289 — both surface as
+	// the default {name:"unknown", detected_from:"unknown"} agent block
+	// when wrapped by FromDecision. Mirrors the column written by
+	// ibounce + dbounce + gbounce per [[cross-product-agent-parity]].
+	AgentName string
+	// AgentSessionID added in #289. The per-MCP-connection UUID v7 bound
+	// at the MCP handshake; empty for proxy-observed traffic that wasn't
+	// routed through an MCP connection (bare kubectl, ad-hoc scripts).
+	AgentSessionID string
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -454,8 +498,9 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			decision_verdict, decision_reason, mode_at_decision, enforced,
 			matched_rule_id, task_id,
 			decision_source, profile_name, pause_id,
-			is_stream, stream_kind
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			is_stream, stream_kind,
+			agent_name, agent_session_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Method, d.Path,
 		d.ParsedVerb, d.ParsedGroup, d.ParsedVersion, d.ParsedResource,
 		d.ParsedNamespace, d.ParsedName, d.ParsedSubresource,
@@ -464,6 +509,7 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 		nullableInt(d.MatchedRuleID), nullableString(d.TaskID),
 		d.DecisionSource, nullableString(d.ProfileName), nullableInt(d.PauseID),
 		boolToInt(d.IsStream), d.StreamKind,
+		nullableString(d.AgentName), nullableString(d.AgentSessionID),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("kbounce: record decision: %w", err)
@@ -505,7 +551,8 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		matched_rule_id, task_id,
 		COALESCE(decision_source, ''), COALESCE(profile_name, ''),
 		pause_id,
-		COALESCE(is_stream, 0), COALESCE(stream_kind, '')
+		COALESCE(is_stream, 0), COALESCE(stream_kind, ''),
+		COALESCE(agent_name, ''), COALESCE(agent_session_id, '')
 		FROM decisions
 		ORDER BY id DESC
 		LIMIT ?`, limit)
@@ -535,6 +582,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&ruleID, &taskID,
 			&d.DecisionSource, &d.ProfileName, &pauseID,
 			&isStream, &d.StreamKind,
+			&d.AgentName, &d.AgentSessionID,
 		); err != nil {
 			return nil, fmt.Errorf("kbounce: recent decisions scan: %w", err)
 		}

@@ -23,16 +23,18 @@
 //   - Supported fields match the cross-product spec + add kbounce-
 //     native `resource.namespace` (the K8s namespace) for kbounce.
 //
-// AGENT-FIELD CAVEAT
+// AGENT-FIELD COVERAGE
 //
-// DecisionRow in SQLite does NOT carry the agent-identity block
-// (agent name + session id are bound IN MEMORY for the lifetime of
-// the proxy process; only the JSONL log + HTTPS webhook persist them).
-// SQLite-sourced rows in `audit tail` show the default
-// `{name: "unknown", detected_from: "unknown"}` agent — accurate, just
-// less informative than the JSONL stream. Operators who need agent-
-// scoped filtering should `jq` over the JSONL log directly (or feed
-// the SIEM). This is documented in docs/QUERYING-AUDIT-LOGS.md.
+// Per #289 (closes the kbounce-agent-identity-sqlite-gap) the
+// decisions table persists the agent name + per-MCP-session id
+// alongside every row. `audit tail` reads those columns and surfaces
+// them under unmapped.iam_jit.agent so --filter on
+// unmapped.iam_jit.agent.name / agent.session_id works against
+// SQLite-sourced events exactly the same way it does against the
+// JSONL log. Pre-#289 rows have NULL columns and fall through to the
+// default {name:"unknown", detected_from:"unknown"} block —
+// accurate, since we never had the identity to record for those
+// rows.
 //
 // SECURITY-RELEVANT INVARIANTS
 //
@@ -440,10 +442,14 @@ func rowFingerprint(r store.DecisionRow) string {
 // is the bridge that lets --filter / --summary / --export operate
 // against the same wire shape downstream SIEMs see.
 //
-// Agent fields are absent in DecisionRow (bound in memory; never
-// persisted to SQLite) so the resulting event carries the default
-// `{name:"unknown", detected_from:"unknown"}` agent block. Documented
-// in the file-doc + docs/QUERYING-AUDIT-LOGS.md.
+// Agent fields are read from the persisted decisions.agent_name +
+// decisions.agent_session_id columns (#289 closes the kbounce-agent-
+// identity-sqlite-gap). DetectedFrom is reconstructed best-effort:
+// a populated session id implies the MCP-clientinfo source (only the
+// MCP handshake binds a session id); a populated name without a
+// session id implies the user-agent source. Empty AgentName falls
+// through to the FromDecision default {name:"unknown",
+// detected_from:"unknown"} block — accurate for pre-#289 rows.
 func decisionRowToEvent(r store.DecisionRow) audit.Event {
 	in := audit.DecisionInput{
 		At:                r.At,
@@ -466,8 +472,39 @@ func decisionRowToEvent(r store.DecisionRow) audit.Event {
 		IsDryRun:          r.IsDryRun,
 		StreamKind:        r.StreamKind,
 		TaskID:            r.TaskID,
+		Agent:             agentInfoFromRow(r),
 	}
 	return audit.FromDecision(in)
+}
+
+// agentInfoFromRow rebuilds the audit.AgentInfo from the columns
+// persisted by #289. Shared by every SQLite read path (audit tail,
+// investigate, /audit/events, web UI) so the agent block surfaces
+// identically across surfaces. The PrincipalName field on
+// DecisionInput is the K8s-subject path — distinct from the agent
+// (which is the calling client identity); we populate both via the
+// Actor block downstream when name is non-empty.
+func agentInfoFromRow(r store.DecisionRow) audit.AgentInfo {
+	if r.AgentName == "" && r.AgentSessionID == "" {
+		return audit.AgentInfo{}
+	}
+	info := audit.AgentInfo{
+		Name:      r.AgentName,
+		SessionID: r.AgentSessionID,
+	}
+	// Best-effort reconstruction of DetectedFrom from the persisted
+	// shape. The proxy hot-path knows the detection source exactly but
+	// SQLite only stores name + session id (matching ibounce +
+	// dbounce + gbounce); a populated session id is unambiguous (only
+	// MCP-clientinfo binds one), and a populated name without a
+	// session id is the user-agent path.
+	switch {
+	case r.AgentSessionID != "":
+		info.DetectedFrom = audit.DetectionSourceMCPClientInfo
+	case r.AgentName != "" && r.AgentName != audit.AgentNameUnknown:
+		info.DetectedFrom = audit.DetectionSourceUserAgent
+	}
+	return info
 }
 
 // --------------------------------------------------------------------
