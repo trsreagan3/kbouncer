@@ -1355,7 +1355,17 @@ func NewServer(cfg Config, st *store.Store) *Server {
 	// merged stream. Registered BEFORE the catch-all "/" so the exact
 	// path wins ServeMux precedence (matches /healthz handling above).
 	mux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken))
-	mux.HandleFunc("/", s.handle)
+	// #272 — GET / serves the minimal live audit-stream web UI. The
+	// page polls /audit/events every 2 s. kbounce's proxy port doubles
+	// as the mgmt port, so the UI shares the ServeMux with the k8s
+	// API catch-all. auditEventsUIRoot intercepts ONLY exact `GET /`
+	// (the browser landing path) and falls through to s.handle for
+	// every k8s API path (`/api/...`, `/apis/...`, ...) and every
+	// non-GET verb. Same auth model as /audit/events.
+	mux.HandleFunc("/", auditEventsUIRoot(
+		auditEventsUIHandler(cfg.AuditEventsToken),
+		s.handle,
+	))
 	s.http = &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 		Handler:           mux,
