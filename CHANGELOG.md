@@ -5,6 +5,25 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### HTTP `/audit/events` endpoint (2026-05-18, #271)
+
+GET `/audit/events` ships on the existing proxy port (`8766`)
+alongside `/healthz`. Same filter language as `kbounce audit tail
+--filter`, same supported field catalog, same OCSF v1.1.0 wire
+shape. Query parameters: `since` / `until` (ISO 8601), `filter`
+(repeatable; `field=value` / `field~regex` / `field>=N` /
+`field<=N`), `limit` (default 100, max 1000), `format` (`jsonl`
+default | `ocsf-bundle`). Loopback bind requires no auth (matches
+the existing trust anchor); external bind requires a bearer token
+via the new `kbounce run --audit-events-token TOKEN` flag (refuses
+to start in external-bind mode without it). Filter parsing lives
+in the new `internal/audit/filter.go` so both the CLI surface and
+the HTTP surface call the same parser. Powers the cross-bouncer
+`iam-jit audit query` CLI which queries every reachable bouncer in
+parallel + merges results. Per `[[cross-product-agent-parity]]` +
+`[[creates-never-mutates]]` (read-only) + `[[self-host-zero-billing-
+dependency]]` (operator-controlled port; no phone-home).
+
 ### Investigate-with-Claude workflow (2026-05-18, #273)
 
 `kbounce investigate` composes the existing `audit tail --export

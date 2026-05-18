@@ -261,6 +261,13 @@ type Config struct {
 	BulkAnswerThreshold int
 	BulkAnswerWindow    time.Duration
 	BulkAnswerCooldown  time.Duration
+
+	// AuditEventsToken (#271) is the bearer token clients must present
+	// on GET /audit/events when the proxy is bound off-loopback. Empty +
+	// loopback bind = no auth (the loopback bind is itself the trust
+	// anchor); empty + external bind = the CLI refuses to start. The
+	// audit-events handler reads this directly.
+	AuditEventsToken string
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -1341,6 +1348,13 @@ func NewServer(cfg Config, st *store.Store) *Server {
 	// regex against. Registering BEFORE the catch-all "/" so the
 	// exact-match path wins ServeMux precedence.
 	mux.HandleFunc("/healthz", s.healthz)
+	// #271 — GET /audit/events ships the headless audit-tail query
+	// surface. Same filter language as `kbounce audit tail --filter`;
+	// the cross-bouncer `iam-jit audit query` CLI calls this endpoint
+	// in parallel against each reachable bouncer to produce a single
+	// merged stream. Registered BEFORE the catch-all "/" so the exact
+	// path wins ServeMux precedence (matches /healthz handling above).
+	mux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken))
 	mux.HandleFunc("/", s.handle)
 	s.http = &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),

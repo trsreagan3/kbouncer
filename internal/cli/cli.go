@@ -215,6 +215,9 @@ func newRunCmd() *cobra.Command {
 		bulkAnswerThreshold int
 		bulkAnswerWindow    time.Duration
 		bulkAnswerCooldown  time.Duration
+		// #271 — bearer token for GET /audit/events when the proxy is
+		// bound off-loopback. Empty = loopback-only (no auth gate).
+		auditEventsToken string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -281,6 +284,16 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 						"re-run with --i-know-this-binds-externally AND read the "+
 						"SECURITY threat model first.\n", host)
 				os.Exit(2)
+			}
+			// #271 — GET /audit/events lives on the same port; an
+			// external bind without a bearer token would expose recent
+			// audit events (URL paths can be sensitive). Refuse to
+			// start in that shape.
+			if _, ok := loopbackHosts[host]; !ok && auditEventsToken == "" {
+				return fmt.Errorf(
+					"kbounce: --audit-events-token TOKEN is required when --host %q is non-loopback "+
+						"(GET /audit/events would otherwise be exposed without auth)",
+					host)
 			}
 
 			st, err := store.Open(dbPath)
@@ -408,6 +421,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				BulkAnswerThreshold:     bulkAnswerThreshold,
 				BulkAnswerWindow:        bulkAnswerWindow,
 				BulkAnswerCooldown:      bulkAnswerCooldown,
+				AuditEventsToken:        auditEventsToken,
 			}.Normalize()
 
 			// Cooperative mode + --sync-prompt-on-deny: per spec the
@@ -752,6 +766,11 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"fallback surfaces must not ride through it). Minimum 1s; "+
 			"requires --alert-rules to be a non-empty path for the local "+
 			"gap detection (ENTERPRISE-tier).")
+	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "",
+		"Bearer token required for GET /audit/events (#271) when the "+
+			"proxy is bound externally. Empty + loopback bind = no auth "+
+			"required (the loopback bind is the trust anchor). Empty + "+
+			"external bind = kbounce refuses to start.")
 	return cmd
 }
 

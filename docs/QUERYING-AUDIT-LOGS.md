@@ -406,3 +406,48 @@ vocabulary + summary groupings + export formats are identical across
 the suite. Product-specific extension fields (kbounce's
 `resource.namespace`, dbounce's SQL-statement fields) are additive —
 they never replace the shared catalog.
+
+## HTTP `GET /audit/events` endpoint (`#271`)
+
+kbounce exposes the same query surface as a headless HTTP endpoint on
+its existing port (`8766`):
+
+```
+GET /audit/events?since=ISO8601&until=ISO8601&filter=field=value&filter=...&limit=N&format=jsonl|ocsf-bundle
+```
+
+Same filter language as `kbounce audit tail --filter`, same supported
+field catalog. Defaults: `limit=100` (max `1000`), `format=jsonl` (one
+OCSF event per line). Pass `format=ocsf-bundle` for a single
+OCSF v1.1.0 class 2004 Detection Finding wrapping the matched events.
+
+### Sample invocations
+
+```bash
+# Loopback bind (default): no auth required.
+curl 'http://127.0.0.1:8766/audit/events?limit=10'
+
+# Filter to one namespace + last hour, NDJSON.
+curl 'http://127.0.0.1:8766/audit/events?filter=resource.namespace=prod&since=2026-05-18T00:00:00Z'
+
+# OCSF Detection Finding bundle for SIEM batch import.
+curl 'http://127.0.0.1:8766/audit/events?format=ocsf-bundle&limit=100'
+```
+
+### Auth model
+
+- **Loopback bind (default)**: no `Authorization` header required.
+  kbounce refuses to bind off-loopback without
+  `--i-know-this-binds-externally`.
+- **External bind**: `kbounce run --i-know-this-binds-externally
+  --host 0.0.0.0 --audit-events-token <TOKEN>` is required. Requests
+  must carry `Authorization: Bearer <TOKEN>`. Missing header → 401;
+  wrong token → 403. kbounce refuses to start in external-bind mode
+  without `--audit-events-token`.
+
+### Cross-bouncer query
+
+The `iam-jit audit query` CLI calls this endpoint on every reachable
+bouncer in parallel and merges the results. See
+[`iam-roles/docs/IAM-JIT-AUDIT-QUERY.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/IAM-JIT-AUDIT-QUERY.md)
+for the cross-product correlation workflow.
