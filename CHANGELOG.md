@@ -5,6 +5,57 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Same-class audit of ibounce #272 root-path shadowing fix (2026-05-19)
+
+Cross-product triage after the ibounce sibling fix at iam-roles
+commit `d045eee` (ibounce #272 audit-stream UI was silently
+shadowing AWS SDK root-path calls — S3 ListBuckets, presigned-URL
+redirects, opaque proxy traffic — because the UI route registered
+at `GET /` on the proxy port matched every bare-root request
+unconditionally with no Accept-header sniff).
+
+**Determination: kbounce is NOT affected.** No code fix shipped.
+
+Three structural reasons the ibounce bug does not apply:
+
+1. The Kubernetes apiserver protocol never routes a kubectl /
+   client-go call to bare `GET /`. Every legitimate client request
+   targets `/api`, `/apis`, `/api/{ver}/...`,
+   `/apis/{group}/{ver}/...`, `/healthz`, `/readyz`, `/livez`,
+   `/version`, `/openapi/v2`, `/openapi/v3`, or `/metrics`. There
+   is no API operation whose request-line target is `/`.
+2. The existing `auditEventsUIRoot` wrapper in
+   `internal/proxy/events_ui.go` uses an EXACT-path match
+   (`r.URL.Path == "/"`) — not a prefix or aiohttp-style catch-
+   all. Any other path falls through to `s.handle` untouched.
+3. Defense in depth: even if a request did arrive at bare `/`,
+   `parser.Parse()` rejects it as `ErrMalformedURL`, routing it
+   through the default-policy opaque path rather than letting it
+   slip through unevaluated.
+
+The ibounce sniff-the-`Accept`-header pattern is therefore not
+applicable here — the Go `http.ServeMux` + exact-path wrapper
+combination is the right shape for kbounce's protocol.
+
+New test pins the assumption: `TestAuditEventsUIRoot_KubernetesProtocolNeverHitsBareRoot`
+in `internal/proxy/events_ui_test.go` exercises 21 canonical
+kubectl + client-go request paths (core / named-group discovery,
+list / get / create / delete / patch / exec / log on pods +
+secrets + deployments + clusterroles, plus `/healthz`, `/readyz`,
+`/livez`, `/version`, `/openapi/v2`, `/openapi/v3`, `/metrics`),
+each asserting the UI handler never fires and the proxy fallback
+runs exactly once. If kubernetes ever shipped a bare-root API
+operation, this test would fail and force a re-evaluation of the
+wrapper (which would then need the ibounce Accept-header sniff
+pattern).
+
+Per `[[creates-never-mutates]]` this triage is read-only — no
+proxy code changed; only test + CHANGELOG. Per `[[deliberate-
+feature-completion]]` triage shipped as a discrete unit (test +
+CHANGELOG entry + cross-product reasoning recorded). Per
+`[[push-policy-public-repo]]` diff scanned before push; no
+sensitive data.
+
 ### Per-org notification routing engine (2026-05-19, #280; ENTERPRISE tier)
 
 - **`kbounce run --alert-routes ROUTES.yaml`** activates the multi-
