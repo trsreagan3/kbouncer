@@ -207,6 +207,11 @@ func newRunCmd() *cobra.Command {
 		// JSONL log + HTTPS webhook transport as decision events.
 		// Enterprise-tier (license-gated; placeholder error until #235).
 		auditAlertRulesPath string
+		// #280 — per-org notification routing engine. YAML config path;
+		// nil disables the engine (the single --audit-webhook-url path
+		// stays available). Enterprise-tier (license-gated; placeholder
+		// error until #235 license-file plumbing lands).
+		auditAlertRoutesPath string
 		// Heartbeat cadence per [[prompt-injection-disable-bouncer-
 		// threat]] + [[audit-export-failure-visibility]]. 0 = OFF
 		// (default; safety-not-surveillance positioning); 30s
@@ -484,6 +489,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				allowInternalWebhook,
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
 				auditAlertRulesPath,
+				auditAlertRoutesPath,
 				auditHeartbeatInterval,
 				recordSessionsDir,
 				securityLakeBucket, securityLakeRegion, securityLakeRoleARN,
@@ -840,6 +846,18 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"Becomes the Log-Type header on every POST; Sentinel auto-creates "+
 			"the table on first ingest. Ignored by other presets.")
 	// Slice 2 of #252 — suspicious-activity alert rule engine.
+	cmd.Flags().StringVar(&auditAlertRoutesPath, "alert-routes", "",
+		"#280 (ENTERPRISE tier — license-gated) — YAML file describing "+
+			"per-org notification routing. When set, the multi-destination "+
+			"routing engine activates: each event is matched against the "+
+			"configured routes' match blocks + dispatched to the route's "+
+			"destinations (webhook / pagerduty / slack). When unset, the "+
+			"existing single-webhook --audit-webhook-url path stays exactly "+
+			"as today (zero regression). Secrets must use ${ENV_VAR} "+
+			"interpolation; literal tokens in the YAML are refused. Use "+
+			"`kbounce config preview-routes` to dry-run a sample event "+
+			"against the file before deploying. Setting BOTH --alert-routes "+
+			"and --audit-webhook-url ignores the latter (with a warning).")
 	cmd.Flags().StringVar(&auditAlertRulesPath, "alert-rules", "",
 		"Path to a YAML file tuning the audit alert-rule engine "+
 			"(admin_fallback_burst / pause_long / non_org_profile_install / "+
@@ -967,6 +985,7 @@ func buildAuditManager(
 	allowInternal bool,
 	webhookPreset, webhookTags, webhookSentinelTable string,
 	alertRulesPath string,
+	alertRoutesPath string,
 	heartbeatInterval time.Duration,
 	recordSessionsDir string,
 	securityLakeBucket, securityLakeRegion, securityLakeRoleARN string,
@@ -991,9 +1010,16 @@ func buildAuditManager(
 				"(passing region without a target bucket has no effect)")
 	}
 	if logPath == "" && webhookURL == "" && alertRulesPath == "" &&
+		alertRoutesPath == "" &&
 		heartbeatInterval == 0 && recordSessionsDir == "" &&
 		securityLakeBucket == "" {
 		return nil, nil, noop, nil
+	}
+	// #280 — per-org routing engine. License-gated (placeholder until
+	// #235). When set, the engine takes precedence over the single-
+	// webhook pusher (see the "ignored with warning" check below).
+	if alertRoutesPath != "" {
+		return nil, nil, noop, audit.ErrRoutesLicenseRequired
 	}
 	// Validate the preset name up front so a typo surfaces before
 	// the license gate (gives the operator a single clear error per

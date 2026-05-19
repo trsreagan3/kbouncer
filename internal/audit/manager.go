@@ -143,6 +143,12 @@ type Status struct {
 type Manager struct {
 	log     *LogWriter
 	webhook *WebhookPusher
+	// #280 — per-org routing engine. When wired, the Manager skips the
+	// single-webhook dispatch (the CLI parse-time gate already warned
+	// the operator if both --alert-routes and --audit-webhook-url were
+	// passed). The JSONL log + Security Lake + recorder channels stay
+	// independent + run alongside the engine.
+	routes *RoutesEngine
 	// #258 — optional Security Lake parquet writer. Nil disables this
 	// channel. When wired, every event is also flushed (per-class) to
 	// the operator's S3 bucket in the Security-Lake-compatible
@@ -169,6 +175,11 @@ type Manager struct {
 type ManagerOptions struct {
 	LogWriter          *LogWriter
 	WebhookPusher      *WebhookPusher
+	// #280 — per-org routing engine. Nil disables; non-nil takes
+	// precedence over WebhookPusher (the CLI enforces that they aren't
+	// both passed at the same time but the Manager defensively skips
+	// the single-webhook on every emit anyway).
+	RoutesEngine       *RoutesEngine
 	SecurityLakeWriter *SecurityLakeWriter
 	SessionRecorder    *SessionRecorder
 }
@@ -181,6 +192,7 @@ func NewManager(opts ManagerOptions) *Manager {
 	return &Manager{
 		log:          opts.LogWriter,
 		webhook:      opts.WebhookPusher,
+		routes:       opts.RoutesEngine,
 		securityLake: opts.SecurityLakeWriter,
 		recorder:     opts.SessionRecorder,
 	}
@@ -198,7 +210,13 @@ func (m *Manager) Emit(ctx context.Context, ev Event) {
 	if m.log != nil {
 		_ = m.log.Write(ctx, ev)
 	}
-	if m.webhook != nil {
+	// #280 — routing engine takes precedence over the single-webhook
+	// pusher. When both are wired (defensively — the CLI gate refuses
+	// both at parse time) the routing engine handles all webhook
+	// dispatch + the single-webhook is skipped.
+	if m.routes != nil {
+		m.routes.Push(ctx, ev)
+	} else if m.webhook != nil {
 		_ = m.webhook.Push(ctx, ev)
 	}
 	// #258 — Security Lake parquet writer. Synchronous in-memory
@@ -366,6 +384,11 @@ func (m *Manager) Close() {
 	}
 	if m.webhook != nil {
 		m.webhook.Close()
+	}
+	// #280 — routes engine teardown drains the queue + waits for the
+	// worker. Idempotent.
+	if m.routes != nil {
+		m.routes.Close()
 	}
 	// #258 — Security Lake teardown flushes every pending parquet
 	// batch synchronously (per the spec) so a shutdown doesn't drop

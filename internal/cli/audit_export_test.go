@@ -33,6 +33,7 @@ func TestAuditWebhook_LicensePlaceholderRejects(t *testing.T) {
 		false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		"", // alertRoutesPath
 		0,
 		"",
 		"", "", "", 0,
@@ -55,6 +56,7 @@ func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		"", // alertRoutesPath
 		0,
 		"",
 		"", "", "", 0,
@@ -78,6 +80,7 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		"", // alertRoutesPath
 		0,
 		"",
 		"", "", "", 0,
@@ -86,6 +89,38 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 	assert.Nil(t, mgr, "no flags → no Manager constructed")
 	assert.NotNil(t, closer, "closer should be a no-op, not nil")
 	closer() // must not panic
+}
+
+// TestAuditRoutes_LicensePlaceholderRejects pins the #280 Enterprise
+// license gate for the per-org routing engine. Same placeholder shape
+// as the webhook + alert-rules gates; all three wait on #235.
+func TestAuditRoutes_LicensePlaceholderRejects(t *testing.T) {
+	dir := t.TempDir()
+	_, _, _, err := buildAuditManager(
+		t.Context(),
+		"", false,
+		"", "", 1, false,
+		"generic", "", audit.SentinelDefaultTable,
+		"",
+		dir+"/routes.yaml",
+		0,
+		"",
+		"", "", "", 0,
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, audit.ErrRoutesLicenseRequired,
+		"--alert-routes must return ErrRoutesLicenseRequired until license-file plumbing lands")
+	assert.Contains(t, err.Error(), "#235",
+		"error message should direct the operator to the tracking issue")
+}
+
+// TestRunCmdRegistersAlertRoutesFlag confirms the #280 --alert-routes
+// flag is registered on `kbounce run`. Cross-product parity (ibounce
+// + dbounce) ships the same flag name + YAML schema.
+func TestRunCmdRegistersAlertRoutesFlag(t *testing.T) {
+	cmd := newRunCmd()
+	require.NotNil(t, cmd.Flags().Lookup("alert-routes"),
+		"--alert-routes flag must be registered on `kbounce run`")
 }
 
 // TestAuditAlerts_LicensePlaceholderRejects pins the Slice 2 Enterprise
@@ -99,6 +134,7 @@ func TestAuditAlerts_LicensePlaceholderRejects(t *testing.T) {
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		dir+"/rules.yaml",
+		"", // alertRoutesPath
 		0,
 		"",
 		"", "", "", 0,
@@ -127,6 +163,7 @@ func TestAuditHeartbeat_OnEnabledWiresHealthCheckAndEmits(t *testing.T) {
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		"", // alertRoutesPath
 		audit.MinHeartbeatInterval,
 		"",
 		"", "", "", 0,
@@ -157,6 +194,7 @@ func TestAuditHeartbeat_TooSmallIntervalRejected(t *testing.T) {
 		"", "", 1, false,
 		"generic", "", audit.SentinelDefaultTable,
 		"",
+		"", // alertRoutesPath
 		100*time.Millisecond,
 		"",
 		"", "", "", 0,

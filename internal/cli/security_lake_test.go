@@ -17,6 +17,7 @@ func TestSecurityLakeBucketRequiresRegion(t *testing.T) {
 		"", "", 1, false,
 		"generic", "", "IamJitBouncer",
 		"",
+		"", // alertRoutesPath
 		0,
 		"",
 		"my-bucket", "", "", 0,
@@ -35,6 +36,7 @@ func TestSecurityLakeRegionRequiresBucket(t *testing.T) {
 		"", "", 1, false,
 		"generic", "", "IamJitBouncer",
 		"",
+		"", // alertRoutesPath
 		0,
 		"",
 		"", "us-east-1", "", 0,
