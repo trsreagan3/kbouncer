@@ -5,6 +5,43 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #321 / §A19 — `kbounce profile doctor` upgrade-blindness fix — Shipped 2026-05-22
+
+Cross-product fix for silent profile-upgrade-blindness across the
+Bounce suite. kbouncer was vulnerable to the same shape that the
+role-effectiveness eval 2026-05-22 surfaced on dbounce (D3): operators
+who installed kbouncer before later-shipped safety floors (e.g.
+`deny_subresource_writes` from #286) silently ran without those
+floors because `~/.kbouncer/profiles.yaml` is intentionally never
+overwritten (operator edits must survive).
+
+- **internal/profile/doctor.go (new):** `Check()` diff-checks the
+  installed profile YAML against a curated catalog of shipped default
+  fields (`deny_subresource_writes`, `deny_on_impersonation` in v1.0).
+  `Apply()` additively merges missing fields into the on-disk YAML +
+  backs up the prior file (`<path>.bak-YYYYMMDD-HHMMSS`) before
+  writing. `Acknowledge()` writes a per-operator stamp to suppress
+  the startup banner until a new `ShippedDefaultsVersion` re-arms
+  it. Per [[creates-never-mutates]]: additive only — operator-
+  customized field values are never overwritten.
+- **internal/cli/cli.go (extended):** `kbounce profile doctor`
+  subcommand with `--apply` / `--acknowledge` / `--diff` / `--check`
+  / `--json` flags. Same flag shape across all 4 Bounce products
+  per [[cross-product-agent-parity]]. Also adds `kbounce profile
+  install-defaults` (parity with dbounce + ibounce — was previously
+  only writeable transparently via `kbounce run`).
+- **internal/cli/cli.go (extended):** `kbounce run` startup-banner
+  hook calls `profile.StartupBannerLine` after the existing caveats
+  block. The one-line warning fires only when a safety-floor field
+  is missing AND the operator hasn't acknowledged the current
+  shipped-defaults version. Per
+  [[security-team-positioning-safety-not-surveillance]]: framed as
+  "your profile is behind" not "you are non-compliant."
+- **internal/profile/doctor_test.go (new):** 7 tests cover fresh
+  profile / missing-safety-floor / missing-convenience / apply-
+  additive / apply-backs-up / acknowledge-silences /
+  catalog-covers-embedded-defaults.
+
 ### #320 / §A18 — `/audit/events` wire-shape parity fix — Shipped 2026-05-22
 
 Closes a UAT-discovered CRIT: the HTTP `/audit/events` projection

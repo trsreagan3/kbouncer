@@ -14,6 +14,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -722,6 +723,15 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			for _, line := range caveats.BannerLines(caveats.Trigger{
 				SafeDefaultProfile: activeProfileName == "safe-default",
 			}) {
+				fmt.Fprintln(os.Stderr, line)
+			}
+			// §A19 profile-upgrade-blindness banner (#321). Only fires
+			// when the operator's installed profile is missing a
+			// safety-floor field AND they haven't acknowledged the
+			// current shipped-defaults version. Convenience / detection
+			// / audit misses don't trigger startup line — operators see
+			// those on explicit `kbounce profile doctor`.
+			if line := profile.StartupBannerLine("kbounce", resolvedProfilesPath); line != "" {
 				fmt.Fprintln(os.Stderr, line)
 			}
 			fmt.Fprintln(os.Stderr, "Ctrl+C to stop.")
@@ -1518,6 +1528,218 @@ prints the full record for a single profile.`,
 	cmd.AddCommand(newProfileListCmd())
 	cmd.AddCommand(newProfileShowCmd())
 	cmd.AddCommand(newProfileInstallCmd())
+	cmd.AddCommand(newProfileInstallDefaultsCmd())
+	cmd.AddCommand(newProfileDoctorCmd())
+	return cmd
+}
+
+// newProfileInstallDefaultsCmd implements `kbounce profile install-
+// defaults` per [[cross-product-agent-parity]] (matches dbounce +
+// ibounce). Writes the embedded default profiles to disk iff the file
+// doesn't already exist, so an operator who wants to review / edit
+// the defaults BEFORE starting the proxy can materialize the file
+// on demand. `kbounce run` does the same write transparently on its
+// first launch; this surface is for the "I want to see what gets
+// shipped" workflow.
+func newProfileInstallDefaultsCmd() *cobra.Command {
+	var (
+		profilesPath string
+		force        bool
+	)
+	cmd := &cobra.Command{
+		Use:   "install-defaults",
+		Short: "Materialize the built-in profiles.yaml on disk",
+		Long: `Write the embedded default profiles (full-user +
+safe-default) to ~/.kbouncer/profiles.yaml. NEVER overwrites an
+existing file unless --force is set (operator edits to community-
+installed profiles must survive). Convenient when operators want
+to review or edit profiles.yaml before starting the proxy.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if profilesPath == "" {
+				p, err := profile.DefaultProfilesPath()
+				if err != nil {
+					return err
+				}
+				profilesPath = p
+			}
+			if force {
+				_ = os.Remove(profilesPath)
+			}
+			written, err := profile.EnsureDefaultProfilesFile(profilesPath)
+			if err != nil {
+				return err
+			}
+			if written {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"kbounce: wrote default profiles to %s\n", profilesPath)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"kbounce: profiles.yaml already exists at %s "+
+						"(pass --force to overwrite)\n", profilesPath)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Overwrite an existing profiles.yaml at the target path.")
+	return cmd
+}
+
+// newProfileDoctorCmd implements `kbounce profile doctor` per task
+// #321 / KNOWN-CAVEATS §A19. Diff-checks the operator's installed
+// profile YAML against embedded defaults + reports missing fields
+// without overwriting. Operator opts in to merging via --apply or
+// silences via --acknowledge.
+//
+// Exit codes:
+//
+//	0  current OR --apply succeeded OR --acknowledge succeeded
+//	1  filesystem error
+//	2  doctor found missing fields AND neither --apply nor
+//	   --acknowledge was given
+func newProfileDoctorCmd() *cobra.Command {
+	var (
+		profilesPath string
+		apply        bool
+		acknowledge  bool
+		showDiff     bool
+		checkOnly    bool
+		jsonOut      bool
+	)
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Diff installed profile against shipped defaults + report missing fields",
+		Long: `Compare ~/.kbouncer/profiles.yaml against the shipped defaults
+and report any fields the operator's local file is missing. kbounce
+NEVER auto-overwrites profiles.yaml — operator edits survive
+upgrades — but that means new safety floors added to embedded
+defaults AFTER your file was written go unnoticed.
+
+  kbounce profile doctor              # report missing fields (no write)
+  kbounce profile doctor --apply      # additively merge missing fields + back up prior file
+  kbounce profile doctor --acknowledge # silence the warning for this defaults version
+  kbounce profile doctor --diff       # show the YAML delta --apply would write
+  kbounce profile doctor --check      # silent; exit 2 if gaps found (script-friendly)
+
+Per [[creates-never-mutates]]: --apply is ADDITIVE only. If you set
+a deny field to false deliberately, --apply skips it.
+
+Per [[security-team-positioning-safety-not-surveillance]]: framed
+as "your profile is behind" not "you are non-compliant."`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if apply && acknowledge {
+				return fmt.Errorf("--apply and --acknowledge are mutually exclusive")
+			}
+			if profilesPath == "" {
+				p, err := profile.DefaultProfilesPath()
+				if err != nil {
+					return err
+				}
+				profilesPath = p
+			}
+			rep, err := profile.Check(profilesPath)
+			if err != nil {
+				return err
+			}
+			if apply {
+				result, aerr := profile.Apply(profilesPath, profile.ApplyOptions{})
+				if aerr != nil {
+					return aerr
+				}
+				if len(result.AppliedFields) == 0 {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"kbounce: profile doctor — nothing to apply; installed profile matches shipped defaults (version %s).\n",
+						profile.ShippedDefaultsVersion)
+					return nil
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"kbounce: profile doctor --apply — added %d field(s); backup at %s\n",
+					len(result.AppliedFields), result.BackupPath)
+				for _, g := range result.AppliedFields {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"  + %s.%s = %v   [%s] %s\n",
+						g.ProfileName, g.Field, g.DefaultValue, g.Category, g.AddedIn)
+				}
+				return nil
+			}
+			if acknowledge {
+				path, aerr := profile.Acknowledge(profilesPath)
+				if aerr != nil {
+					return aerr
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"kbounce: profile doctor --acknowledge — recorded %s at %s\n",
+					profile.ShippedDefaultsVersion, path)
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"future `kbounce run` startup banners will skip the §A19 warning "+
+						"until a new shipped-defaults version bumps the stamp.")
+				return nil
+			}
+			if checkOnly {
+				if len(rep.MissingFields) > 0 {
+					os.Exit(2)
+				}
+				return nil
+			}
+			if jsonOut {
+				type jsonGap struct {
+					Profile  string `json:"profile"`
+					Field    string `json:"field"`
+					Category string `json:"category"`
+					Why      string `json:"why"`
+					AddedIn  string `json:"added_in"`
+					Default  any    `json:"default"`
+				}
+				out := struct {
+					Version       string    `json:"shipped_defaults_version"`
+					InstalledPath string    `json:"installed_path"`
+					Missing       []jsonGap `json:"missing"`
+				}{Version: rep.ShippedDefaultsVersion, InstalledPath: rep.InstalledPath}
+				for _, g := range rep.MissingFields {
+					out.Missing = append(out.Missing, jsonGap{
+						Profile: g.ProfileName, Field: g.Field,
+						Category: string(g.Category), Why: g.WhyMatters,
+						AddedIn: g.AddedIn, Default: g.DefaultValue,
+					})
+				}
+				b, _ := json.MarshalIndent(out, "", "  ")
+				fmt.Fprintln(cmd.OutOrStdout(), string(b))
+				if len(rep.MissingFields) > 0 {
+					os.Exit(2)
+				}
+				return nil
+			}
+			fmt.Fprint(cmd.OutOrStdout(), profile.FormatReport("kbounce", rep))
+			if showDiff {
+				fmt.Fprintln(cmd.OutOrStdout(), "--- YAML that --apply would add ---")
+				for _, g := range rep.MissingFields {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"profiles.%s.%s: %v\n",
+						g.ProfileName, g.Field, g.DefaultValue)
+				}
+			}
+			if len(rep.MissingFields) > 0 {
+				os.Exit(2)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
+	cmd.Flags().BoolVar(&apply, "apply", false,
+		"Additively merge missing default fields into profiles.yaml + back up prior file.")
+	cmd.Flags().BoolVar(&acknowledge, "acknowledge", false,
+		"Record the current shipped-defaults version as acknowledged.")
+	cmd.Flags().BoolVar(&showDiff, "diff", false,
+		"Print the YAML fragment --apply would add.")
+	cmd.Flags().BoolVar(&checkOnly, "check", false,
+		"Silent mode: exit 0 if current, exit 2 if gaps found.")
+	cmd.Flags().BoolVar(&jsonOut, "json", false,
+		"Emit machine-readable JSON. Exit 2 if gaps found.")
 	return cmd
 }
 

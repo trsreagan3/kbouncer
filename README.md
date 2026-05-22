@@ -40,6 +40,20 @@ export KBOUNCER_PROFILE=safe-default
 kbounce run
 ```
 
+### After upgrade: `kbounce profile doctor` (one-time)
+
+kbounce never overwrites `~/.kbouncer/profiles.yaml` (your edits
+survive upgrades), so a new safety floor added to embedded defaults
+won't land until you opt in. After upgrading the binary, run:
+
+```sh
+kbounce profile doctor          # report missing fields (no write)
+kbounce profile doctor --apply  # additively merge + back up prior file
+```
+
+See [docs/PROFILE-UPGRADE.md](../iam-roles/docs/PROFILE-UPGRADE.md)
+for the full runbook (task #321 / KNOWN-CAVEATS §A19).
+
 ### Local development build
 
 If you're iterating on the source tree:
