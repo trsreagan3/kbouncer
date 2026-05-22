@@ -5,6 +5,83 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #317 / §A15 — cloud-neutral S3-compatible NDJSON object-storage sink — Shipped 2026-05-22
+
+Closes the headline cloud-neutrality gap surfaced by founder
+direction 2026-05-22: bouncers other than ibounce are
+cloud-neutral; the AWS-only Security Lake adapter (#258) alone
+doesn't serve operators on GCS / Azure Blob / MinIO / R2 / B2 /
+DigitalOcean Spaces. kbouncer ships the new sink alongside the
+existing JSONL + webhook + Security Lake transports per
+[[creates-never-mutates]] (additive composition).
+
+- **`kbounce run --audit-object-storage-endpoint URL
+  --audit-object-storage-bucket NAME
+  --audit-object-storage-prefix PREFIX
+  --audit-object-storage-region REGION
+  --audit-object-storage-credentials-file PATH
+  --audit-object-storage-rotation-minutes N
+  --audit-object-storage-max-size-mb N
+  --audit-object-storage-instance-id ID`** — generic S3-compat
+  sink. Per [[cross-product-agent-parity]] the flag shape is
+  identical on ibounce + dbounce + gbounce.
+- New package symbols: `audit.ObjectStorageWriter` +
+  `audit.ObjectStorageCredentials` +
+  `audit.LoadObjectStorageCredentials` +
+  `audit.NewObjectStorageWriter` +
+  `audit.ObjectStorageStatus` +
+  `audit.ObjectStorageDefaultRotationMinutes` +
+  `audit.ObjectStorageDefaultMaxSizeMB` +
+  `audit.ObjectStorageDefaultRegion` +
+  `audit.ErrObjectStorageNoCredentials` +
+  `audit.ErrObjectStorageBucketUnreachable`. The writer is
+  background-rotated; refuses to start when HeadBucket fails (so
+  credential / endpoint / bucket-name misconfigurations surface
+  immediately, not at first flush); fail-soft on Write; flushes
+  synchronously on Close.
+- Output layout: NDJSON (one OCSF event per line),
+  gzip-compressed, Hive-partitioned at
+  `{prefix}/year=YYYY/month=MM/day=DD/hour=HH/kbounce-{instance_id}-{timestamp}.jsonl.gz`.
+  Athena / BigQuery / Spark / Trino auto-discover the partitions;
+  SIEM collectors `LIST + GET` against the prefix.
+- Per-instance file naming derives `instance_id` from
+  `hostname-pid` (override with `--audit-object-storage-instance-id`).
+- Additive `audit.Manager` field
+  `ObjectStorageWriter *ObjectStorageWriter` + `ManagerOptions.
+  ObjectStorageWriter`. `Manager.Emit` fans new events to the
+  writer alongside the JSONL + webhook + Security Lake channels;
+  `Manager.Close` flushes the writer synchronously. The aggregate
+  `Status.ObjectStorage` embeds the writer's snapshot for the MCP
+  audit-export status tool.
+- Per [[self-host-zero-billing-dependency]]: destination is
+  operator-owned (operator creates the bucket; kbounce never
+  creates buckets). Per [[don't-tailor-to-lighthouse]]: generic
+  S3-compat covers AWS S3 (native), GCS (S3 interop / HMAC), Azure
+  Blob (S3-compat layer), MinIO, Cloudflare R2, Backblaze B2,
+  DigitalOcean Spaces.
+
+**What does NOT ship in v1.0** (deferred to v1.1 per
+[[don't-tailor-to-lighthouse]]): native GCS auth (Workload
+Identity) + native Azure Blob auth (Managed Identity). S3 interop
+covers ~95% of operators today.
+
+**Regression tests:** `internal/audit/object_storage_test.go` — 19
+tests cover defaults, credentials resolution (env + YAML + INI),
+partition path format, construction refusal, write/flush happy
+path, status surface, size-cap synchronous flush,
+drop-on-buffer-full, write-before-start no-op,
+close-flushes-pending, put_object failure -> writes_ok=false, and
+the rotation timer triggering a background flush.
+
+**Task:** #317 — completed 2026-05-22.
+
+### #319 / §A17 — UAT findings cluster: cross-product CLI parity (kbounce slice) — Fixed 2026-05-22
+
+- **F-311-4 (HIGH)** — added `--audit-log-max-size-mb` + `--audit-log-max-age-days` + `--audit-db-retention-days` flags on `kbounce run` with matching `KBOUNCE_AUDIT_LOG_MAX_SIZE_MB` / `_MAX_AGE_DAYS` / `_DB_RETENTION_DAYS` env-var overrides. CLI flag wins when explicitly set; env var fills in otherwise; audit-package default (matches iam-roles/docs/LOG-RETENTION.md) wins last. Sentinel -1 = "use audit-pkg default"; 0 = "operator explicitly disabled trigger." Threaded through `buildAuditManager` into `audit.LogWriterOptions.{MaxSizeMB,MaxAgeDays}` so the live writer enforces both triggers. DB-retention is consumed by the on-demand `kbounce logs purge` subcommand (no writer-side DB sweep — `[[creates-never-mutates]]` keeps the live SQLite intact).
+- **F-311-3 / F-304-1 / F-304-2 verified** — kbounce already ships `kbounce logs {archive,purge,verify}` + `kbounce doctor {caveats,logs}` + the `caveats.BannerLines(caveats.Trigger{SafeDefaultProfile: ...})` startup hook (verified via `/tmp/kbounce --help`). The §A17 findings doc was stale on these three items; documented as such in `iam-roles/docs/KNOWN-CAVEATS.md` §A17 closure notes.
+
+Regression coverage: new `TestRunCmdRegistersRotationFlags` in `internal/cli/security_lake_test.go`. Existing `buildAuditManager` test callers updated to thread the new positional args.
+
 ### #318 / §A16 — cross-bouncer X-Agent-Session-Id header parity (2026-05-22)
 
 Closes the headline cross-bouncer correlation gap surfaced by the

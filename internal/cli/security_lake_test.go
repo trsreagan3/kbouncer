@@ -14,6 +14,7 @@ func TestSecurityLakeBucketRequiresRegion(t *testing.T) {
 	_, _, _, err := buildAuditManager(
 		t.Context(),
 		"", false,
+		-1, -1, -1,
 		"", "", 1, false,
 		"generic", "", "IamJitBouncer",
 		"",
@@ -21,6 +22,7 @@ func TestSecurityLakeBucketRequiresRegion(t *testing.T) {
 		0,
 		"",
 		"my-bucket", "", "", 0,
+		"", "", "", "", "", 0, 0, "",
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--security-lake-region",
@@ -33,6 +35,7 @@ func TestSecurityLakeRegionRequiresBucket(t *testing.T) {
 	_, _, _, err := buildAuditManager(
 		t.Context(),
 		"", false,
+		-1, -1, -1,
 		"", "", 1, false,
 		"generic", "", "IamJitBouncer",
 		"",
@@ -40,6 +43,7 @@ func TestSecurityLakeRegionRequiresBucket(t *testing.T) {
 		0,
 		"",
 		"", "us-east-1", "", 0,
+		"", "", "", "", "", 0, 0, "",
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--security-lake-bucket",
@@ -60,5 +64,23 @@ func TestRunCmdRegistersSecurityLakeFlags(t *testing.T) {
 	} {
 		require.NotNil(t, flags.Lookup(name),
 			"--%s flag must be registered", name)
+	}
+}
+
+// TestRunCmdRegistersRotationFlags pins F-311-4 closure: the
+// cross-product audit-log rotation trio MUST be registered on
+// `kbounce run`. Names + env-var-override-name shape match
+// LOG-RETENTION.md per [[cross-product-agent-parity]].
+func TestRunCmdRegistersRotationFlags(t *testing.T) {
+	cmd := newRunCmd()
+	flags := cmd.Flags()
+	for _, name := range []string{
+		"audit-log-max-size-mb",
+		"audit-log-max-age-days",
+		"audit-db-retention-days",
+	} {
+		require.NotNil(t, flags.Lookup(name),
+			"--%s flag must be registered on `kbounce run` (F-311-4 regression)",
+			name)
 	}
 }

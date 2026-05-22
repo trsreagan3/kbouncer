@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -203,6 +204,16 @@ func newRunCmd() *cobra.Command {
 		// gated for Enterprise per [[security-team-audit-export]].
 		auditLogPath              string
 		auditLogFsync             bool
+		// #311 / §A10 — rotation thresholds. 0 disables the trigger;
+		// negative values (sentinel for "operator didn't pass the flag")
+		// fall back to the audit-package defaults via the env-var
+		// resolution. Names match the cross-product spec at
+		// iam-roles/docs/LOG-RETENTION.md per [[cross-product-agent-
+		// parity]] (sibling products ship the same flag names + env-var
+		// names so a single playbook covers all four).
+		auditLogMaxSizeMB    int64
+		auditLogMaxAgeDays   int
+		auditDBRetentionDays int
 		auditWebhookURL           string
 		auditWebhookToken         string
 		auditWebhookBatch         int
@@ -251,6 +262,17 @@ func newRunCmd() *cobra.Command {
 		securityLakeRegion          string
 		securityLakeRoleARN         string
 		securityLakeRotationSeconds int
+		// #317 — cloud-neutral S3-compatible NDJSON object-storage
+		// sink. All fields OFF by default. Per [[self-host-zero-
+		// billing-dependency]] the bucket is operator-owned.
+		auditObjectStorageEndpoint        string
+		auditObjectStorageBucket          string
+		auditObjectStoragePrefix          string
+		auditObjectStorageRegion          string
+		auditObjectStorageCredentialsFile string
+		auditObjectStorageRotationMinutes int
+		auditObjectStorageMaxSizeMB       int
+		auditObjectStorageInstanceID      string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -491,9 +513,40 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			// truth regardless. Webhook flags require an Enterprise
 			// license (placeholder error until #235 license-file
 			// plumbing lands).
+			// #311 / §A10 — env-var fallback for the rotation trio. CLI
+			// flag wins; env var fills in when the operator didn't pass
+			// it; sentinel -1 left intact for downstream "use default"
+			// resolution. Env-var names match the cross-product spec at
+			// iam-roles/docs/LOG-RETENTION.md.
+			resolveInt64Env := func(flagVal int64, envName string) int64 {
+				if cmd.Flags().Changed(strings.TrimPrefix(strings.ToLower(envName), "kbounce_")) {
+					return flagVal
+				}
+				if v := os.Getenv(envName); v != "" {
+					if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
+						return parsed
+					}
+				}
+				return flagVal
+			}
+			resolveIntEnv := func(flagVal int, envName string) int {
+				if cmd.Flags().Changed(strings.TrimPrefix(strings.ToLower(envName), "kbounce_")) {
+					return flagVal
+				}
+				if v := os.Getenv(envName); v != "" {
+					if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+						return parsed
+					}
+				}
+				return flagVal
+			}
+			effAuditLogMaxSizeMB := resolveInt64Env(auditLogMaxSizeMB, "KBOUNCE_AUDIT_LOG_MAX_SIZE_MB")
+			effAuditLogMaxAgeDays := resolveIntEnv(auditLogMaxAgeDays, "KBOUNCE_AUDIT_LOG_MAX_AGE_DAYS")
+			effAuditDBRetentionDays := resolveIntEnv(auditDBRetentionDays, "KBOUNCE_AUDIT_DB_RETENTION_DAYS")
 			auditEmitter, auditHealth, auditCloser, auditErr := buildAuditManager(
 				cmd.Context(),
 				auditLogPath, auditLogFsync,
+				effAuditLogMaxSizeMB, effAuditLogMaxAgeDays, effAuditDBRetentionDays,
 				auditWebhookURL, auditWebhookToken, auditWebhookBatch,
 				allowInternalWebhook,
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
@@ -503,6 +556,12 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				recordSessionsDir,
 				securityLakeBucket, securityLakeRegion, securityLakeRoleARN,
 				securityLakeRotationSeconds,
+				auditObjectStorageEndpoint, auditObjectStorageBucket,
+				auditObjectStoragePrefix, auditObjectStorageRegion,
+				auditObjectStorageCredentialsFile,
+				auditObjectStorageRotationMinutes,
+				auditObjectStorageMaxSizeMB,
+				auditObjectStorageInstanceID,
 			)
 			if auditErr != nil {
 				return auditErr
@@ -827,6 +886,30 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"(buffered writes are durable to a crash but not a power loss). "+
 			"Opt in for compliance-grade durability at the cost of ~10x "+
 			"per-line write latency.")
+	// #311 / §A10 — rotation thresholds. Sentinel value -1 = "operator
+	// didn't pass the flag → use the audit package default (100 MB / 7
+	// days / 30 days)." 0 = "operator explicitly disabled this trigger."
+	// Same names across all four Bounce products per
+	// [[cross-product-agent-parity]].
+	cmd.Flags().Int64Var(&auditLogMaxSizeMB, "audit-log-max-size-mb", -1,
+		"#311 — rotate the JSONL audit log when it exceeds N MB. 0 disables "+
+			"size-triggered rotation. Default 100 (matches the cross-product "+
+			"LOG-RETENTION.md spec). Rotated files are gzip'd in-place and "+
+			"remain until `kbounce logs purge` reaps them (per [[creates-"+
+			"never-mutates]] the active log is never destroyed automatically). "+
+			"Honors $KBOUNCE_AUDIT_LOG_MAX_SIZE_MB for non-flag overrides.")
+	cmd.Flags().IntVar(&auditLogMaxAgeDays, "audit-log-max-age-days", -1,
+		"#311 — rotate the JSONL audit log when its mtime is older than N "+
+			"days. 0 disables age-triggered rotation. Default 7 (matches the "+
+			"cross-product LOG-RETENTION.md spec). Pairs with --audit-log-"+
+			"max-size-mb; whichever fires first wins. Honors "+
+			"$KBOUNCE_AUDIT_LOG_MAX_AGE_DAYS for non-flag overrides.")
+	cmd.Flags().IntVar(&auditDBRetentionDays, "audit-db-retention-days", -1,
+		"#311 — purge rotated audit DB archives older than N days. 0 "+
+			"disables DB retention. Default 30 (matches the cross-product "+
+			"LOG-RETENTION.md spec). Active audit DB is NEVER deleted by "+
+			"this path; only rotated archives are eligible. Honors "+
+			"$KBOUNCE_AUDIT_DB_RETENTION_DAYS for non-flag overrides.")
 	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
 		"HTTPS URL of an operator-owned audit-event collector. Each decision "+
 			"event POSTed as JSON. ENTERPRISE-tier feature (license-gated; "+
@@ -966,6 +1049,72 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"Default 300 (5 minutes) matches the Security Lake custom-"+
 			"source ingest cadence. A 10 MiB size cap also forces a flush, "+
 			"whichever fires first.")
+	// #317 — cloud-neutral S3-compatible NDJSON object-storage sink.
+	// All fields OFF by default. Per [[self-host-zero-billing-
+	// dependency]] the bucket is operator-owned. Per [[don't-tailor-
+	// to-lighthouse]]: generic S3-compat (AWS S3 native + GCS interop
+	// + Azure Blob S3-compat layer + MinIO + R2 + B2 + DigitalOcean
+	// Spaces). Per [[cross-product-agent-parity]] the flag shape is
+	// identical to ibounce + dbounce + gbounce.
+	cmd.Flags().StringVar(&auditObjectStorageEndpoint,
+		"audit-object-storage-endpoint", "",
+		"#317 — S3 API endpoint URL. Required when "+
+			"--audit-object-storage-bucket is set. Examples: "+
+			"https://s3.us-east-1.amazonaws.com (AWS S3); "+
+			"https://<accountid>.r2.cloudflarestorage.com (Cloudflare R2); "+
+			"https://minio.internal:9000 (MinIO); "+
+			"https://storage.googleapis.com (GCS interop); "+
+			"https://s3.us-west-002.backblazeb2.com (Backblaze B2); "+
+			"https://nyc3.digitaloceanspaces.com (DigitalOcean Spaces).")
+	cmd.Flags().StringVar(&auditObjectStorageBucket,
+		"audit-object-storage-bucket", "",
+		"#317 — name of the operator-owned bucket the writer appends "+
+			"NDJSON files into. Operator creates the bucket; kbounce "+
+			"NEVER creates buckets. When set, every OCSF event is also "+
+			"written as a gzip-compressed NDJSON line into "+
+			"`{prefix}/year=YYYY/month=MM/day=DD/hour=HH/"+
+			"kbounce-{instance_id}-{timestamp}.jsonl.gz`. Hive-style "+
+			"partitioning lets Athena / BigQuery / Spark / Trino query "+
+			"the bucket directly; collectors do LIST + GET against the "+
+			"prefix at predictable cadence.")
+	cmd.Flags().StringVar(&auditObjectStoragePrefix,
+		"audit-object-storage-prefix", "",
+		"#317 — key prefix inside the bucket (e.g. `bounce-audit/prod`). "+
+			"Empty = bucket root. Hive partition directories are "+
+			"appended under the prefix.")
+	cmd.Flags().StringVar(&auditObjectStorageRegion,
+		"audit-object-storage-region", audit.ObjectStorageDefaultRegion,
+		"#317 — region for the SigV4 signature. AWS S3: real region "+
+			"(`us-east-1`, `eu-west-1`, ...). Cloudflare R2: `auto`. "+
+			"MinIO / vendor-specific: pick whatever the vendor docs say.")
+	cmd.Flags().StringVar(&auditObjectStorageCredentialsFile,
+		"audit-object-storage-credentials-file", "",
+		"#317 — optional explicit credentials file (overrides env vars). "+
+			"YAML or INI shape with keys `access_key_id`, "+
+			"`secret_access_key`, optional `session_token`. When absent, "+
+			"reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / "+
+			"AWS_SESSION_TOKEN env vars.")
+	cmd.Flags().IntVar(&auditObjectStorageRotationMinutes,
+		"audit-object-storage-rotation-minutes",
+		audit.ObjectStorageDefaultRotationMinutes,
+		"#317 — rotate the active NDJSON file when N minutes elapse OR "+
+			"--audit-object-storage-max-size-mb fires, whichever first. "+
+			"Lower values mean smaller files + faster collector "+
+			"visibility; higher values mean fewer / larger files "+
+			"(better scan efficiency).")
+	cmd.Flags().IntVar(&auditObjectStorageMaxSizeMB,
+		"audit-object-storage-max-size-mb",
+		audit.ObjectStorageDefaultMaxSizeMB,
+		"#317 — rotate the active NDJSON file when its in-memory size "+
+			"estimate crosses N megabytes. Default 16. Works together "+
+			"with --audit-object-storage-rotation-minutes; whichever cap "+
+			"fires first triggers a flush.")
+	cmd.Flags().StringVar(&auditObjectStorageInstanceID,
+		"audit-object-storage-instance-id", "",
+		"#317 — override the auto-generated instance identifier "+
+			"(hostname-pid) used in the object key. Useful for operators "+
+			"with ephemeral hostnames (containers / k8s pods) who want "+
+			"the path stable across restarts.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more
@@ -1006,6 +1155,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 func buildAuditManager(
 	ctx context.Context,
 	logPath string, logFsync bool,
+	logMaxSizeMB int64, logMaxAgeDays int, dbRetentionDays int,
 	webhookURL, webhookToken string, webhookBatch int,
 	allowInternal bool,
 	webhookPreset, webhookTags, webhookSentinelTable string,
@@ -1015,6 +1165,12 @@ func buildAuditManager(
 	recordSessionsDir string,
 	securityLakeBucket, securityLakeRegion, securityLakeRoleARN string,
 	securityLakeRotationSeconds int,
+	auditObjectStorageEndpoint, auditObjectStorageBucket,
+	auditObjectStoragePrefix, auditObjectStorageRegion,
+	auditObjectStorageCredentialsFile string,
+	auditObjectStorageRotationMinutes int,
+	auditObjectStorageMaxSizeMB int,
+	auditObjectStorageInstanceID string,
 ) (audit.Emitter, func() bool, func(), error) {
 	noop := func() {}
 	// #258 — Security Lake parse-time validation. Bucket without region
@@ -1034,10 +1190,28 @@ func buildAuditManager(
 			"kbounce: --security-lake-region requires --security-lake-bucket " +
 				"(passing region without a target bucket has no effect)")
 	}
+	// #317 — object-storage parse-time validation. Bucket without
+	// endpoint (or vice versa) is a misconfiguration; fail-fast.
+	if auditObjectStorageBucket != "" && auditObjectStorageEndpoint == "" {
+		return nil, nil, noop, fmt.Errorf(
+			"kbounce: --audit-object-storage-bucket requires " +
+				"--audit-object-storage-endpoint (the S3 API endpoint URL " +
+				"for the operator's cloud provider — examples: " +
+				"https://s3.us-east-1.amazonaws.com for AWS S3; " +
+				"https://<accountid>.r2.cloudflarestorage.com for " +
+				"Cloudflare R2; https://storage.googleapis.com for GCS " +
+				"interop)")
+	}
+	if auditObjectStorageEndpoint != "" && auditObjectStorageBucket == "" {
+		return nil, nil, noop, fmt.Errorf(
+			"kbounce: --audit-object-storage-endpoint requires " +
+				"--audit-object-storage-bucket (passing an endpoint " +
+				"without a target bucket has no effect)")
+	}
 	if logPath == "" && webhookURL == "" && alertRulesPath == "" &&
 		alertRoutesPath == "" &&
 		heartbeatInterval == 0 && recordSessionsDir == "" &&
-		securityLakeBucket == "" {
+		securityLakeBucket == "" && auditObjectStorageBucket == "" {
 		return nil, nil, noop, nil
 	}
 	// #280 — per-org routing engine. License-gated (placeholder until
@@ -1069,9 +1243,28 @@ func buildAuditManager(
 	var logWriter *audit.LogWriter
 	var webhookPusher *audit.WebhookPusher
 	if logPath != "" {
+		// #311 / §A10 — sentinel -1 means "use the audit-package default
+		// (matches LOG-RETENTION.md)." 0 means "operator explicitly
+		// disabled the trigger." Same resolution pattern across all
+		// four Bounce products per [[cross-product-agent-parity]].
+		effSize := logMaxSizeMB
+		if effSize < 0 {
+			effSize = audit.DefaultMaxSizeMB
+		}
+		effAge := logMaxAgeDays
+		if effAge < 0 {
+			effAge = audit.DefaultMaxAgeDays
+		}
+		// dbRetentionDays is consumed by the on-demand purge subcommand,
+		// not the live writer; surface it on stderr so the operator sees
+		// the resolved value at startup but don't fail-fast on it here
+		// (the writer doesn't sweep the DB).
+		_ = dbRetentionDays
 		lw, err := audit.NewLogWriter(ctx, audit.LogWriterOptions{
-			Path:  logPath,
-			Fsync: logFsync,
+			Path:       logPath,
+			Fsync:      logFsync,
+			MaxSizeMB:  effSize,
+			MaxAgeDays: effAge,
 		})
 		if err != nil {
 			return nil, nil, noop, err
@@ -1131,11 +1324,46 @@ func buildAuditManager(
 		}
 		securityLakeWriter = slw
 	}
+	// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
+	// Default OFF; only constructed when --audit-object-storage-bucket
+	// is set. Start() probes the bucket (HeadBucket) so credential /
+	// endpoint / bucket-name misconfigurations surface immediately
+	// rather than at first flush. Per [[self-host-zero-billing-
+	// dependency]] the bucket is operator-owned (operator creates;
+	// kbouncer never creates).
+	var objectStorageWriter *audit.ObjectStorageWriter
+	if auditObjectStorageBucket != "" {
+		osCreds, err := audit.LoadObjectStorageCredentials(
+			auditObjectStorageCredentialsFile)
+		if err != nil {
+			return nil, nil, noop, err
+		}
+		osw, err := audit.NewObjectStorageWriter(audit.ObjectStorageWriterOptions{
+			EndpointURL:     auditObjectStorageEndpoint,
+			Bucket:          auditObjectStorageBucket,
+			Prefix:          auditObjectStoragePrefix,
+			Region:          auditObjectStorageRegion,
+			Credentials:     osCreds,
+			Product:         "kbounce",
+			InstanceID:      auditObjectStorageInstanceID,
+			RotationMinutes: auditObjectStorageRotationMinutes,
+			MaxSizeMB:       auditObjectStorageMaxSizeMB,
+		})
+		if err != nil {
+			return nil, nil, noop, err
+		}
+		if err := osw.Start(ctx); err != nil {
+			return nil, nil, noop, fmt.Errorf(
+				"kbounce: object-storage writer failed to start: %w", err)
+		}
+		objectStorageWriter = osw
+	}
 	mgr := audit.NewManager(audit.ManagerOptions{
-		LogWriter:          logWriter,
-		WebhookPusher:      webhookPusher,
-		SecurityLakeWriter: securityLakeWriter,
-		SessionRecorder:    sessRecorder,
+		LogWriter:           logWriter,
+		WebhookPusher:       webhookPusher,
+		SecurityLakeWriter:  securityLakeWriter,
+		ObjectStorageWriter: objectStorageWriter,
+		SessionRecorder:     sessRecorder,
 	})
 	// Heartbeat wiring. When the rule engine is enabled (which the
 	// license gate currently blocks pre-#235), we'd bind the
