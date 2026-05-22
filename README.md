@@ -17,22 +17,45 @@ with a one-line deprecation warning + is removed in v1.1.
 
 ---
 
-## Quickstart
+## Install
 
 ```sh
-# Build (single static binary).
-go build ./cmd/kbounce
+# Canonical install — builds the binary fresh from source into $GOPATH/bin
+# (or $HOME/go/bin if GOPATH is unset). Make sure that directory is on
+# your PATH.
+go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest
+```
 
+Then:
+
+```sh
 # Default run: cooperative mode, no profile (passthrough), audit-only.
 # Banner reminds you about --profile safe-default for the deny layer.
-./kbounce run
+kbounce run
 
 # Opt into the safe-default safety net:
-./kbounce run --profile safe-default
+kbounce run --profile safe-default
 # Or, persistent for your shell:
 export KBOUNCER_PROFILE=safe-default
-./kbounce run
+kbounce run
 ```
+
+### Local development build
+
+If you're iterating on the source tree:
+
+```sh
+# Drops the binary into ./bin/kbounce (gitignored).
+make build
+
+# Or invoke go directly:
+go build -o bin/kbounce ./cmd/kbounce
+./bin/kbounce run
+```
+
+`bin/` is gitignored — never commit a pre-built binary. Users pick up
+fresh source via `go install ...@latest` and get an up-to-date build
+every time. Closes #306 / #307 + KNOWN-CAVEATS §A8.
 
 Default port: `8766` (distinct from `bounce`'s `8767` so the two
 products can coexist on the same laptop). Default audit DB: `~/.kbouncer/state.db`.

@@ -1,6 +1,7 @@
 # kbouncer — make targets
 #
-# `make build`                  compile both binaries (kbounce + legacy kbouncer)
+# `make build`                  compile both binaries into ./bin/ (gitignored)
+# `make install`                go install both binaries into $GOPATH/bin
 # `make vet`                    go vet ./...
 # `make test`                   unit tests only (always runnable, no docker)
 # `make test-integration`       spin up a kind cluster + run integration tests
@@ -20,12 +21,25 @@
 KBOUNCE_TEST_CLUSTER ?= kbounce-test
 KBOUNCE_TEST_KUBECONFIG_PATH ?= $(CURDIR)/.kind-kubeconfig
 
-.PHONY: build vet test \
+.PHONY: build install vet test \
 	test-integration test-integration-keep test-integration-clean \
 	kind-up kind-down
 
+# Local-dev build — drops binaries into ./bin/ which is gitignored. NEVER
+# commit the contents of bin/. The canonical install path for end users
+# is `go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest` per
+# README; this target exists for source-tree iteration only.
 build:
-	go build ./...
+	@mkdir -p bin
+	go build -o bin/kbounce ./cmd/kbounce
+	go build -o bin/kbouncer ./cmd/kbouncer
+
+# Equivalent of the canonical end-user install — drops the binary into
+# $GOPATH/bin (or $HOME/go/bin). Use this when you want the locally-
+# built binary on your PATH without committing ./bin/.
+install:
+	go install ./cmd/kbounce
+	go install ./cmd/kbouncer
 
 vet:
 	go vet ./...
