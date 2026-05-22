@@ -40,9 +40,11 @@ lives at ` + caveats.CanonicalDocURL() + `.`,
 		Args: cobra.NoArgs,
 	}
 	cmd.RunE = func(c *cobra.Command, _ []string) error {
-		return fmt.Errorf("kbounce doctor: subcommand required (try `kbounce doctor caveats`)")
+		return fmt.Errorf("kbounce doctor: subcommand required (try `kbounce doctor caveats` or `kbounce doctor logs`)")
 	}
 	cmd.AddCommand(newDoctorCaveatsCmd())
+	// #311 / §A10 — audit-log integrity / freshness / disk check.
+	cmd.AddCommand(newDoctorLogsCmd())
 	return cmd
 }
 

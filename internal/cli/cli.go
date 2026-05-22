@@ -29,6 +29,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
+	"github.com/trsreagan3/kbouncer/internal/caveats"
 	"github.com/trsreagan3/kbouncer/internal/mcp"
 	"github.com/trsreagan3/kbouncer/internal/mcpinstall"
 	"github.com/trsreagan3/kbouncer/internal/profile"
@@ -125,10 +126,18 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newVersionCheckCmd())
 	root.AddCommand(newConfigCmd())
 	root.AddCommand(newDiagnosticsCmd())
+	// #304 — `kbounce doctor caveats` surfaces the §B entries from
+	// KNOWN-CAVEATS.md that apply to kbounce. Sibling Bounce products
+	// ship the same shape per [[cross-product-agent-parity]].
+	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newInvestigateCmd())
 	root.AddCommand(newBackupCmd())
 	root.AddCommand(newRestoreCmd())
 	root.AddCommand(newSessionCmd())
+	// #311 / §A10 — `kbounce logs {purge,archive,verify}` audit-log
+	// retention surface. Ships in lockstep with the sibling products
+	// + the cross-product runbook at iam-roles/docs/LOG-RETENTION.md.
+	root.AddCommand(newLogsCmd())
 	return root
 }
 
@@ -639,6 +648,22 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 						"To block write/destructive verbs + privilege primitives, "+
 						"run with --profile safe-default OR "+
 						"`export KBOUNCER_PROFILE=safe-default` in your shell rc.")
+			}
+			// #304 — known-caveats banner. kbounce surfaces §B5
+			// (apiserver-edge shape; pod-to-pod traffic not seen)
+			// because that property is structural — the operator
+			// should know it from line one of every startup. Per the
+			// founder direction "the signal should be useful, not
+			// noise"; we don't spam other §B entries here. Full list
+			// available via `kbounce doctor caveats`.
+			activeProfileName := ""
+			if activeProfile != nil {
+				activeProfileName = activeProfile.Name
+			}
+			for _, line := range caveats.BannerLines(caveats.Trigger{
+				SafeDefaultProfile: activeProfileName == "safe-default",
+			}) {
+				fmt.Fprintln(os.Stderr, line)
 			}
 			fmt.Fprintln(os.Stderr, "Ctrl+C to stop.")
 

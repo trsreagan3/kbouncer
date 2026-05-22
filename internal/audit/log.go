@@ -45,6 +45,26 @@ type LogWriter struct {
 	writesOK             atomic.Bool
 	consecFailures       atomic.Int64
 	lastSuccessUnixNano  atomic.Int64
+
+	// #311 / §A10 rotation knobs + telemetry. maxSizeMB / maxAgeDays
+	// gate the rotation trigger; rotations / rotationFailures /
+	// partialBytesRecovered are surfaced by the MCP status tool and
+	// `kbounce logs verify` so operators can confirm rotation is
+	// firing without grepping for the admin-action.
+	maxSizeMB              int64
+	maxAgeDays             int
+	rotations              atomic.Int64
+	rotationFailures       atomic.Int64
+	lastRotationUnixNano   atomic.Int64
+	lastRotationPath       atomic.Value // string
+	partialBytesRecovered  atomic.Int64
+	// Callbacks fire on rotation success / failure / recovery; the
+	// proxy wires admin-action emitters into these so the audit
+	// channel records `audit.log.rotated` / `.rotation_failed` /
+	// `.recovered_partial` lifecycle events.
+	onRotation         func(archive string)
+	onRotationFailure  func(reason string)
+	onRecovery         func(bytes int64)
 }
 
 // LogWriterOptions configures a LogWriter. Path must be non-empty
@@ -58,6 +78,18 @@ type LogWriterOptions struct {
 	// webhook pusher default. A full queue triggers drop+count
 	// rather than blocking the caller.
 	QueueDepth int
+	// #311 / §A10 rotation thresholds. Zero disables the respective
+	// trigger; the writer never destroys data on its own — rotated
+	// files are gzipped into the same dir and live until an explicit
+	// `kbounce logs purge` reaps them.
+	MaxSizeMB  int64
+	MaxAgeDays int
+	// Optional lifecycle callbacks for the admin-action audit
+	// channel. Each fires off the worker goroutine; callers MUST NOT
+	// block on the audit pipeline (would deadlock the worker).
+	OnRotation        func(archive string)
+	OnRotationFailure func(reason string)
+	OnRecovery        func(bytes int64)
 }
 
 // NewLogWriter constructs + starts a LogWriter. The worker goroutine
@@ -76,17 +108,36 @@ func NewLogWriter(ctx context.Context, opts LogWriterOptions) (*LogWriter, error
 	if depth <= 0 {
 		depth = 1000
 	}
+	// #311 / §A10 — crash recovery before opening for append. If the
+	// previous process died mid-write, the trailing line may be
+	// partial; truncate it so the next O_APPEND lands clean.
+	recovered, recErr := RecoverPartialTail(opts.Path)
 	f, err := os.OpenFile(opts.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("audit: open log file %q: %w", opts.Path, err)
 	}
 	lw := &LogWriter{
-		path:  opts.Path,
-		fsync: opts.Fsync,
-		queue: make(chan Event, depth),
-		done:  make(chan struct{}),
+		path:              opts.Path,
+		fsync:             opts.Fsync,
+		queue:             make(chan Event, depth),
+		done:              make(chan struct{}),
+		maxSizeMB:         opts.MaxSizeMB,
+		maxAgeDays:        opts.MaxAgeDays,
+		onRotation:        opts.OnRotation,
+		onRotationFailure: opts.OnRotationFailure,
+		onRecovery:        opts.OnRecovery,
 	}
 	lw.lastErr.Store("")
+	lw.lastRotationPath.Store("")
+	if recErr != nil {
+		lw.lastErr.Store(fmt.Sprintf("recover partial tail: %v", recErr))
+	}
+	if recovered > 0 {
+		lw.partialBytesRecovered.Add(recovered)
+		if opts.OnRecovery != nil {
+			go opts.OnRecovery(recovered)
+		}
+	}
 	// Newly-constructed writer starts in the "healthy, no attempts
 	// yet" shape — a startup-time /healthz probe that lands before
 	// any decisions should not flag the channel as degraded just
@@ -131,9 +182,17 @@ func (lw *LogWriter) Write(_ context.Context, ev Event) error {
 // run is the worker goroutine. Exits when ctx is cancelled, when
 // done is closed (Close call), or when an unrecoverable file I/O
 // error fires.
+//
+// The file handle + encoder are stored in worker-local pointers so
+// the rotation guard (called after each successful write) can swap
+// them when it renames + reopens the active log.
 func (lw *LogWriter) run(ctx context.Context, f *os.File) {
 	defer lw.wg.Done()
-	defer func() { _ = f.Close() }()
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	}()
 	enc := json.NewEncoder(f)
 	for {
 		select {
@@ -145,8 +204,49 @@ func (lw *LogWriter) run(ctx context.Context, f *os.File) {
 			return
 		case ev := <-lw.queue:
 			lw.writeOne(f, enc, ev)
+			// #311 / §A10 — rotation guard. Cheap when no trigger
+			// fires (a single Stat); on rotation we swap f + enc.
+			if newF, newEnc := lw.maybeRotate(f); newF != nil {
+				f = newF
+				enc = newEnc
+			}
 		}
 	}
+}
+
+// maybeRotate runs the size + age check; on a trigger it fsyncs +
+// closes the active fd, calls Rotate, then re-opens. Returns (nil,
+// nil) when no rotation happened. On rotation failure the active fd
+// is re-opened so writes continue; the failure is recorded.
+func (lw *LogWriter) maybeRotate(f *os.File) (*os.File, *json.Encoder) {
+	if !ShouldRotateBySize(lw.path, lw.maxSizeMB) &&
+		!ShouldRotateByAge(lw.path, lw.maxAgeDays, time.Now()) {
+		return nil, nil
+	}
+	_ = f.Sync()
+	_ = f.Close()
+	archive, rotErr := Rotate(lw.path, time.Now())
+	if rotErr != nil {
+		lw.rotationFailures.Add(1)
+		lw.lastErr.Store(fmt.Sprintf("rotate: %v", rotErr))
+		if lw.onRotationFailure != nil {
+			go lw.onRotationFailure(rotErr.Error())
+		}
+	}
+	newF, err := os.OpenFile(lw.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		lw.lastErr.Store(fmt.Sprintf("reopen after rotate: %v", err))
+		return nil, nil
+	}
+	if archive != "" {
+		lw.rotations.Add(1)
+		lw.lastRotationUnixNano.Store(time.Now().UnixNano())
+		lw.lastRotationPath.Store(archive)
+		if lw.onRotation != nil {
+			go lw.onRotation(archive)
+		}
+	}
+	return newF, json.NewEncoder(newF)
 }
 
 // drainRemaining flushes anything left in the channel on shutdown.
@@ -288,4 +388,61 @@ func (lw *LogWriter) LastSuccess() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, v).UTC()
+}
+
+// Rotations returns the cumulative count of successful rotations
+// since startup. Surfaced via the MCP status tool + the doctor
+// logs subcommand so operators can confirm rotation cadence.
+func (lw *LogWriter) Rotations() int64 {
+	if lw == nil {
+		return 0
+	}
+	return lw.rotations.Load()
+}
+
+// RotationFailures returns the cumulative count of rotation
+// attempts that failed (gzip error, rename error, etc.). A
+// non-zero value should fire an alert; the active log keeps
+// growing until the operator intervenes.
+func (lw *LogWriter) RotationFailures() int64 {
+	if lw == nil {
+		return 0
+	}
+	return lw.rotationFailures.Load()
+}
+
+// LastRotationPath returns the archive path of the most-recent
+// rotation, "" when none has happened.
+func (lw *LogWriter) LastRotationPath() string {
+	if lw == nil {
+		return ""
+	}
+	v, _ := lw.lastRotationPath.Load().(string)
+	return v
+}
+
+// PartialBytesRecovered returns the total bytes trimmed by the
+// startup partial-tail recovery. Non-zero indicates a previous
+// process died mid-write.
+func (lw *LogWriter) PartialBytesRecovered() int64 {
+	if lw == nil {
+		return 0
+	}
+	return lw.partialBytesRecovered.Load()
+}
+
+// MaxSizeMB returns the configured size threshold; 0 == disabled.
+func (lw *LogWriter) MaxSizeMB() int64 {
+	if lw == nil {
+		return 0
+	}
+	return lw.maxSizeMB
+}
+
+// MaxAgeDays returns the configured age threshold; 0 == disabled.
+func (lw *LogWriter) MaxAgeDays() int {
+	if lw == nil {
+		return 0
+	}
+	return lw.maxAgeDays
 }

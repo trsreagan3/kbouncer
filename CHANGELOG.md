@@ -5,6 +5,84 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #311 / §A10 — robust audit-log retention (2026-05-22)
+
+Cross-product launch-blocker resolved. `kbounce` now rotates `audit.jsonl`
+automatically at 100 MB or 7 days (whichever first), gzipping to
+`audit-{YYYY-MM-DD-HHMMSS}.jsonl.gz` in the same dir. New surface:
+
+- `kbounce logs purge --older-than 7d --yes` — retention sweep of rotated
+  archives (never touches the active `audit.jsonl`)
+- `kbounce logs archive --out FILE` — tar.gz bundle for SIEM hand-off
+- `kbounce logs verify` — gzip + JSONL integrity check
+- `kbounce doctor logs` — integrity + freshness + retention + disk checks
+  (exits non-zero on any failure)
+- Crash recovery: partial JSONL tail truncated on startup; emits
+  `audit.log.recovered_partial` admin-action
+- Rotation lifecycle admin-actions: `audit.log.rotated`,
+  `audit.log.rotation_failed`, `audit.log.recovered_partial`
+- LogWriter Options: `MaxSizeMB`, `MaxAgeDays`, `OnRotation`,
+  `OnRotationFailure`, `OnRecovery`
+- Status getters: `Rotations()`, `RotationFailures()`,
+  `LastRotationPath()`, `PartialBytesRecovered()`, `MaxSizeMB()`,
+  `MaxAgeDays()`
+- Cross-product runbook: `iam-roles/docs/LOG-RETENTION.md`
+- 21 new tests in `internal/audit/rotation_test.go`
+
+### #308 — cross-bouncer agent-attribution env-var injection (2026-05-22)
+
+`kbounce mcp install-*` now stamps `KBOUNCE_AGENT_NAME` +
+`KBOUNCE_AGENT_SESSION_ID` env vars on the generated MCP server entry
+so the agent runtime carries the same identity into outbound HTTP
+calls. Per-client defaults:
+
+- `install-claude-code` → `KBOUNCE_AGENT_NAME=claude-code`
+- `install-cursor`       → `KBOUNCE_AGENT_NAME=cursor`
+- `install-codex`        → `KBOUNCE_AGENT_NAME=openai-codex`
+
+`KBOUNCE_AGENT_SESSION_ID` is left empty in the static snippet — the
+agent runtime mints a fresh UUID v7 per session. New
+`ServerConfigDictForAgent(agentName)` + `ServerEntryForAgent(agentName)`
++ `agentNameForClient(clientName)` helpers in
+`internal/mcpinstall/install.go`; the existing `ServerConfigDict()` +
+`ServerEntry()` calls fall through to `DefaultAgentName="claude-code"`
+so external callers are unaffected. `kbounce mcp show-config` footer
+points operators at `iam-roles/docs/AGENT-ATTRIBUTION.md` for the
+per-runtime header-injection patterns. Mirrors the parallel ibounce
+slice on the iam-roles side.
+
+Per `[[cross-product-agent-parity]]`: the gbounce side of this same
+work ships under the same task #308 ticket; the on-disk OCSF wire
+shape is identical across kbounce + gbounce so a SIEM operator's
+saved query reads the agent block uniformly across products.
+
+### #304 — KNOWN-CAVEATS discoverability surfaces (2026-05-22)
+
+Per founder direction 2026-05-22: caveats must be easily discoverable to
+users + agents, not buried in `docs/KNOWN-CAVEATS.md`. This slice ships
+four surfaces:
+
+- `internal/caveats/` — new package centralizes the kbounce-relevant
+  §B entries (B5 product-specific; B13 + B14 + B15 cross-product) + the
+  GitHub markdown anchors. `caveats.BannerLines(Trigger)` returns the
+  startup-banner lines to emit; `caveats.DoctorEntries()` returns the
+  full applicable list; `caveats.LinkSuffix(id)` produces an inline
+  `(see KNOWN-CAVEATS §X: <URL>)` suffix.
+- **README "Known limitations" section** — top 3 kbounce-relevant §B
+  entries (B5 / B13 / B14) linked to the canonical doc.
+- **Startup banner** — `kbounce run` emits the §B5 line on every
+  startup (kbounce's apiserver-edge shape is structural — the operator
+  should see the caveat from line one of every run). Quiet otherwise
+  per the founder's "useful, not noise" directive.
+- **`kbounce doctor caveats`** — new subcommand under the `doctor`
+  command group (added alongside `doctor logs` from #311). Same shape
+  across the Bounce suite per `[[cross-product-agent-parity]]`.
+- **MCP tool descriptions** — `kbounce_active_mode` description now
+  embeds a §B5 reference + link (agents reading `tools/list` see the
+  caveat at registration time, before the first tool call). The
+  `kbounce_active_profile` description gets a verb-level / pair-with-
+  iam-jit note per the founder direction in #304.
+
 ### #306 + #307 — canonicalize `go install` as the install path; no checked-in `bin/` (2026-05-22)
 
 Closes KNOWN-CAVEATS §A8. The repository never tracked `bin/kbounce`
