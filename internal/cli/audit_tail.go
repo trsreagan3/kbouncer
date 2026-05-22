@@ -478,31 +478,31 @@ func decisionRowToEvent(r store.DecisionRow) audit.Event {
 }
 
 // agentInfoFromRow rebuilds the audit.AgentInfo from the columns
-// persisted by #289. Shared by every SQLite read path (audit tail,
-// investigate, /audit/events, web UI) so the agent block surfaces
-// identically across surfaces. The PrincipalName field on
+// persisted by #289 + #320. Shared by every SQLite read path (audit
+// tail, investigate, /audit/events, web UI) so the agent block
+// surfaces identically across surfaces. The PrincipalName field on
 // DecisionInput is the K8s-subject path — distinct from the agent
 // (which is the calling client identity); we populate both via the
 // Actor block downstream when name is non-empty.
+//
+// #320 / §A18: reads `detected_from` from the persisted column
+// instead of heuristically inferring it. Pre-#320 rows surface
+// `DetectionSourceUnknown` via the schema-level DEFAULT — historical
+// events stay accurate (we don't synthesize a detection source we
+// didn't actually observe).
 func agentInfoFromRow(r store.DecisionRow) audit.AgentInfo {
-	if r.AgentName == "" && r.AgentSessionID == "" {
+	if r.AgentName == "" && r.AgentSessionID == "" &&
+		(r.DetectedFrom == "" || r.DetectedFrom == audit.DetectionSourceUnknown) {
 		return audit.AgentInfo{}
 	}
 	info := audit.AgentInfo{
 		Name:      r.AgentName,
 		SessionID: r.AgentSessionID,
 	}
-	// Best-effort reconstruction of DetectedFrom from the persisted
-	// shape. The proxy hot-path knows the detection source exactly but
-	// SQLite only stores name + session id (matching ibounce +
-	// dbounce + gbounce); a populated session id is unambiguous (only
-	// MCP-clientinfo binds one), and a populated name without a
-	// session id is the user-agent path.
-	switch {
-	case r.AgentSessionID != "":
-		info.DetectedFrom = audit.DetectionSourceMCPClientInfo
-	case r.AgentName != "" && r.AgentName != audit.AgentNameUnknown:
-		info.DetectedFrom = audit.DetectionSourceUserAgent
+	if r.DetectedFrom != "" {
+		info.DetectedFrom = r.DetectedFrom
+	} else {
+		info.DetectedFrom = audit.DetectionSourceUnknown
 	}
 	return info
 }

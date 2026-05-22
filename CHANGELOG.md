@@ -5,6 +5,50 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #320 / §A18 — `/audit/events` wire-shape parity fix — Shipped 2026-05-22
+
+Closes a UAT-discovered CRIT: the HTTP `/audit/events` projection
+heuristically guessed `detected_from=mcp_clientinfo` whenever an
+`agent_session_id` was persisted, mis-labelling http_header-detected
+requests as MCP-detected. SIEM filters that distinguish "agent
+declared via HTTP header" from "agent declared via MCP handshake"
+silently lied.
+
+- **store/store.go:** SchemaVersion bumped to 9. Adds
+  `decisions.detected_from TEXT NOT NULL DEFAULT 'unknown'` via
+  idempotent `ALTER TABLE` migration (v8 #289 columns landed without
+  it). Pre-#320 rows surface "unknown" via the schema-level DEFAULT
+  — historical events stay honest per `[[scorer-is-ground-truth]]`.
+- **proxy/proxy.go:** `writeDecisionForTask` persists `DetectedFrom`
+  from the AgentInfo built by `resolveAgentInfo` (the same source
+  the JSONL log + webhook stream consume).
+- **proxy/audit_events.go:** `agentInfoFromDecisionRow` replaced the
+  heuristic with a stored-column read. Empty `DetectedFrom` falls
+  through to `DetectionSourceUnknown` so handler code never has to
+  nil-check.
+- **cli/audit_tail.go:** Mirror change to `agentInfoFromRow` so
+  audit-tail, investigate, web UI, /audit/events all read the same
+  shape (cross-surface invariant).
+- **audit/agent_context.go:** `AgentInfo` struct gains a
+  `HeaderRejection any` field for §A18 structured rejection
+  breadcrumbs (set by `resolveAgentInfo` when an inbound X-Agent-*
+  header fails validation). `[[cross-product-agent-parity]] with
+  ibounce + dbounce + gbounce.
+- **audit/agent_header_rejection.go (new):** Cross-product bounded
+  enum + classifier helpers (`invalid_name_charset` /
+  `invalid_name_length` / `invalid_session_id_format` /
+  `invalid_session_id_length`). Raw rejected value NEVER emitted;
+  only its length, for safe forensics.
+- **audit/event.go:** `FromDecision` splices the breadcrumb into
+  `unmapped.iam_jit.ext.agent_header_rejection` when present.
+- New regression test:
+  `TestAuditEvents_320_DetectedFromReadsStoredColumn` in
+  `internal/proxy/audit_events_test.go`. Existing
+  `TestDecisionRowToEvent_*` tests updated to set `DetectedFrom`
+  explicitly (no longer inferred).
+- Closes `[[cross-product-agent-parity]]` parity with dbounce v7 +
+  gbounce + ibounce.
+
 ### #317 / §A15 — cloud-neutral S3-compatible NDJSON object-storage sink — Shipped 2026-05-22
 
 Closes the headline cloud-neutrality gap surfaced by founder

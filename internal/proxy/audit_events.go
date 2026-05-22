@@ -265,19 +265,31 @@ func decisionRowsToEvents(rows []store.DecisionRow) []audit.Event {
 // Kept byte-identical to preserve the cross-surface guarantee that
 // /audit/events + the web UI + audit-tail + investigate all surface
 // the same agent block for the same row.
+//
+// #320 / §A18: reads `detected_from` from the persisted column
+// instead of heuristically inferring it. Pre-#320 rows surface
+// `DetectionSourceUnknown` via the schema-level DEFAULT 'unknown'
+// — historical events stay accurate (we don't synthesize a
+// detection source we didn't actually observe). The heuristic
+// `agent_session_id != "" → mcp_clientinfo` mis-labelled
+// http_header-detected events (UAT 2026-05-22); the stored column
+// fix matches what the JSONL log + webhook stream already carry.
 func agentInfoFromDecisionRow(r store.DecisionRow) audit.AgentInfo {
-	if r.AgentName == "" && r.AgentSessionID == "" {
+	if r.AgentName == "" && r.AgentSessionID == "" &&
+		(r.DetectedFrom == "" || r.DetectedFrom == audit.DetectionSourceUnknown) {
 		return audit.AgentInfo{}
 	}
 	info := audit.AgentInfo{
 		Name:      r.AgentName,
 		SessionID: r.AgentSessionID,
 	}
-	switch {
-	case r.AgentSessionID != "":
-		info.DetectedFrom = audit.DetectionSourceMCPClientInfo
-	case r.AgentName != "" && r.AgentName != audit.AgentNameUnknown:
-		info.DetectedFrom = audit.DetectionSourceUserAgent
+	// Prefer the persisted column. Empty string → "unknown" so the
+	// canonical fall-through value lands on every event with no
+	// observed source.
+	if r.DetectedFrom != "" {
+		info.DetectedFrom = r.DetectedFrom
+	} else {
+		info.DetectedFrom = audit.DetectionSourceUnknown
 	}
 	return info
 }

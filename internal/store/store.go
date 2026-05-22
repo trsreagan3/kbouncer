@@ -60,7 +60,22 @@ import (
 //	    pre-#289 rows, which the read path surfaces as the default
 //	    {name:"unknown", detected_from:"unknown"} agent block; old data
 //	    is preserved per [[creates-never-mutates]])
-const SchemaVersion = 8
+//	9 — #320 / §A18: add decisions.detected_from TEXT NOT NULL DEFAULT
+//	    'unknown' so the HTTP /audit/events endpoint can surface the
+//	    REAL detection source (http_header, http_header_name_only,
+//	    user_agent, mcp_clientinfo, process_tree, unknown) instead of
+//	    the agentInfoFromDecisionRow heuristic that always rendered
+//	    `detected_from=mcp_clientinfo` whenever an agent_session_id
+//	    was present. UAT 2026-05-22 verified the heuristic mis-
+//	    labelled http_header-detected events as mcp_clientinfo —
+//	    breaks SIEM filters that distinguish "agent declared itself
+//	    via HTTP header" from "agent surfaced via MCP handshake".
+//	    Pre-#320 rows get 'unknown' via the schema-level DEFAULT —
+//	    historical events stay accurate (we don't synthesize a
+//	    detection source we didn't actually observe). Mirrors
+//	    dbounce v7 + gbounce + ibounce per
+//	    [[cross-product-agent-parity]].
+const SchemaVersion = 9
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
@@ -403,6 +418,21 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// v9 additive migration (#320 / §A18 — close the /audit/events
+	// wire-shape parity gap): replace the read-time
+	// `agentInfoFromDecisionRow` heuristic (which guessed
+	// `detected_from=mcp_clientinfo` whenever a session_id was
+	// persisted, mis-labelling http_header-detected events) with a
+	// stored column populated at write time from the SAME source the
+	// in-memory exporter pipeline already records. NOT NULL DEFAULT
+	// 'unknown' so pre-#320 rows surface the canonical "we don't
+	// know" value instead of synthesizing a fake detection source.
+	// Mirrors dbounce v7 + gbounce + ibounce per
+	// [[cross-product-agent-parity]].
+	if err := s.addColumnIfMissing("decisions", "detected_from", "TEXT NOT NULL DEFAULT 'unknown'"); err != nil {
+		return err
+	}
+
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it
 	// idempotent on re-open.
 	var ver int
@@ -478,6 +508,16 @@ type DecisionRow struct {
 	// at the MCP handshake; empty for proxy-observed traffic that wasn't
 	// routed through an MCP connection (bare kubectl, ad-hoc scripts).
 	AgentSessionID string
+	// DetectedFrom added in v9 (#320 / §A18). Names the signal that
+	// produced the AgentName + AgentSessionID values: one of
+	// "http_header", "http_header_name_only", "user_agent",
+	// "mcp_clientinfo", "process_tree", "unknown". Empty string is
+	// treated as "unknown" on the read path so handler code never has
+	// to nil-check. Replaces the read-time heuristic that mis-labelled
+	// http_header-detected events as mcp_clientinfo whenever a
+	// session_id was present. Mirrors the column written by dbounce +
+	// ibounce + gbounce per [[cross-product-agent-parity]].
+	DetectedFrom string
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -489,6 +529,13 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 	if d.At.IsZero() {
 		atStr = time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	}
+	// #320 / §A18: default DetectedFrom to "unknown" so a row written
+	// without an explicit detection source still satisfies the NOT
+	// NULL constraint + reads back as the canonical fall-through.
+	detectedFrom := d.DetectedFrom
+	if detectedFrom == "" {
+		detectedFrom = "unknown"
+	}
 	res, err := s.db.Exec(
 		`INSERT INTO decisions(
 			at, method, path,
@@ -499,8 +546,8 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			matched_rule_id, task_id,
 			decision_source, profile_name, pause_id,
 			is_stream, stream_kind,
-			agent_name, agent_session_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			agent_name, agent_session_id, detected_from
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Method, d.Path,
 		d.ParsedVerb, d.ParsedGroup, d.ParsedVersion, d.ParsedResource,
 		d.ParsedNamespace, d.ParsedName, d.ParsedSubresource,
@@ -509,7 +556,7 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 		nullableInt(d.MatchedRuleID), nullableString(d.TaskID),
 		d.DecisionSource, nullableString(d.ProfileName), nullableInt(d.PauseID),
 		boolToInt(d.IsStream), d.StreamKind,
-		nullableString(d.AgentName), nullableString(d.AgentSessionID),
+		nullableString(d.AgentName), nullableString(d.AgentSessionID), detectedFrom,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("kbounce: record decision: %w", err)
@@ -552,7 +599,8 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		COALESCE(decision_source, ''), COALESCE(profile_name, ''),
 		pause_id,
 		COALESCE(is_stream, 0), COALESCE(stream_kind, ''),
-		COALESCE(agent_name, ''), COALESCE(agent_session_id, '')
+		COALESCE(agent_name, ''), COALESCE(agent_session_id, ''),
+		COALESCE(detected_from, 'unknown')
 		FROM decisions
 		ORDER BY id DESC
 		LIMIT ?`, limit)
@@ -582,7 +630,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&ruleID, &taskID,
 			&d.DecisionSource, &d.ProfileName, &pauseID,
 			&isStream, &d.StreamKind,
-			&d.AgentName, &d.AgentSessionID,
+			&d.AgentName, &d.AgentSessionID, &d.DetectedFrom,
 		); err != nil {
 			return nil, fmt.Errorf("kbounce: recent decisions scan: %w", err)
 		}

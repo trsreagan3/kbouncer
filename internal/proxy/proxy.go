@@ -1099,23 +1099,66 @@ func resolveAgentInfo(opts EvalOptions, r *http.Request) audit.AgentInfo {
 	}
 	// #318 / §A16 — cross-bouncer X-Agent-* header parity. Read +
 	// validate the canonical headers BEFORE the MCP / UA fallbacks.
+	//
+	// #320 / §A18: collect structured rejection breadcrumbs so the
+	// audit event surfaces which header failed + why + the rejected
+	// value's length under
+	// `unmapped.iam_jit.ext.agent_header_rejection`. Pre-§A18 the
+	// rejection signal was the /healthz counter + the truncated
+	// stderr line; SOC analysts querying the audit log directly
+	// couldn't see WHICH request had the misconfigured agent SDK.
 	rawName := r.Header.Get("X-Agent-Name")
 	rawSessionID := r.Header.Get("X-Agent-Session-Id")
 	validatedName := ""
 	validatedSessionID := ""
+	var rejectionBreadcrumbs []map[string]any
 	if rawName != "" {
 		if audit.IsValidAgentName(rawName) {
 			validatedName = rawName
-		} else if opts.RecordRejectedAgentHeader != nil {
-			opts.RecordRejectedAgentHeader("X-Agent-Name", rawName)
+		} else {
+			if opts.RecordRejectedAgentHeader != nil {
+				opts.RecordRejectedAgentHeader("X-Agent-Name", rawName)
+			}
+			rejectionBreadcrumbs = append(rejectionBreadcrumbs,
+				audit.BuildAgentHeaderRejectionBreadcrumb(
+					audit.AgentNameField,
+					audit.ClassifyAgentNameRejection(rawName),
+					len(rawName),
+				))
 		}
 	}
 	if rawSessionID != "" {
 		if audit.IsValidSessionID(rawSessionID) {
 			validatedSessionID = rawSessionID
-		} else if opts.RecordRejectedAgentHeader != nil {
-			opts.RecordRejectedAgentHeader("X-Agent-Session-Id", rawSessionID)
+		} else {
+			if opts.RecordRejectedAgentHeader != nil {
+				opts.RecordRejectedAgentHeader("X-Agent-Session-Id", rawSessionID)
+			}
+			rejectionBreadcrumbs = append(rejectionBreadcrumbs,
+				audit.BuildAgentHeaderRejectionBreadcrumb(
+					audit.AgentSessionIDField,
+					audit.ClassifyAgentSessionIDRejection(rawSessionID),
+					len(rawSessionID),
+				))
 		}
+	}
+	// Helper to splice the rejection breadcrumb onto whichever
+	// AgentInfo we eventually return. Single map for one failure;
+	// []any of maps for both. Empty rejectionBreadcrumbs is a no-op.
+	withRejection := func(info audit.AgentInfo) audit.AgentInfo {
+		if len(rejectionBreadcrumbs) == 0 {
+			return info
+		}
+		if len(rejectionBreadcrumbs) == 1 {
+			info.HeaderRejection = rejectionBreadcrumbs[0]
+		} else {
+			bs := make([]any, 0, len(rejectionBreadcrumbs))
+			for _, b := range rejectionBreadcrumbs {
+				bs = append(bs, b)
+			}
+			info.HeaderRejection = bs
+		}
+		return info
 	}
 	if validatedName != "" {
 		// Header path wins. `detected_from=http_header` when both pieces
@@ -1126,11 +1169,11 @@ func resolveAgentInfo(opts EvalOptions, r *http.Request) audit.AgentInfo {
 		if validatedSessionID == "" {
 			detectedFrom = audit.DetectionSourceHTTPHeaderNameOnly
 		}
-		return audit.AgentInfo{
+		return withRejection(audit.AgentInfo{
 			Name:         validatedName,
 			SessionID:    validatedSessionID,
 			DetectedFrom: detectedFrom,
-		}
+		})
 	}
 	if opts.AgentRegistry != nil {
 		if sid := r.Header.Get(SessionHeaderName); sid != "" {
@@ -1143,7 +1186,7 @@ func resolveAgentInfo(opts EvalOptions, r *http.Request) audit.AgentInfo {
 				if validatedSessionID != "" {
 					info.SessionID = validatedSessionID
 				}
-				return info
+				return withRejection(info)
 			}
 			// Header set but not registered → record the session id
 			// untrusted (best-effort) + still derive name from UA.
@@ -1152,7 +1195,7 @@ func resolveAgentInfo(opts EvalOptions, r *http.Request) audit.AgentInfo {
 			if validatedSessionID != "" {
 				ua.SessionID = validatedSessionID
 			}
-			return ua
+			return withRejection(ua)
 		}
 	}
 	ua := audit.FingerprintFromUserAgent(r.Header.Get("User-Agent"))
@@ -1161,7 +1204,7 @@ func resolveAgentInfo(opts EvalOptions, r *http.Request) audit.AgentInfo {
 		// thread the session id so cross-bouncer correlation works.
 		ua.SessionID = validatedSessionID
 	}
-	return ua
+	return withRejection(ua)
 }
 
 // maybeEnqueuePrompt writes a pending_prompts row when ALL of:
@@ -1304,6 +1347,15 @@ func writeDecisionForTask(st *store.Store, obs *RequestObservation, activePause 
 		StreamKind:        obs.StreamKind,
 		AgentName:         agent.Name,
 		AgentSessionID:    agent.SessionID,
+		// #320 / §A18: persist the REAL detection source instead of
+		// letting the read path heuristically infer it (the old
+		// agentInfoFromDecisionRow mis-labelled http_header-detected
+		// events as mcp_clientinfo whenever a session_id was set).
+		// agent.DetectedFrom comes straight from the request-side
+		// resolver (resolveAgentInfo / handleAgentHeadersForDecision)
+		// so the SQLite-backed /audit/events projection sees the same
+		// label the JSONL log + webhook stream already carry.
+		DetectedFrom: agent.DetectedFrom,
 	}
 	if activePause != nil {
 		pid := activePause.ID

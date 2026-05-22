@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/store"
 )
 
@@ -412,5 +413,62 @@ func TestAuditEvents_SurfacesPersistedAgentIdentity(t *testing.T) {
 	}
 	if got := user["name"]; got != "claude-code" {
 		t.Errorf("actor.user.name = %v; want claude-code", got)
+	}
+}
+
+// TestAuditEvents_320_DetectedFromReadsStoredColumn is the §A18
+// regression guard: when an HTTP-header-detected request lands in
+// SQLite with DetectedFrom=DetectionSourceHTTPHeader, the
+// /audit/events projection MUST surface that exact value instead
+// of the pre-§A18 heuristic that mis-labelled any row with a
+// session_id as mcp_clientinfo. UAT 2026-05-22 caught this: SOC
+// analysts pulling cross-product events saw kbounce rows tagged
+// `detected_from=mcp_clientinfo` even when the agent declared
+// itself via HTTP header.
+func TestAuditEvents_320_DetectedFromReadsStoredColumn(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	const wantSession = "01968d6a-9c12-7a4b-b6f8-3b8e4c0d1aef"
+	if _, err := st.RecordDecision(store.DecisionRow{
+		At:              time.Now().UTC(),
+		Method:          "GET",
+		Path:            "/api/v1/pods",
+		ParsedVerb:      "list",
+		ParsedResource:  "pods",
+		DecisionVerdict: "ALLOW",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "claude-code",
+		AgentSessionID:  wantSession,
+		DetectedFrom:    audit.DetectionSourceHTTPHeader,
+	}); err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+	srv := httptest.NewServer(auditEventsHandler(st, ""))
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "?limit=10")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	line := strings.TrimSpace(string(body))
+	var ev map[string]any
+	if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	unmapped, _ := ev["unmapped"].(map[string]any)
+	iamjit, _ := unmapped["iam_jit"].(map[string]any)
+	agent, _ := iamjit["agent"].(map[string]any)
+	if got := agent["detected_from"]; got != audit.DetectionSourceHTTPHeader {
+		t.Errorf("agent.detected_from = %v; want %q (heuristic mis-labelling NOT fixed)",
+			got, audit.DetectionSourceHTTPHeader)
+	}
+	if got := agent["session_id"]; got != wantSession {
+		t.Errorf("agent.session_id = %v; want %q", got, wantSession)
 	}
 }

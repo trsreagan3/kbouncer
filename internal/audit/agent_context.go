@@ -123,6 +123,19 @@ type AgentInfo struct {
 	// analysts build their own filters for tools we don't know about.
 	// Truncated to RawUserAgentMaxLen to bound the audit-row width.
 	RawUserAgent string
+
+	// HeaderRejection is the #320 / §A18 structured breadcrumb that
+	// lands at `unmapped.iam_jit.ext.agent_header_rejection` when
+	// the inbound X-Agent-Name / X-Agent-Session-Id headers failed
+	// validation. Stamped at request-time (resolveAgentInfo) +
+	// threaded onto the OCSF event via FromDecision so a SOC analyst
+	// querying the audit log can see which request had a
+	// misconfigured agent SDK + which reason (charset / length).
+	// NEVER includes the raw value — only the rejected value's
+	// length, for safe forensics per
+	// [[security-team-positioning-safety-not-surveillance]]. Single
+	// map when one header failed, []any of maps when both failed.
+	HeaderRejection any
 }
 
 // RawUserAgentMaxLen caps RawUserAgent so a pathological client can't

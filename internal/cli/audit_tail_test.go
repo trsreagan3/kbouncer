@@ -647,6 +647,11 @@ func TestAuditTail_FollowPollIntervalMatchesSpec(t *testing.T) {
 // surfaces both under unmapped.iam_jit.agent AND under
 // actor.user.name. Same wire shape ibounce + dbounce + gbounce
 // emit per [[cross-product-agent-parity]].
+//
+// #320 / §A18: DetectedFrom is now read from the persisted column
+// instead of heuristically inferred. The test fixture sets
+// DetectionSourceMCPClientInfo explicitly to mirror what the proxy
+// hot-path writes when an MCP session minted the agent identity.
 func TestDecisionRowToEvent_SurfacesPersistedAgentIdentity(t *testing.T) {
 	row := store.DecisionRow{
 		At:              time.Now().UTC(),
@@ -660,6 +665,7 @@ func TestDecisionRowToEvent_SurfacesPersistedAgentIdentity(t *testing.T) {
 		ModeAtDecision:  "cooperative",
 		AgentName:       "claude-code",
 		AgentSessionID:  "01956c44-c5c1-7c31-9bca-7c0aaa000001",
+		DetectedFrom:    audit.DetectionSourceMCPClientInfo,
 	}
 	ev := decisionRowToEvent(row)
 
@@ -670,7 +676,7 @@ func TestDecisionRowToEvent_SurfacesPersistedAgentIdentity(t *testing.T) {
 		ev.Unmapped.IAMJIT.Agent.SessionID)
 	assert.Equal(t, audit.DetectionSourceMCPClientInfo,
 		ev.Unmapped.IAMJIT.Agent.DetectedFrom,
-		"session id populated → reconstruct as MCP-clientinfo source")
+		"detected_from is now read from the stored column (§A18)")
 
 	// Actor.User.Name mirrors the agent name (cross-product spec).
 	require.NotNil(t, ev.Actor, "actor must be present for non-anon agent")
@@ -709,8 +715,8 @@ func TestDecisionRowToEvent_AnonymousRowKeepsActorEmpty(t *testing.T) {
 
 // TestDecisionRowToEvent_UserAgentOnlyShape covers the kubectl /
 // helm / client-go path: a fingerprinted name with no MCP session
-// id. DetectedFrom rebuilds as user_agent (the only path that yields
-// a known name without a session id).
+// id. DetectedFrom rebuilds as user_agent (the proxy hot-path wrote
+// it that way per §A18 — no longer a heuristic).
 func TestDecisionRowToEvent_UserAgentOnlyShape(t *testing.T) {
 	row := store.DecisionRow{
 		At:              time.Now().UTC(),
@@ -722,6 +728,7 @@ func TestDecisionRowToEvent_UserAgentOnlyShape(t *testing.T) {
 		DecisionReason:  "default policy",
 		ModeAtDecision:  "cooperative",
 		AgentName:       "kubectl",
+		DetectedFrom:    audit.DetectionSourceUserAgent,
 	}
 	ev := decisionRowToEvent(row)
 
@@ -731,7 +738,7 @@ func TestDecisionRowToEvent_UserAgentOnlyShape(t *testing.T) {
 		"no session id should round-trip empty")
 	assert.Equal(t, audit.DetectionSourceUserAgent,
 		ev.Unmapped.IAMJIT.Agent.DetectedFrom,
-		"name without session id → reconstruct as user-agent source")
+		"detected_from is now read from the stored column (§A18)")
 	require.NotNil(t, ev.Actor)
 	require.NotNil(t, ev.Actor.User)
 	assert.Equal(t, "kubectl", ev.Actor.User.Name)

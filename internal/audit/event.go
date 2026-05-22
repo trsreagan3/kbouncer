@@ -541,6 +541,20 @@ func FromDecision(in DecisionInput) Event {
 
 	ext := buildExt(in)
 
+	// #320 / §A18: when validation rejected an inbound X-Agent-*
+	// header at request-time, splice the structured breadcrumb
+	// onto the OCSF Ext map so it lands at
+	// `unmapped.iam_jit.ext.agent_header_rejection`. NEVER includes
+	// the raw value — only field + bounded enum reason + length.
+	// Per [[cross-product-agent-parity]] the shape is identical to
+	// ibounce + dbounce + gbounce.
+	if in.Agent.HeaderRejection != nil {
+		if ext == nil {
+			ext = map[string]any{}
+		}
+		ext["agent_header_rejection"] = in.Agent.HeaderRejection
+	}
+
 	actor := buildActor(in)
 
 	return Event{
