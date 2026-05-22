@@ -49,13 +49,35 @@ import (
 const AgentNameUnknown = "unknown"
 
 // Detection-source enum values for unmapped.iam_jit.agent.detected_from.
-// Stable strings — keep in sync across ibounce / kbounce / dbounce.
+// Stable strings — keep in sync across ibounce / kbounce / dbounce / gbounce.
+//
+// #318 / §A16 — DetectionSourceHTTPHeader is the cross-bouncer canonical
+// value when the inbound `X-Agent-Name` + `X-Agent-Session-Id` headers
+// fire. HTTPHeaderNameOnly is the partial-detection variant (name
+// passed validation but session_id was absent or invalid).
 const (
-	DetectionSourceMCPClientInfo = "mcp_clientinfo"
-	DetectionSourceUserAgent     = "user_agent"
-	DetectionSourceProcessTree   = "process_tree"
-	DetectionSourceUnknown       = "unknown"
+	DetectionSourceMCPClientInfo      = "mcp_clientinfo"
+	DetectionSourceUserAgent          = "user_agent"
+	DetectionSourceProcessTree        = "process_tree"
+	DetectionSourceHTTPHeader         = "http_header"
+	DetectionSourceHTTPHeaderNameOnly = "http_header_name_only"
+	DetectionSourceUnknown            = "unknown"
 )
+
+// agentNameRe matches the documented X-Agent-Name validation rules:
+// alphanumerics, dots, underscores, dashes; max 64 chars. Mirrors
+// gbounce's `agentNameRe` + ibounce's `is_valid_agent_name` regex
+// byte-for-byte so a SIEM query on `unmapped.iam_jit.agent.name=X` is
+// portable across the Bounce suite. Shell-injection characters ($, `,
+// ", ', ;, |, &, newline, ...) are rejected so an attacker who controls
+// the inbound header can't smuggle shell payloads into a log line a
+// downstream operator might `grep | sh`.
+var agentNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// IsValidAgentName returns true when s matches the canonical
+// X-Agent-Name shape. Cross-product invariant: a name accepted by
+// kbouncer MUST be accepted by every other Bouncer.
+func IsValidAgentName(s string) bool { return agentNameRe.MatchString(s) }
 
 // AgentInfo is the populated agent-identity record for one audit
 // event. Mirrors the OCSF wire shape under unmapped.iam_jit.agent;

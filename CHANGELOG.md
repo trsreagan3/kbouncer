@@ -5,6 +5,54 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #318 / §A16 — cross-bouncer X-Agent-Session-Id header parity (2026-05-22)
+
+Closes the headline cross-bouncer correlation gap surfaced by the
+NanoClaw integration test. kbouncer now reads inbound `X-Agent-Name` +
+`X-Agent-Session-Id` headers at HIGHEST detection precedence (above
+the existing `X-Kbouncer-Session-Id` MCP registry lookup + the
+User-Agent fingerprint fallback). Mirrors gbounce's #308 pattern
+byte-for-byte so a SIEM query on `unmapped.iam_jit.agent.session_id=X`
+is portable across all four Bounce products.
+
+- `internal/audit/agent_context.go`:
+  - New `IsValidAgentName()` mirroring gbounce + ibounce's regex
+    `^[A-Za-z0-9._-]{1,64}$` byte-for-byte.
+  - New `DetectionSourceHTTPHeader` + `DetectionSourceHTTPHeaderNameOnly`
+    constants so the OCSF event surfaces the right detection source.
+- `internal/proxy/proxy.go`:
+  - `resolveAgentInfo` reads `X-Agent-Name` + `X-Agent-Session-Id`
+    BEFORE the registry / UA fallback chain. Invalid headers are
+    dropped (audited as `name="unknown"` / `detected_from="unknown"`)
+    and never written to the audit event; the rejection callback
+    bumps a per-Server `totalAgentHeadersRejected` counter + logs the
+    truncated raw value (control chars replaced with `?`) so a
+    malicious header can't reposition the operator's terminal cursor.
+  - When `X-Agent-Session-Id` is valid but `X-Agent-Name` falls
+    through to MCP / UA, the validated session_id overlays the
+    downstream block so cross-bouncer correlation works.
+  - `EvalOptions.RecordRejectedAgentHeader` callback for the
+    rejection counter; `Server.recordRejectedAgentHeader` is the
+    wired-up implementation.
+  - `/healthz` payload now includes `total_agent_headers_rejected`
+    (matches gbounce + ibounce fields of the same name).
+- New tests in `internal/proxy/agent_headers_318_test.go` —
+  canonical cross-product names `TestAgentHeaders_HappyPath`,
+  `TestAgentHeaders_NoHeaders_FallbackToUserAgent`,
+  `TestAgentHeaders_InvalidName_Rejected`,
+  `TestAgentHeaders_NameOnly_PartialDetection`, plus
+  `TestAgentHeaders_InvalidSessionID_Rejected`,
+  `TestIsValidAgentName_MatchesGbounceRegex`,
+  `TestAgentHeaders_UUIDv4_Accepted` (operators may use v4 or v7).
+
+`docs/AGENT-ATTRIBUTION.md` + `docs/KNOWN-CAVEATS.md` §A16 live in the
+iam-roles repo (cross-product reference); they're updated alongside
+this slice. Cross-product integration test at
+`iam-roles/tests/integration/cross_bouncer_session_id_parity_test.py`
+fires one request through each Bouncer with the same session_id and
+asserts the unified `iam-jit audit query` returns one event per
+bouncer.
+
 ### #311 / §A10 — robust audit-log retention (2026-05-22)
 
 Cross-product launch-blocker resolved. `kbounce` now rotates `audit.jsonl`

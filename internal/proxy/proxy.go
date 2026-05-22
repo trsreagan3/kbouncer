@@ -517,6 +517,17 @@ type EvalOptions struct {
 	// request. nil = no-op (test callers + the
 	// EvaluateRequestWithProfile thin wrapper leave it unset).
 	OnPauseLookup func(active *store.PauseRow)
+
+	// RecordRejectedAgentHeader, when non-nil, is invoked once per
+	// inbound `X-Agent-Name` or `X-Agent-Session-Id` header that fails
+	// validation (#318 / §A16). The Server hooks this to bump a per-
+	// Server `totalAgentHeadersRejected` counter surfaced on /healthz so
+	// operators see agent-config drift the same way across the Bounce
+	// suite. nil = silent rejection (pure-evaluator + test callers).
+	// Per [[security-team-positioning-safety-not-surveillance]]: the
+	// rejection is SAFETY (operator visibility); the value is NEVER
+	// written into the audit event.
+	RecordRejectedAgentHeader func(headerName, rawValue string)
 }
 
 // SessionHeaderName is the inbound HTTP header an MCP-aware client can
@@ -1054,15 +1065,26 @@ func emitAuditEvent(opts EvalOptions, agent audit.AgentInfo, obs *RequestObserva
 }
 
 // resolveAgentInfo derives the per-request AgentInfo from (in
-// priority order, per [[agent-identity-in-audit]]):
+// priority order, per [[agent-identity-in-audit]] +
+// [[cross-product-agent-parity]]):
 //
-//  1. X-Kbouncer-Session-Id header → AgentRegistry lookup. The MCP
+//  1. **Cross-bouncer X-Agent-* headers** (#318 / §A16) — the canonical
+//     `X-Agent-Name` + `X-Agent-Session-Id` headers documented in
+//     `docs/AGENT-ATTRIBUTION.md`. HIGHEST precedence: when the agent
+//     explicitly declares itself via the canonical headers, that wins
+//     over heuristic detection. Mirrors gbounce's #308 pattern
+//     byte-for-byte so a SIEM query on
+//     `unmapped.iam_jit.agent.session_id=X` resolves across all four
+//     Bounce products. Invalid headers are dropped (audited as
+//     `name="unknown"` / `detected_from="unknown"`) + counted on
+//     /healthz via the per-Server counter.
+//  2. X-Kbouncer-Session-Id header → AgentRegistry lookup. The MCP
 //     server registers its clientInfo + session-id at handshake; a
 //     proxied SDK call that carries the header inherits the bound
 //     agent identity.
-//  2. User-Agent header → audit.FingerprintFromUserAgent. kubectl /
+//  3. User-Agent header → audit.FingerprintFromUserAgent. kubectl /
 //     client-go / helm / k9s / etc. all carry distinctive UA strings.
-//  3. nil request → empty AgentInfo (audit emits the default
+//  4. nil request → empty AgentInfo (audit emits the default
 //     {name:"unknown", detected_from:"unknown"} block).
 //
 // Process-tree fingerprinting is NOT performed here — the proxy
@@ -1075,20 +1097,71 @@ func resolveAgentInfo(opts EvalOptions, r *http.Request) audit.AgentInfo {
 	if r == nil {
 		return audit.AgentInfo{}
 	}
+	// #318 / §A16 — cross-bouncer X-Agent-* header parity. Read +
+	// validate the canonical headers BEFORE the MCP / UA fallbacks.
+	rawName := r.Header.Get("X-Agent-Name")
+	rawSessionID := r.Header.Get("X-Agent-Session-Id")
+	validatedName := ""
+	validatedSessionID := ""
+	if rawName != "" {
+		if audit.IsValidAgentName(rawName) {
+			validatedName = rawName
+		} else if opts.RecordRejectedAgentHeader != nil {
+			opts.RecordRejectedAgentHeader("X-Agent-Name", rawName)
+		}
+	}
+	if rawSessionID != "" {
+		if audit.IsValidSessionID(rawSessionID) {
+			validatedSessionID = rawSessionID
+		} else if opts.RecordRejectedAgentHeader != nil {
+			opts.RecordRejectedAgentHeader("X-Agent-Session-Id", rawSessionID)
+		}
+	}
+	if validatedName != "" {
+		// Header path wins. `detected_from=http_header` when both pieces
+		// validated; `http_header_name_only` for partial. Per
+		// [[cross-product-agent-parity]] the partial variant lets SIEM
+		// filters distinguish full from partial header attribution.
+		detectedFrom := audit.DetectionSourceHTTPHeader
+		if validatedSessionID == "" {
+			detectedFrom = audit.DetectionSourceHTTPHeaderNameOnly
+		}
+		return audit.AgentInfo{
+			Name:         validatedName,
+			SessionID:    validatedSessionID,
+			DetectedFrom: detectedFrom,
+		}
+	}
 	if opts.AgentRegistry != nil {
 		if sid := r.Header.Get(SessionHeaderName); sid != "" {
 			info := opts.AgentRegistry.Lookup(sid)
 			if info.Name != "" {
+				// Explicit X-Agent-Session-Id (when present without a
+				// name) overlays the registry-bound info so cross-bouncer
+				// correlation works even when the name fell through to
+				// MCP.
+				if validatedSessionID != "" {
+					info.SessionID = validatedSessionID
+				}
 				return info
 			}
 			// Header set but not registered → record the session id
 			// untrusted (best-effort) + still derive name from UA.
 			ua := audit.FingerprintFromUserAgent(r.Header.Get("User-Agent"))
 			ua.SessionID = sid
+			if validatedSessionID != "" {
+				ua.SessionID = validatedSessionID
+			}
 			return ua
 		}
 	}
-	return audit.FingerprintFromUserAgent(r.Header.Get("User-Agent"))
+	ua := audit.FingerprintFromUserAgent(r.Header.Get("User-Agent"))
+	if validatedSessionID != "" {
+		// Bare X-Agent-Session-Id with no name fell through to UA. Still
+		// thread the session id so cross-bouncer correlation works.
+		ua.SessionID = validatedSessionID
+	}
+	return ua
 }
 
 // maybeEnqueuePrompt writes a pending_prompts row when ALL of:
@@ -1336,6 +1409,51 @@ type Server struct {
 	// `pause stop`) get audit-exported through the proxy on the next
 	// inbound request — no separate CLI-side emitter wiring needed.
 	lastSeenPauseID atomic.Int64
+
+	// totalAgentHeadersRejected (#318 / §A16) counts inbound
+	// `X-Agent-Name` / `X-Agent-Session-Id` headers that failed
+	// validation. Surfaced via /healthz so operators see agent-config
+	// drift (e.g. a misconfigured agent setting the header to a
+	// shell-injection payload) without grepping stderr. Mirrors
+	// gbounce's field of the same name byte-for-byte per
+	// [[cross-product-agent-parity]].
+	totalAgentHeadersRejected atomic.Int64
+}
+
+// recordRejectedAgentHeader bumps the per-Server rejection counter +
+// logs one stderr line (truncated raw value, control chars replaced
+// with '?'). Wired into EvalOptions.RecordRejectedAgentHeader so
+// EvaluateRequestFull can surface invalid inbound X-Agent-* headers
+// without the evaluator owning audit semantics. Mirrors gbounce's
+// `logAgentHeaderRejected` Go function.
+//
+// Per [[security-team-positioning-safety-not-surveillance]]: surfacing
+// the rejection is SAFETY (operator sees attribution gap); the
+// truncation is privacy-shaped (we don't echo arbitrary unbounded
+// header bodies into the log). The header VALUE is NEVER written into
+// the audit event regardless.
+func (s *Server) recordRejectedAgentHeader(headerName, rawValue string) {
+	if s == nil {
+		return
+	}
+	s.totalAgentHeadersRejected.Add(1)
+	truncated := rawValue
+	if len(truncated) > 32 {
+		truncated = truncated[:32] + "..."
+	}
+	clean := make([]byte, 0, len(truncated))
+	for i := 0; i < len(truncated); i++ {
+		c := truncated[i]
+		if c < 0x20 || c > 0x7e {
+			clean = append(clean, '?')
+		} else {
+			clean = append(clean, c)
+		}
+	}
+	log.Warn().
+		Str("header", headerName).
+		Str("value", string(clean)).
+		Msg("kbounce: rejected invalid X-Agent-* header — request audited as anonymous")
 }
 
 // lookupErrorsCounter is a process-wide counter of lookup-class
@@ -1851,17 +1969,18 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
 		activeProfile, s.cfg.Cluster,
 		EvalOptions{
-			PromptOnDeny:       s.cfg.PromptOnDeny,
-			SyncPromptOnDeny:   syncPromptActive,
-			TaskOwner:          s.cfg.TaskOwner,
-			StreamKind:         string(streamKind),
-			AuditEmitter:       s.cfg.AuditEmitter,
-			AuditHost:          net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
-			AuditUpstream:      upstreamLabel,
-			AuditProfileSource: profileSource,
-			AgentRegistry:      s.cfg.AgentRegistry,
-			BurstDetector:      s.burstDetector,
-			OnPauseLookup:      s.observePauseTransition,
+			PromptOnDeny:              s.cfg.PromptOnDeny,
+			SyncPromptOnDeny:          syncPromptActive,
+			TaskOwner:                 s.cfg.TaskOwner,
+			StreamKind:                string(streamKind),
+			AuditEmitter:              s.cfg.AuditEmitter,
+			AuditHost:                 net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
+			AuditUpstream:             upstreamLabel,
+			AuditProfileSource:        profileSource,
+			AgentRegistry:             s.cfg.AgentRegistry,
+			BurstDetector:             s.burstDetector,
+			OnPauseLookup:             s.observePauseTransition,
+			RecordRejectedAgentHeader: s.recordRejectedAgentHeader,
 		},
 	)
 
@@ -2078,20 +2197,22 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Reason    string `json:"reason,omitempty"`
 	}
 	payload := struct {
-		Status              string        `json:"status"`
-		Mode                string        `json:"mode"`
-		DefaultPolicy       string        `json:"default_policy"`
-		ActiveProfile       string        `json:"active_profile"`
-		DecisionsCount      int64         `json:"decisions_count"`
-		LookupErrorsCounter int64         `json:"lookup_errors_counter"`
-		AuditExportHealthy  bool          `json:"audit_export_healthy"`
-		Pause               *HealthzPause `json:"pause"`
+		Status                    string        `json:"status"`
+		Mode                      string        `json:"mode"`
+		DefaultPolicy             string        `json:"default_policy"`
+		ActiveProfile             string        `json:"active_profile"`
+		DecisionsCount            int64         `json:"decisions_count"`
+		LookupErrorsCounter       int64         `json:"lookup_errors_counter"`
+		AuditExportHealthy        bool          `json:"audit_export_healthy"`
+		TotalAgentHeadersRejected int64         `json:"total_agent_headers_rejected"`
+		Pause                     *HealthzPause `json:"pause"`
 	}{
-		Status:              "ok",
-		Mode:                string(s.cfg.Mode),
-		DefaultPolicy:       string(s.cfg.DefaultPolicy),
-		LookupErrorsCounter: LookupErrorsCount(),
-		AuditExportHealthy:  true,
+		Status:                    "ok",
+		Mode:                      string(s.cfg.Mode),
+		DefaultPolicy:             string(s.cfg.DefaultPolicy),
+		LookupErrorsCounter:       LookupErrorsCount(),
+		AuditExportHealthy:        true,
+		TotalAgentHeadersRejected: s.totalAgentHeadersRejected.Load(),
 	}
 	if ap := s.ActiveProfile(); ap != nil {
 		payload.ActiveProfile = ap.Name
