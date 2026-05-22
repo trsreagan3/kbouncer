@@ -150,6 +150,28 @@ const (
 	// EntityName carries the on-disk path of the backup file.
 	AdminActionStoreBackup  AdminAction = "store.backup"
 	AdminActionStoreRestore AdminAction = "store.restore"
+
+	// AdminActionDynamicDenyReloaded — #324b. The dynamic-deny YAML
+	// at `~/.iam-jit/dynamic-denies.yaml` (or the path passed via
+	// `--dynamic-denies-path`) was reloaded by the in-process
+	// fsnotify watcher OR the POST /admin/dynamic-denies/reload mgmt
+	// endpoint. The reload reason
+	// (`unmapped.iam_jit.ext.dynamic_deny_reload_reason`) distinguishes
+	// `file_created` / `file_modified` / `file_removed` /
+	// `reload_requested` so a SIEM dashboard can split filesystem-
+	// triggered reloads from operator-pushed ones. Severity
+	// Informational (routine audit trail). Activity Other. Wire shape
+	// mirrors gbounce #324d byte-for-byte per
+	// [[cross-product-agent-parity]].
+	AdminActionDynamicDenyReloaded AdminAction = "dynamic_deny.reloaded"
+
+	// AdminActionDynamicDenyParseError — #324b. A reload attempt
+	// failed YAML parse / schema validation. The previous snapshot is
+	// retained in memory (fail-CLOSED per
+	// [[ibounce-honest-positioning]]). Surfaced so an operator who
+	// installed an invalid file sees it immediately rather than
+	// "silently 0 rules applied."
+	AdminActionDynamicDenyParseError AdminAction = "dynamic_deny.parse_error"
 )
 
 // AdminActionActivityID returns the OCSF activity_id (class 6003 enum)
@@ -175,7 +197,9 @@ func AdminActionActivityID(a AdminAction) int {
 		return ActivityDelete
 	case AdminActionConfigExport,
 		AdminActionDiagnosticsBundle,
-		AdminActionStoreBackup:
+		AdminActionStoreBackup,
+		AdminActionDynamicDenyReloaded,
+		AdminActionDynamicDenyParseError:
 		return ActivityOther
 	case AdminActionStoreRestore:
 		// Restore wholesale REPLACES the destination DB. CRUD-wise

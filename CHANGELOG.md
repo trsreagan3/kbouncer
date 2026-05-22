@@ -5,6 +5,120 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Added
+
+- **#324b — dynamic-deny YAML watcher + matcher + mgmt-port reload endpoint** (2026-05-22) —
+  kbouncer now consumes the cross-product
+  `~/.iam-jit/dynamic-denies.yaml` file. The on-disk shape + cross-bouncer
+  resolver semantics live in the canonical design doc at
+  `iam-roles/docs/DYNAMIC-DENY-RULES.md`; the JSON Schema lives at
+  `iam-roles/docs/schemas/dynamic-denies-v1.json`. This slice ships the
+  kbouncer consumer (#324b only — sibling slices #324a/c/d cover
+  ibounce + dbounce + gbounce; #324e ships the unified CLI + MCP
+  fan-out; #324f embeds the same denies into JIT-issued roles).
+
+  Surface:
+
+  - New package `internal/dynamicdeny` — loader + watcher + matcher.
+    The loader validates the YAML against the v1.0 schema shape
+    (rule-id pattern, duration grammar, applied-to bouncer enum,
+    duplicate-id rejection, product-magic discriminator) + filters
+    down to rules whose `applied_to` list includes `"kbouncer"`
+    (the historical `kbounce` alias is also accepted). Per
+    `[[ibounce-honest-positioning]]` the loader rejects malformed
+    YAML rather than silently dropping rules.
+  - Three kbouncer-shaped target pattern kinds: `namespace:<glob>`,
+    `cluster:<glob>`, and exact `<group>/<version>/<resource>`
+    triples. `namespace` + `cluster` patterns support exact match,
+    leading-`*.` suffix glob, and trailing `<prefix>-*` glob. Resource
+    triples are exact (with `core` as a canonical synonym for the
+    empty group the parser emits for core-API requests).
+  - fsnotify-driven watcher (`fsevents` on macOS, `inotify` on Linux).
+    Watches the parent directory so atomic-rename writes (`write-tmp +
+    rename onto live path`) are caught. Rapid sequential writes are
+    coalesced with a 100ms debounce quiet-period.
+  - Parse errors on reload RETAIN the previous in-memory snapshot
+    (fail-CLOSED per `[[ibounce-honest-positioning]]`) + emit a
+    `dynamic_deny.parse_error` admin-action OCSF event so a SIEM
+    surfaces the bad-file event without an operator having to grep.
+  - The proxy's evaluator consults the snapshot AFTER profile +
+    meta-discovery short-circuits but BEFORE per-task + global rule
+    evaluation. A dynamic-deny match short-circuits to DENY with
+    `decision_source="dynamic-deny"`, `deny_source="dynamic"`, and
+    `dynamic_deny_rule_id="dd_..."`. Per the cross-product design
+    doc: deny always wins over allow — dynamic-deny beats
+    profile-allow + task-allow + global-allow.
+  - Deny audit events now carry `unmapped.iam_jit.ext.deny_source` +
+    `unmapped.iam_jit.ext.dynamic_deny_rule_id` so a SIEM analyst can
+    pivot on either field. Mirrors gbounce #324d byte-for-byte per
+    `[[cross-product-agent-parity]]`.
+  - New flag `kbounce run --dynamic-denies-path PATH` (default
+    `~/.iam-jit/dynamic-denies.yaml`; also honors
+    `$IAM_JIT_DYNAMIC_DENIES_PATH`). Companion flag
+    `--disable-dynamic-denies` turns the channel off for operators
+    who haven't installed the cross-product CLI yet.
+  - Startup banner emits one line per `[[cross-product-agent-parity]]`:
+    `dynamic-denies: N rules loaded from PATH (M applied to kbouncer;
+    watching for changes)`.
+  - New endpoint `POST /admin/dynamic-denies/reload` on the mgmt port
+    (the kbouncer proxy port doubles as the mgmt port). Triggers an
+    immediate reload from disk + returns
+    `{"reloaded":true,"rules_count":N,"rules_applied_to_kbouncer":M,
+    "path":"..."}`. Parse errors return 422 with the structured
+    error. Useful for the cross-bouncer fan-out CLI (#324e), which
+    writes the YAML then POSTs each Bounce product's mgmt port to
+    confirm the rules are live.
+  - `/healthz` now reports `dynamic_denies_enabled`,
+    `dynamic_denies_count`, `dynamic_denies_path`,
+    `total_dynamic_deny_matches`, `total_dynamic_deny_reloads`, and
+    `total_dynamic_deny_parse_errors`. Counter naming mirrors the
+    cross-product spec.
+  - New admin-action constants `audit.AdminActionDynamicDenyReloaded`
+    + `audit.AdminActionDynamicDenyParseError`. The CLI wires an
+    emit-callback on the watcher that tees a `dynamic_deny.reloaded`
+    OR `dynamic_deny.parse_error` admin-action event with
+    `unmapped.iam_jit.ext.dynamic_deny_reload_reason ∈ {file_created,
+    file_modified, file_removed, reload_requested, parse_error}` per
+    the canonical design doc.
+
+  Tests:
+
+  - `internal/dynamicdeny/loader_test.go` — 18 tests (valid YAML;
+    missing-file = no error; 6 schema-violation rejections;
+    applied-to filter; namespace glob matrix; cluster glob matrix;
+    resource-triple matrix including the empty-group `core` alias;
+    expired-rule filter; unrecognized-target silent skip; kbounce
+    alias acceptance; round-trip JSON/YAML shape; env-var path).
+  - `internal/dynamicdeny/watcher_test.go` — 6 tests (file creation;
+    file modification; rapid-write debounce; parse-error retain;
+    manual ReloadNow; empty-path no-op).
+  - `internal/proxy/dynamic_deny_test.go` — 13 tests covering
+    namespace match, cluster match, resource-triple match (with
+    no-match negative), precedence over profile-allow, callback
+    bump, OCSF ext audit shape, reload-endpoint E2E (200 / non-POST
+    / 503-no-watcher / 422-parse-error), and /healthz dynamic-deny
+    surface.
+  - 38 new tests; existing K-Slice 1-8 + #271 + #311 + #318 + #320
+    regression suites continue to pass unchanged.
+
+  New runtime dependency: `github.com/fsnotify/fsnotify v1.7.0` (one
+  module — already a transitive dep of common Go ecosystem packages;
+  same library + version gbounce + dbounce adopted for their #324c/d
+  slices per `[[cross-product-agent-parity]]`).
+
+  Per `[[creates-never-mutates]]`: this slice is additive — when the
+  watcher is disabled (no path configured, file absent, or
+  `--disable-dynamic-denies` set) the proxy's evaluator behavior is
+  byte-identical to the pre-#324b shape.
+
+  Per `[[deliberate-feature-completion]]`: this slice complete =
+  loader + watcher + matcher + evaluator integration + CLI flags +
+  mgmt endpoint + tests + CHANGELOG + README link.
+
+  See `iam-roles/docs/DYNAMIC-DENY-RULES.md` for the cross-bouncer
+  design + `iam-roles/docs/tasks/324-dynamic-deny-rules.md` for the
+  per-slice tracking.
+
 ### Changed
 
 ### BREAKING — §A21 / [[discovery-first-default]] — default flips to DISCOVERY MODE — Shipped 2026-05-22

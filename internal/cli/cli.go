@@ -32,6 +32,7 @@ import (
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/caveats"
+	"github.com/trsreagan3/kbouncer/internal/dynamicdeny"
 	"github.com/trsreagan3/kbouncer/internal/mcp"
 	"github.com/trsreagan3/kbouncer/internal/mcpinstall"
 	"github.com/trsreagan3/kbouncer/internal/profile"
@@ -274,6 +275,13 @@ func newRunCmd() *cobra.Command {
 		auditObjectStorageRotationMinutes int
 		auditObjectStorageMaxSizeMB       int
 		auditObjectStorageInstanceID      string
+		// #324b — dynamic-deny YAML path. Default is
+		// ~/.iam-jit/dynamic-denies.yaml (also honors
+		// $IAM_JIT_DYNAMIC_DENIES_PATH). The --disable-dynamic-denies
+		// boolean turns the channel off entirely for operators who
+		// haven't installed the cross-product CLI yet.
+		dynamicDeniesPath    string
+		disableDynamicDenies bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -569,6 +577,38 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			}
 			defer auditCloser()
 
+			// #324b — dynamic-deny watcher. Constructed BEFORE
+			// proxy.NewServer so the watcher's initial in-memory
+			// snapshot is the one the proxy sees on its first request.
+			// Default path is `~/.iam-jit/dynamic-denies.yaml`; the
+			// `--dynamic-denies-path PATH` flag overrides; the
+			// `--disable-dynamic-denies` flag turns the channel off
+			// entirely (the watcher goroutine never starts).
+			var ddWatcher *dynamicdeny.Watcher
+			var ddBannerLine string
+			if !disableDynamicDenies {
+				ddPath := dynamicDeniesPath
+				if ddPath == "" {
+					ddPath = dynamicdeny.ResolveDefaultPath()
+				}
+				if ddPath != "" {
+					// emitFunc is wired AFTER NewServer below so we can
+					// reference the Server's counter-bump methods +
+					// audit-log sink. For now construct with nil.
+					w, loadErr := dynamicdeny.NewWatcher(ddPath, nil)
+					if loadErr != nil {
+						// The watcher object is still returned so the
+						// banner reports "0 rules (parse error)"; the
+						// watcher goroutine won't start until Start()
+						// is called.
+						fmt.Fprintf(os.Stderr,
+							"kbouncer: dynamic-denies: initial load of %q failed: %v\n",
+							ddPath, loadErr)
+					}
+					ddWatcher = w
+				}
+			}
+
 			cfg := proxy.Config{
 				Host:                    host,
 				Port:                    port,
@@ -590,6 +630,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				BulkAnswerWindow:        bulkAnswerWindow,
 				BulkAnswerCooldown:      bulkAnswerCooldown,
 				AuditEventsToken:        auditEventsToken,
+				DynamicDenyWatcher:      ddWatcher,
 			}.Normalize()
 
 			// Cooperative mode + --sync-prompt-on-deny: per spec the
@@ -605,6 +646,58 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			}
 
 			s := proxy.NewServer(cfg, st)
+
+			// #324b — wire the watcher's emit callback now that the
+			// Server exists. Each reload bumps the matching counter +
+			// tees an OCSF admin-action event into the audit log so a
+			// SIEM dashboard sees activity. Mirrors gbounce #324d wiring.
+			if ddWatcher != nil {
+				ddWatcher.SetStderr(os.Stderr)
+				emitCtx := cmd.Context()
+				auditSink := auditEmitter
+				emit := func(reason dynamicdeny.ReloadReason, rs *dynamicdeny.RuleSet, parseErr error) {
+					switch reason {
+					case dynamicdeny.ReasonParseError:
+						s.BumpDynamicDenyParseError()
+					default:
+						s.BumpDynamicDenyReload()
+					}
+					action := audit.AdminActionDynamicDenyReloaded
+					if reason == dynamicdeny.ReasonParseError {
+						action = audit.AdminActionDynamicDenyParseError
+					}
+					extra := map[string]any{
+						"dynamic_deny_reload_reason": string(reason),
+					}
+					if rs != nil {
+						extra["dynamic_denies_count"] = len(rs.Rules)
+						extra["dynamic_denies_path"] = rs.SourcePath
+					}
+					if parseErr != nil {
+						extra["dynamic_deny_parse_error"] = parseErr.Error()
+					}
+					audit.EmitAdminAction(emitCtx, auditSink, audit.AdminActionInput{
+						Action:     action,
+						Source:     audit.AdminActionSourceCLI,
+						EntityKind: "dynamic_denies_file",
+						EntityName: ddWatcher.Path(),
+						ExtraExt:   extra,
+					})
+				}
+				ddWatcher.SetEmitFunc(emit)
+				if startErr := ddWatcher.Start(cmd.Context()); startErr != nil {
+					fmt.Fprintf(os.Stderr,
+						"kbouncer: dynamic-denies: watcher failed to start: %v\n", startErr)
+				}
+				snap := ddWatcher.Snapshot()
+				ruleCount := 0
+				if snap != nil {
+					ruleCount = len(snap.Rules)
+				}
+				ddBannerLine = fmt.Sprintf(
+					"dynamic-denies: %d rules loaded from %s (%d applied to kbouncer; watching for changes)",
+					ruleCount, ddWatcher.Path(), ruleCount)
+			}
 
 			// Print a friendly startup banner to stderr so stdout stays
 			// clean for tools that might pipe kbounce's output.
@@ -628,6 +721,13 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			fmt.Fprintf(os.Stderr,
 				"kbounce proxy starting on %s://%s:%d (mode=%s, default-policy=%s, profile=%s, default_mode=%s)\n",
 				scheme, cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name, defaultModeLabel)
+			// #324b — dynamic-deny banner. One line per
+			// [[cross-product-agent-parity]]; identical shape on the
+			// other Bounce products. Quiet when --disable-dynamic-denies
+			// or when the path can't be resolved (Watcher is nil).
+			if ddBannerLine != "" {
+				fmt.Fprintln(os.Stderr, ddBannerLine)
+			}
 			// #254 — preset-derivation banner sits RIGHT AFTER the
 			// address line so the operator immediately sees which
 			// settings came from the preset. Same format across all
@@ -1151,6 +1251,22 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"(hostname-pid) used in the object key. Useful for operators "+
 			"with ephemeral hostnames (containers / k8s pods) who want "+
 			"the path stable across restarts.")
+	// #324b — cross-product dynamic-deny YAML.
+	cmd.Flags().StringVar(&dynamicDeniesPath, "dynamic-denies-path", "",
+		"#324b — path to the cross-product dynamic-deny rules YAML. "+
+			"Default ~/.iam-jit/dynamic-denies.yaml (also honors "+
+			"$IAM_JIT_DYNAMIC_DENIES_PATH). The file is shared with "+
+			"ibounce / kbouncer / dbounce / gbounce; rules whose "+
+			"applied_to list excludes kbouncer are silently skipped. "+
+			"Hot-reloaded on disk change (fsnotify-driven). The "+
+			"unified `iam-jit deny add` CLI for editing the file lands "+
+			"in #324e; today the file is hand-edited (or written by "+
+			"agents via the cross-product MCP path).")
+	cmd.Flags().BoolVar(&disableDynamicDenies, "disable-dynamic-denies", false,
+		"#324b — disable the dynamic-deny channel entirely. The "+
+			"watcher goroutine never starts; the proxy behaves "+
+			"byte-identically to the pre-#324b shape. Useful for "+
+			"operators who haven't installed the cross-product CLI.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more

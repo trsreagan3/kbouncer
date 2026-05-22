@@ -131,6 +131,75 @@ Switch with `--mode cooperative` or `--mode transparent`.
 
 ---
 
+## Dynamic deny rules (#324b — cross-product hot-reload)
+
+Profiles are great for stable operator-set rules. For **incident-time
+deny ergonomics** ("Claude, make sure nothing touches the prod
+namespace for 3h"), kbounce also consumes
+`~/.iam-jit/dynamic-denies.yaml` — a cross-product file shared with
+ibounce, dbounce, and gbounce. Rules in the file are hot-reloaded on
+disk change (fsevents on macOS, inotify on Linux); rules whose
+`applied_to` list does NOT include `kbouncer` are silently skipped, so
+ONE file fans out across the Bounce suite without operators picking
+which proxy to call.
+
+```sh
+# Optional override; default is ~/.iam-jit/dynamic-denies.yaml.
+kbounce run --upstream https://<api>:6443 \
+            --dynamic-denies-path ~/.iam-jit/dynamic-denies.yaml
+```
+
+Startup banner reports the loaded count:
+
+```
+dynamic-denies: 2 rules loaded from ~/.iam-jit/dynamic-denies.yaml (2 applied to kbouncer; watching for changes)
+```
+
+Three kbouncer-shaped pattern kinds are recognized in each rule's
+`targets` list:
+
+| Pattern | Matches |
+| --- | --- |
+| `namespace:prod` / `namespace:prod-*` / `namespace:*.svc` | Parsed K8s namespace |
+| `cluster:prod-east` / `cluster:prod-*` | The kubeconfig cluster name kbouncer was launched with |
+| `apps/v1/deployments` / `core/v1/secrets` | Exact K8s `group/version/resource` triple (use `core` for the K8s core API; matches the empty-group parser shape) |
+
+On match: the verdict OCSF event carries
+`unmapped.iam_jit.ext.deny_source="dynamic"` +
+`unmapped.iam_jit.ext.dynamic_deny_rule_id="dd_..."` so a SIEM
+distinguishes the source flavor + names the originating rule. Dynamic
+denies beat profile-allow + task-allow + global-allow per the
+cross-product design doc's "deny always wins over allow" rule.
+
+`POST /admin/dynamic-denies/reload` on the proxy port triggers an
+immediate reload from disk — useful for the cross-bouncer fan-out CLI
+(#324e), which writes the YAML then POSTs each Bounce product's mgmt
+port to confirm the rules are live.
+
+The canonical cross-product design lives at
+[`iam-roles/docs/DYNAMIC-DENY-RULES.md`](https://github.com/trsreagan3/iam-jit/blob/main/docs/DYNAMIC-DENY-RULES.md);
+the on-disk schema at
+[`iam-roles/docs/schemas/dynamic-denies-v1.json`](https://github.com/trsreagan3/iam-jit/blob/main/docs/schemas/dynamic-denies-v1.json).
+The headline operator-facing CLI (`iam-jit deny add | list | remove |
+show`) lands in #324e; this slice (#324b) ships the kbouncer
+consumer + manual / agent-driven YAML editing works today.
+
+Honest caveats:
+
+- **The proxy is bypassable.** Per `[[ibounce-honest-positioning]]`:
+  an operator who controls the agent's network can route around
+  kbounce. The dynamic-deny rules add ergonomics + audit-trail
+  visibility; the defense-in-depth half (recommender embedding the
+  same denies as explicit `Deny` statements on JIT-issued roles)
+  ships in #324f for the AWS surface.
+- **Fail-CLOSED on parse error.** A YAML typo retains the previous
+  in-memory snapshot — kbounce does NOT silently fall back to "0
+  rules applied" when an operator's file fails to validate. The
+  failure surfaces in `/healthz` (`total_dynamic_deny_parse_errors`)
+  + as a `dynamic_deny.parse_error` admin-action OCSF event.
+
+---
+
 ## Profiles (the default-profile reshape)
 
 A **profile** is an environment-aware deny layer that fires BEFORE

@@ -490,6 +490,16 @@ type DecisionInput struct {
 	// block so the wire shape always carries a queryable agent
 	// object.
 	Agent AgentInfo
+
+	// DenySource is "dynamic" when a #324b dynamic-deny rule fired,
+	// "" otherwise. Surfaces under `unmapped.iam_jit.ext.deny_source`
+	// per the cross-product design doc.
+	DenySource string
+
+	// DynamicDenyRuleID is the `dd_<ULID>` id of the dynamic-deny
+	// rule that fired (when DenySource == "dynamic"); empty otherwise.
+	// Surfaces under `unmapped.iam_jit.ext.dynamic_deny_rule_id`.
+	DynamicDenyRuleID string
 }
 
 // FromDecision builds an OCSF class 6003 (API Activity) Event from a
@@ -1217,6 +1227,17 @@ func buildExt(in DecisionInput) map[string]any {
 	}
 	if in.AdminFallback {
 		ext["admin_fallback"] = true
+	}
+	// #324b — dynamic-deny rule firing. ext.deny_source distinguishes
+	// dynamic from static (today only the dynamic value lands; static
+	// is reserved for future use); ext.dynamic_deny_rule_id names the
+	// originating `dd_<ULID>` so a SIEM analyst can pivot to the rule.
+	// Mirrors gbounce's wire shape per [[cross-product-agent-parity]].
+	if in.DenySource != "" {
+		ext["deny_source"] = in.DenySource
+	}
+	if in.DynamicDenyRuleID != "" {
+		ext["dynamic_deny_rule_id"] = in.DynamicDenyRuleID
 	}
 	if len(ext) == 0 {
 		return nil

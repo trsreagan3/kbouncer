@@ -44,6 +44,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
+	"github.com/trsreagan3/kbouncer/internal/dynamicdeny"
 	"github.com/trsreagan3/kbouncer/internal/parser"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/rules"
@@ -268,6 +269,20 @@ type Config struct {
 	// anchor); empty + external bind = the CLI refuses to start. The
 	// audit-events handler reads this directly.
 	AuditEventsToken string
+
+	// DynamicDenyWatcher (#324b) is the kbouncer consumer of the
+	// cross-product `~/.iam-jit/dynamic-denies.yaml` file. When non-nil,
+	// the evaluator consults the watcher's snapshot AFTER profile +
+	// meta-discovery short-circuits but BEFORE the per-task + global
+	// rule evaluation, so a dynamic-deny match beats profile-allow +
+	// task-allow + global-allow per the cross-product design doc's
+	// "deny always wins over allow" rule. Per [[creates-never-mutates]]
+	// the field is additive — when nil the evaluator behavior is
+	// byte-identical to the pre-#324b shape. The audit event the
+	// matcher produces carries `unmapped.iam_jit.ext.deny_source="dynamic"`
+	// + `unmapped.iam_jit.ext.dynamic_deny_rule_id="dd_..."` so a SIEM
+	// analyst can pivot on either field.
+	DynamicDenyWatcher *dynamicdeny.Watcher
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -377,6 +392,20 @@ type RequestObservation struct {
 	// the audit row id is an internal handle, not part of the agent-
 	// facing contract.
 	DecisionID int64 `json:"-"`
+
+	// DenySource is "dynamic" when a #324b dynamic-deny rule fired the
+	// verdict, or "" when it didn't. Surfaces into the audit event
+	// under `unmapped.iam_jit.ext.deny_source` so a SIEM analyst can
+	// pivot on the source-flavor without re-parsing the rule body.
+	// Per [[cross-product-agent-parity]] the wire shape mirrors
+	// gbounce's deny_source field.
+	DenySource string `json:"deny_source,omitempty"`
+
+	// DynamicDenyRuleID is the `dd_<ULID>` id of the dynamic-deny rule
+	// that fired (when DenySource == "dynamic"). Surfaces into the
+	// audit event under `unmapped.iam_jit.ext.dynamic_deny_rule_id`.
+	// Empty when no dynamic-deny rule fired.
+	DynamicDenyRuleID string `json:"dynamic_deny_rule_id,omitempty"`
 }
 
 // Verdict values used in observations + the audit log.
@@ -409,6 +438,26 @@ const (
 	// blocked under safe-default (#301). Reported in the audit row so
 	// reviewers can filter discovery noise out of decision queries.
 	SourceMetaDiscovery = "meta-discovery"
+	// SourceDynamic means a #324b dynamic-deny rule from
+	// `~/.iam-jit/dynamic-denies.yaml` fired the verdict. The audit
+	// event carries `unmapped.iam_jit.ext.deny_source="dynamic"` +
+	// `unmapped.iam_jit.ext.dynamic_deny_rule_id="dd_..."` so a SIEM
+	// analyst can pivot on either field. Dynamic-deny beats
+	// profile-allow + task-allow + global-allow per the cross-product
+	// design doc's "deny always wins over allow" rule.
+	SourceDynamic = "dynamic-deny"
+)
+
+// DenySourceStatic + DenySourceDynamic are the canonical values
+// surfaced on a deny audit event under `ext.deny_source`. Mirrors the
+// gbounce #324d wire shape byte-for-byte per
+// [[cross-product-agent-parity]]. kbouncer doesn't have a "static"
+// dimension yet (profile / task / global denies don't claim the
+// label), so the value is set ONLY when a dynamic-deny rule fires —
+// the absence of the field means "not a dynamic deny."
+const (
+	DenySourceStatic  = "static"
+	DenySourceDynamic = "dynamic"
 )
 
 // DecisionSourceHeader is the HTTP response header the proxy sets on
@@ -528,6 +577,25 @@ type EvalOptions struct {
 	// rejection is SAFETY (operator visibility); the value is NEVER
 	// written into the audit event.
 	RecordRejectedAgentHeader func(headerName, rawValue string)
+
+	// DynamicDenies (#324b) is the in-memory snapshot of dynamic-deny
+	// rules the evaluator consults AFTER profile + meta-discovery
+	// short-circuits but BEFORE per-task + global rule evaluation.
+	// nil disables the channel (pure-evaluator + test callers + the
+	// pre-#324b shape — same shape as the rest of the optional behaviors
+	// on EvalOptions). When non-nil, a Match → DENY verdict with
+	// DenySource="dynamic" + DynamicDenyRuleID="dd_..." on the
+	// observation. Mirrors gbounce's union-static-and-dynamic at-match
+	// pattern; kbouncer has no static-deny dimension yet so the union
+	// is dynamic-only.
+	DynamicDenies *dynamicdeny.RuleSet
+
+	// OnDynamicDenyMatch, when non-nil, is invoked exactly once per
+	// dynamic-deny match so the Server can bump a /healthz counter
+	// without the evaluator having to own the audit-package wiring.
+	// nil = silent (the verdict still applies + the audit event still
+	// carries the deny_source / dynamic_deny_rule_id fields).
+	OnDynamicDenyMatch func(rule *dynamicdeny.Pattern)
 }
 
 // SessionHeaderName is the inbound HTTP header an MCP-aware client can
@@ -741,6 +809,42 @@ func EvaluateRequestFull(
 		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 		return obs
+	}
+
+	// #324b — dynamic-deny check. Consults the in-memory snapshot from
+	// `~/.iam-jit/dynamic-denies.yaml` AFTER profile + meta-discovery
+	// short-circuits but BEFORE per-task + global rule evaluation, so
+	// a dynamic-deny match beats profile-allow + task-allow +
+	// global-allow per the cross-product design doc's "deny always
+	// wins over allow" rule. Mirrors gbounce #324d's "dynamic union'd
+	// into the matcher" shape; the wire-shape observation carries
+	// DenySource + DynamicDenyRuleID so a SIEM analyst can pivot on
+	// either field.
+	if opts.DynamicDenies != nil {
+		matchInput := dynamicdeny.MatchInput{
+			Namespace: parsed.Namespace,
+			Cluster:   cluster,
+			Group:     parsed.Group,
+			Version:   parsed.Version,
+			Resource:  parsed.Resource,
+		}
+		if matched := opts.DynamicDenies.Match(matchInput); matched != nil {
+			obs.DecisionVerdict = VerdictDeny
+			obs.DecisionReason = fmt.Sprintf(
+				"matched dynamic-deny rule %s (%s)",
+				matched.RuleID, matched.Raw)
+			obs.DecisionSource = SourceDynamic
+			obs.DenySource = DenySourceDynamic
+			obs.DynamicDenyRuleID = matched.RuleID
+			obs.Enforced = effectiveMode == ModeTransparent
+			if opts.OnDynamicDenyMatch != nil {
+				opts.OnDynamicDenyMatch(matched)
+			}
+			decisionID := writeDecision(st, obs, activePause, agentInfo)
+			emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
+			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+			return obs
+		}
 	}
 
 	// K-Slice 3: build the request view the rule + task engines consume.
@@ -1031,23 +1135,25 @@ func emitAuditEvent(opts EvalOptions, agent audit.AgentInfo, obs *RequestObserva
 		return
 	}
 	in := audit.DecisionInput{
-		At:             obs.At,
-		DecisionID:     obs.DecisionID,
-		Mode:           obs.ModeAtDecision,
-		Profile:        obs.ProfileName,
-		Verdict:        obs.DecisionVerdict,
-		Reason:         obs.DecisionReason,
-		DecisionSource: obs.DecisionSource,
-		Enforced:       obs.Enforced,
-		Host:           opts.AuditHost,
-		Upstream:       opts.AuditUpstream,
-		Method:         obs.Method,
-		Path:           obs.Path,
-		StreamKind:     obs.StreamKind,
-		TaskID:         taskID,
-		ProfileSource:  opts.AuditProfileSource,
-		AdminFallback:  activePause != nil,
-		Agent:          agent,
+		At:                obs.At,
+		DecisionID:        obs.DecisionID,
+		Mode:              obs.ModeAtDecision,
+		Profile:           obs.ProfileName,
+		Verdict:           obs.DecisionVerdict,
+		Reason:            obs.DecisionReason,
+		DecisionSource:    obs.DecisionSource,
+		Enforced:          obs.Enforced,
+		Host:              opts.AuditHost,
+		Upstream:          opts.AuditUpstream,
+		Method:            obs.Method,
+		Path:              obs.Path,
+		StreamKind:        obs.StreamKind,
+		TaskID:            taskID,
+		ProfileSource:     opts.AuditProfileSource,
+		AdminFallback:     activePause != nil,
+		Agent:             agent,
+		DenySource:        obs.DenySource,
+		DynamicDenyRuleID: obs.DynamicDenyRuleID,
 	}
 	if parsed != nil {
 		in.ParsedVerb = parsed.Verb
@@ -1470,6 +1576,23 @@ type Server struct {
 	// gbounce's field of the same name byte-for-byte per
 	// [[cross-product-agent-parity]].
 	totalAgentHeadersRejected atomic.Int64
+
+	// dynamicDeny (#324b) is the optional dynamic-deny YAML watcher.
+	// Held on the Server so the request hot path can read its
+	// snapshot under the watcher's RWMutex + so /healthz + the
+	// mgmt-port reload handler can introspect it without re-walking
+	// the cfg pointer.
+	dynamicDeny *dynamicdeny.Watcher
+
+	// totalDynamicDenyMatches counts dynamic-deny matches across the
+	// proxy's lifetime. Surfaced via /healthz.
+	totalDynamicDenyMatches atomic.Int64
+	// totalDynamicDenyReloads / totalDynamicDenyParseErrors mirror the
+	// watcher's internal counters; the Server's CLI-wired emit
+	// callback bumps these so /healthz reflects activity without
+	// reaching into the watcher's private fields.
+	totalDynamicDenyReloads     atomic.Int64
+	totalDynamicDenyParseErrors atomic.Int64
 }
 
 // recordRejectedAgentHeader bumps the per-Server rejection counter +
@@ -1558,6 +1681,7 @@ func NewServer(cfg Config, st *store.Store) *Server {
 		cfg:           cfg,
 		store:         st,
 		activeProfile: cfg.ActiveProfile,
+		dynamicDeny:   cfg.DynamicDenyWatcher,
 	}
 	s.burstDetector = NewBurstDetector(st, BurstDetectorOptions{
 		Threshold: cfg.BulkAnswerThreshold,
@@ -1588,6 +1712,13 @@ func NewServer(cfg Config, st *store.Store) *Server {
 	// merged stream. Registered BEFORE the catch-all "/" so the exact
 	// path wins ServeMux precedence (matches /healthz handling above).
 	mux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken))
+	// #324b — POST /admin/dynamic-denies/reload mgmt endpoint. Useful
+	// for the cross-bouncer fan-out CLI (#324e) which writes the YAML
+	// then POSTs each Bounce product's mgmt port to confirm rules are
+	// live. Same auth model as /audit/events. Registered BEFORE the
+	// catch-all "/" so the exact path wins ServeMux precedence.
+	mux.HandleFunc("/admin/dynamic-denies/reload",
+		s.dynamicDenyReloadHandler(cfg.AuditEventsToken))
 	// #272 — GET / serves the minimal live audit-stream web UI. The
 	// page polls /audit/events every 2 s. kbounce's proxy port doubles
 	// as the mgmt port, so the UI shares the ServeMux with the k8s
@@ -2033,6 +2164,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			BurstDetector:             s.burstDetector,
 			OnPauseLookup:             s.observePauseTransition,
 			RecordRejectedAgentHeader: s.recordRejectedAgentHeader,
+			// #324b — dynamic-deny snapshot for the evaluator. nil-safe;
+			// snapshot is read under the watcher's RWMutex so the hot
+			// path sees a coherent view even mid-reload.
+			DynamicDenies: s.DynamicDenySnapshot(),
+			OnDynamicDenyMatch: func(_ *dynamicdeny.Pattern) {
+				s.BumpDynamicDenyMatch()
+			},
 		},
 	)
 
@@ -2249,22 +2387,34 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Reason    string `json:"reason,omitempty"`
 	}
 	payload := struct {
-		Status                    string        `json:"status"`
-		Mode                      string        `json:"mode"`
-		DefaultPolicy             string        `json:"default_policy"`
-		ActiveProfile             string        `json:"active_profile"`
-		DecisionsCount            int64         `json:"decisions_count"`
-		LookupErrorsCounter       int64         `json:"lookup_errors_counter"`
-		AuditExportHealthy        bool          `json:"audit_export_healthy"`
-		TotalAgentHeadersRejected int64         `json:"total_agent_headers_rejected"`
-		Pause                     *HealthzPause `json:"pause"`
+		Status                      string        `json:"status"`
+		Mode                        string        `json:"mode"`
+		DefaultPolicy               string        `json:"default_policy"`
+		ActiveProfile               string        `json:"active_profile"`
+		DecisionsCount              int64         `json:"decisions_count"`
+		LookupErrorsCounter         int64         `json:"lookup_errors_counter"`
+		AuditExportHealthy          bool          `json:"audit_export_healthy"`
+		TotalAgentHeadersRejected   int64         `json:"total_agent_headers_rejected"`
+		Pause                       *HealthzPause `json:"pause"`
+		DynamicDeniesEnabled        bool          `json:"dynamic_denies_enabled"`
+		DynamicDeniesCount          int           `json:"dynamic_denies_count"`
+		DynamicDeniesPath           string        `json:"dynamic_denies_path,omitempty"`
+		TotalDynamicDenyMatches     int64         `json:"total_dynamic_deny_matches"`
+		TotalDynamicDenyReloads     int64         `json:"total_dynamic_deny_reloads"`
+		TotalDynamicDenyParseErrors int64         `json:"total_dynamic_deny_parse_errors"`
 	}{
-		Status:                    "ok",
-		Mode:                      string(s.cfg.Mode),
-		DefaultPolicy:             string(s.cfg.DefaultPolicy),
-		LookupErrorsCounter:       LookupErrorsCount(),
-		AuditExportHealthy:        true,
-		TotalAgentHeadersRejected: s.totalAgentHeadersRejected.Load(),
+		Status:                      "ok",
+		Mode:                        string(s.cfg.Mode),
+		DefaultPolicy:               string(s.cfg.DefaultPolicy),
+		LookupErrorsCounter:         LookupErrorsCount(),
+		AuditExportHealthy:          true,
+		TotalAgentHeadersRejected:   s.totalAgentHeadersRejected.Load(),
+		DynamicDeniesEnabled:        s.dynamicDeny != nil,
+		DynamicDeniesCount:          s.dynamicDenyActiveCount(),
+		DynamicDeniesPath:           s.dynamicDenyPath(),
+		TotalDynamicDenyMatches:     s.totalDynamicDenyMatches.Load(),
+		TotalDynamicDenyReloads:     s.totalDynamicDenyReloads.Load(),
+		TotalDynamicDenyParseErrors: s.totalDynamicDenyParseErrors.Load(),
 	}
 	if ap := s.ActiveProfile(); ap != nil {
 		payload.ActiveProfile = ap.Name
