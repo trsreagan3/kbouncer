@@ -271,17 +271,19 @@ func TestParse_TableDriven(t *testing.T) {
 }
 
 func TestParse_MalformedURLs(t *testing.T) {
+	// /healthz, /metrics, /api, /apis, /api/v1, /apis/apps, /apis/apps/v1
+	// + /openapi/v3[/...] are now recognized as IsMetaRead (#301) and
+	// are covered by TestParse_MetaDiscoveryPaths. This set is the
+	// residual unclassifiable shapes — paths that neither match a
+	// resource shape nor a meta-discovery shape.
 	cases := []struct {
 		name string
 		url  string
 	}{
 		{name: "root", url: "/"},
 		{name: "empty path", url: ""},
-		{name: "unknown prefix", url: "/healthz"},
-		{name: "metrics endpoint", url: "/metrics"},
-		{name: "api with no version", url: "/api"},
-		{name: "apis with only group", url: "/apis/apps"},
-		{name: "api version only — discovery", url: "/api/v1"},
+		{name: "unknown top-level segment", url: "/foobar"},
+		{name: "swagger.json (not a known apiserver surface)", url: "/swagger.json"},
 		{name: "namespaced prefix but no resource", url: "/api/v1/namespaces/default"},
 	}
 	for _, tc := range cases {
@@ -301,6 +303,98 @@ func TestParse_MalformedURLs(t *testing.T) {
 			}
 			require.Error(t, err, "expected error for %q", tc.url)
 			assert.Nil(t, got)
+		})
+	}
+}
+
+// TestParse_MetaDiscoveryPaths covers #301: kubectl + client-go
+// bootstrap by hitting OpenAPI schema, API-version + group discovery,
+// /version, /healthz, /readyz, /livez, /metrics BEFORE any resource
+// call. The parser must classify these as IsMetaRead=true with
+// Verb="get", Group="", Resource="meta:<kind>" so the proxy can
+// short-circuit ALLOW under safe-default. Writes (POST/PUT/PATCH/DELETE)
+// on the same prefixes stay unclassifiable per [[creates-never-mutates]].
+func TestParse_MetaDiscoveryPaths(t *testing.T) {
+	allowed := []struct {
+		name     string
+		url      string
+		wantKind string // "meta:<kind>"
+	}{
+		{name: "openapi v2", url: "/openapi/v2", wantKind: "meta:openapi-schema"},
+		{name: "openapi v3 root", url: "/openapi/v3", wantKind: "meta:openapi-schema"},
+		{name: "openapi v3 per-group core", url: "/openapi/v3/api/v1", wantKind: "meta:openapi-schema"},
+		{name: "openapi v3 per-group apps", url: "/openapi/v3/apis/apps/v1", wantKind: "meta:openapi-schema"},
+		{name: "openapi v3 deeply nested group", url: "/openapi/v3/apis/rbac.authorization.k8s.io/v1", wantKind: "meta:openapi-schema"},
+		{name: "version", url: "/version", wantKind: "meta:version"},
+		{name: "healthz", url: "/healthz", wantKind: "meta:health"},
+		{name: "healthz subprobe", url: "/healthz/etcd", wantKind: "meta:health"},
+		{name: "readyz", url: "/readyz", wantKind: "meta:health"},
+		{name: "readyz poststarthook", url: "/readyz/poststarthook/start-kube-apiserver-admission-initializer", wantKind: "meta:health"},
+		{name: "livez", url: "/livez", wantKind: "meta:health"},
+		{name: "metrics", url: "/metrics", wantKind: "meta:metrics"},
+		{name: "core API root", url: "/api", wantKind: "meta:api-discovery"},
+		{name: "core API version list", url: "/api/v1", wantKind: "meta:api-version-discovery"},
+		{name: "named-group root", url: "/apis", wantKind: "meta:api-discovery"},
+		{name: "named-group versions list", url: "/apis/apps", wantKind: "meta:api-group-discovery"},
+		{name: "named-group resource list", url: "/apis/apps/v1", wantKind: "meta:api-group-discovery"},
+		{name: "named-group resource list dotted group", url: "/apis/rbac.authorization.k8s.io/v1", wantKind: "meta:api-group-discovery"},
+	}
+	for _, tc := range allowed {
+		t.Run("GET "+tc.name, func(t *testing.T) {
+			req := MustParseTestURL(http.MethodGet, tc.url)
+			got, err := Parse(req)
+			require.NoError(t, err, "GET %q must classify as meta-read, not malformed", tc.url)
+			require.NotNil(t, got)
+			assert.True(t, got.IsMetaRead, "IsMetaRead must be true for %q", tc.url)
+			assert.Equal(t, "get", got.Verb, "verb must be 'get' for meta paths")
+			assert.Equal(t, "", got.Group, "group must be empty for meta paths")
+			assert.Equal(t, tc.wantKind, got.Resource, "resource must be %q", tc.wantKind)
+			assert.Empty(t, got.Namespace, "namespace must be empty for meta paths")
+			assert.Empty(t, got.Name, "name must be empty for meta paths")
+			assert.Empty(t, got.Subresource, "subresource must be empty for meta paths")
+		})
+	}
+
+	// Writes on these surfaces stay unclassifiable: the apiserver 405s
+	// them and per [[creates-never-mutates]] kbounce refuses to fast-
+	// path anything mutating-shaped through meta-discovery.
+	writeMethods := []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
+	writePaths := []string{"/openapi/v3/api/v1", "/version", "/healthz", "/metrics", "/api/v1", "/apis/apps/v1"}
+	for _, m := range writeMethods {
+		for _, p := range writePaths {
+			t.Run(m+" "+p+" must stay unclassifiable", func(t *testing.T) {
+				req := MustParseTestURL(m, p)
+				_, err := Parse(req)
+				require.Error(t, err, "%s %q must NOT fast-path as meta-read", m, p)
+			})
+		}
+	}
+}
+
+// TestParse_ResourceTailNotMistakenForMeta confirms my classifyMetaPath
+// length checks don't accidentally swallow real resource calls that
+// happen to start with /api or /apis. /api/v1/pods is 3 segments and
+// /apis/apps/v1/deployments is 4; both have resource tails and must
+// flow through the standard parse path (NOT IsMetaRead).
+func TestParse_ResourceTailNotMistakenForMeta(t *testing.T) {
+	cases := []struct {
+		name     string
+		url      string
+		resource string
+	}{
+		{name: "core list pods", url: "/api/v1/pods", resource: "pods"},
+		{name: "core named pod", url: "/api/v1/namespaces/default/pods/p", resource: "pods"},
+		{name: "named-group list deployments", url: "/apis/apps/v1/deployments", resource: "deployments"},
+		{name: "named-group named deployment", url: "/apis/apps/v1/namespaces/default/deployments/d", resource: "deployments"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := MustParseTestURL(http.MethodGet, tc.url)
+			got, err := Parse(req)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.False(t, got.IsMetaRead, "%q is a real resource call, must NOT be IsMetaRead", tc.url)
+			assert.Equal(t, tc.resource, got.Resource)
 		})
 	}
 }

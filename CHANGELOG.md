@@ -5,6 +5,123 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #301 — kubectl OpenAPI discovery + apiserver meta paths classified as IsMetaRead (2026-05-22)
+
+UAT-2026-05-22 (Variants A + C) surfaced that every `kubectl`
+invocation through kbounce under `--profile safe-default` failed at
+step 12 with an `unclassifiable URL shape` deny. Root cause: the
+first thing kubectl does on EVERY call is hit `/openapi/v3/<group>`
+for API discovery (1.24+ default); `client-go` similarly hits
+`/api`, `/apis`, `/api/v1`, `/apis/{group}/{version}` to enumerate
+the API surface. kbounce's parser only knew about resource-shaped
+URLs (`/api/{v}/{res}/...`, `/apis/{g}/{v}/{res}/...`), so every
+discovery path returned `ErrMalformedURL` → `unclassifiable` →
+default-deny under safe-default. The UAT's "blocked Deployment
+apply" finding was actually the OpenAPI bootstrap call being
+denied, not the Deployment create.
+
+CRITICAL severity — made kbounce unusable with kubectl on
+safe-default, the very profile we recommend to most operators.
+
+**Fix shape, per `[[scorer-is-ground-truth]]`:** parser-side
+recognition of the meta-discovery URL shapes; we did NOT widen
+safe-default's `deny_verbs` carve-outs to compensate.
+
+Parser changes (`internal/parser/parser.go`):
+
+- New `ParsedRequest.IsMetaRead bool` field. Set to true when the
+  request targets a kube-apiserver meta/discovery surface rather
+  than an API resource.
+- New `classifyMetaPath(method, segments)` helper. Runs BEFORE the
+  `/api`/`/apis` segment switch. Recognizes (GET only):
+    - `/openapi/v2[/...]` and `/openapi/v3[/...]` → `meta:openapi-schema`
+    - `/api` → `meta:api-discovery`
+    - `/api/{version}` (e.g. `/api/v1`) → `meta:api-version-discovery`
+    - `/apis` → `meta:api-discovery`
+    - `/apis/{group}` and `/apis/{group}/{version}` → `meta:api-group-discovery`
+    - `/version` → `meta:version`
+    - `/healthz`, `/readyz`, `/livez`, including subprobes
+      (`/healthz/etcd`, `/readyz/poststarthook/...`) → `meta:health`
+    - `/metrics` → `meta:metrics`
+- Meta-classified requests populate `Verb=get`, `Group=""`,
+  `Resource="meta:<kind>"`, `IsMetaRead=true`, with empty
+  Namespace/Name/Subresource. The path's full RawPath is preserved
+  in the audit row.
+- Writes (POST/PUT/PATCH/DELETE) on the same prefixes stay
+  unclassifiable. Per `[[creates-never-mutates]]` the fast-path is
+  read-only; the apiserver itself 405s writes on these surfaces, so
+  refusing to widen the carve-out is the safe default.
+- The existing `/api` + `/apis` resource-tail branches tightened
+  their length checks (`< 3` for `/api`, `< 4` for `/apis`) so the
+  meta-discovery surfaces no longer leak into the resource-shape
+  parser. /api/v1/pods and /apis/apps/v1/deployments are unaffected.
+
+Proxy changes (`internal/proxy/proxy.go`):
+
+- New `SourceMetaDiscovery = "meta-discovery"` decision-source
+  constant. Surfaced on the audit row + `x-kbouncer-decision-source`
+  header so reviewers can filter discovery noise out of decision
+  queries with `WHERE decision_source != 'meta-discovery'`.
+- Short-circuit branch immediately AFTER profile evaluation: when
+  `parsed.IsMetaRead==true` and the profile abstained, the proxy
+  emits `VerdictAllow` + `SourceMetaDiscovery` + a self-describing
+  reason. Pause / task-scope / global-rule / default-policy
+  composition order is unchanged for every non-meta request.
+- The carve-out sits AFTER profile evaluation, so a custom profile
+  that adds `deny_keywords: [discovery]` (or any other layer)
+  retains hard-floor control — `IsMetaRead` is a fall-through
+  allow, not an override.
+
+Regression tests:
+
+- `internal/parser/parser_test.go`:
+    - `TestParse_MetaDiscoveryPaths` — 17 GET cases (all meta
+      shapes incl. dotted-group OpenAPI per-document URLs) +
+      24 write cases asserting writes stay unclassifiable.
+    - `TestParse_ResourceTailNotMistakenForMeta` — 4 real-resource
+      shapes (`/api/v1/pods`, `/apis/apps/v1/deployments`, etc.)
+      confirming the length-check tightening didn't swallow real
+      resource calls.
+    - `TestParse_MalformedURLs` updated to drop /healthz, /metrics,
+      /api, /api/v1, /apis/apps from the malformed set (they're
+      now meta-reads) and added /swagger.json + /foobar as the
+      residual unclassifiable shapes.
+- `internal/proxy/proxy_test.go`:
+    - `TestEvaluateRequest_MetaDiscoveryAllowedUnderSafeDefault` —
+      14 meta paths × asserts `VerdictAllow` +
+      `DecisionSource=SourceMetaDiscovery` under
+      `safe-default` profile + `DefaultPolicyDeny`. This is the
+      primary #301 closure test.
+    - `TestEvaluateRequest_MetaDiscoveryWritesStillDenied` — 4
+      methods × `/openapi/v3/api/v1` asserting writes stay
+      unclassifiable (the carve-out is read-only).
+    - `TestEvaluateRequest_RealResourceCallStillFlowsThroughProfile` —
+      2 cases confirming GET on a real resource is NOT
+      meta-discovery, and POST on a real resource is still denied
+      by safe-default with `source=profile` (the fix didn't
+      regress write protection).
+    - `TestEvaluateRequest_UnclassifiableYieldsDeny` updated to
+      use `/swagger.json` instead of `/healthz` (the latter is
+      now a meta-read).
+
+End-to-end verification: kbounce built and run as
+`run --profile safe-default --mode transparent --default-policy deny`
+pointed at a kind cluster; direct `curl` probes against all 12
+canonical meta paths (`/openapi/v3`, `/openapi/v3/api/v1`,
+`/openapi/v3/apis/apps/v1`, `/api`, `/apis`, `/api/v1`,
+`/apis/apps/v1`, `/version`, `/readyz`, `/livez`, `/metrics`,
+plus the bouncer-owned `/healthz` which is short-circuited by
+the audit-UI handler) returned `x-kbouncer-verdict: allow` +
+`x-kbouncer-decision-source: meta-discovery`. The audit log
+tail confirmed `meta-discovery / allow` for each. POST on the
+same paths returned `verdict=deny source=unclassifiable`; POST
+on `/api/v1/namespaces/default/pods` returned
+`verdict=deny source=profile`. Per
+`[[deliberate-feature-completion]]` the fix ships as one unit
+with tests + CHANGELOG + KNOWN-CAVEATS update in lockstep. Per
+`[[push-policy-public-repo]]` diff scanned for sensitive data
+before push.
+
 ### Same-class audit of ibounce #272 root-path shadowing fix (2026-05-19)
 
 Cross-product triage after the ibounce sibling fix at iam-roles

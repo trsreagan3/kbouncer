@@ -101,7 +101,11 @@ func TestEvaluateRequest_DefaultAllowFlipsVerdict(t *testing.T) {
 
 func TestEvaluateRequest_UnclassifiableYieldsDeny(t *testing.T) {
 	st := freshStore(t)
-	req := parser.MustParseTestURL(http.MethodGet, "/healthz")
+	// /healthz, /metrics, /openapi/*, /version, /api, /apis used to be
+	// "unclassifiable" before #301; they're now classified as
+	// IsMetaRead and short-circuit ALLOW. Use a truly malformed shape
+	// (unknown top-level segment) to exercise the unclassifiable path.
+	req := parser.MustParseTestURL(http.MethodGet, "/swagger.json")
 	obs := EvaluateRequest(req, st, ModeTransparent, DefaultPolicyAllow)
 
 	require.NotNil(t, obs)
@@ -109,6 +113,104 @@ func TestEvaluateRequest_UnclassifiableYieldsDeny(t *testing.T) {
 	assert.Contains(t, obs.DecisionReason, "unclassifiable")
 	// Transparent + deny → enforced
 	assert.True(t, obs.Enforced)
+}
+
+// TestEvaluateRequest_MetaDiscoveryAllowedUnderSafeDefault closes #301:
+// kubectl + client-go bootstrap by hitting OpenAPI v3 / /api / /apis /
+// /version / /healthz BEFORE issuing any real call. The proxy must
+// short-circuit these as VerdictAllow + DecisionSource=SourceMetaDiscovery
+// even when the active profile is safe-default (which previously
+// caused these to be denied as unclassifiable).
+func TestEvaluateRequest_MetaDiscoveryAllowedUnderSafeDefault(t *testing.T) {
+	st := freshStore(t)
+	profiles, err := profile.LoadProfiles("")
+	require.NoError(t, err)
+	safeDefault, err := profiles.Active(profile.SafeDefaultProfileName)
+	require.NoError(t, err)
+
+	metaPaths := []string{
+		"/openapi/v3/api/v1",                 // primary #301 repro
+		"/openapi/v3/apis/apps/v1",           // per-group OpenAPI
+		"/openapi/v2",                        // legacy schema
+		"/api",                               // core API discovery
+		"/apis",                              // group list
+		"/api/v1",                            // core resource list
+		"/apis/apps/v1",                      // group resource list
+		"/apis/rbac.authorization.k8s.io/v1", // dotted group resource list
+		"/version",                           // apiserver version
+		"/healthz",                           // health probe
+		"/healthz/etcd",                      // subprobe
+		"/readyz",                            // readiness
+		"/livez",                             // liveness
+		"/metrics",                           // prometheus
+	}
+	for _, p := range metaPaths {
+		t.Run("GET "+p, func(t *testing.T) {
+			req := parser.MustParseTestURL(http.MethodGet, p)
+			obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyDeny, safeDefault, "")
+			require.NotNil(t, obs)
+			assert.Equal(t, VerdictAllow, obs.DecisionVerdict,
+				"meta-read %q must be ALLOWED under safe-default (#301)", p)
+			assert.Equal(t, SourceMetaDiscovery, obs.DecisionSource,
+				"meta-read must be sourced from meta-discovery, not %q", obs.DecisionSource)
+			assert.False(t, obs.Enforced, "allow is never enforced as a block")
+		})
+	}
+}
+
+// TestEvaluateRequest_MetaDiscoveryWritesStillDenied confirms the
+// IsMetaRead carve-out is GET-only. POST/PUT/PATCH/DELETE on the same
+// meta prefixes stay unclassifiable so the default policy decides
+// (apiserver itself 405s these). Per [[creates-never-mutates]].
+func TestEvaluateRequest_MetaDiscoveryWritesStillDenied(t *testing.T) {
+	st := freshStore(t)
+	profiles, err := profile.LoadProfiles("")
+	require.NoError(t, err)
+	safeDefault, err := profiles.Active(profile.SafeDefaultProfileName)
+	require.NoError(t, err)
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		t.Run(method+" /openapi/v3/api/v1", func(t *testing.T) {
+			req := parser.MustParseTestURL(method, "/openapi/v3/api/v1")
+			obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyDeny, safeDefault, "")
+			require.NotNil(t, obs)
+			assert.Equal(t, VerdictDeny, obs.DecisionVerdict,
+				"writes on meta-paths must NOT fast-path through meta-discovery")
+			assert.Equal(t, SourceUnclassifiable, obs.DecisionSource)
+		})
+	}
+}
+
+// TestEvaluateRequest_RealResourceCallStillFlowsThroughProfile confirms
+// the #301 fix didn't accidentally widen the meta-discovery short-
+// circuit to cover real resource calls. A real read like GET
+// /api/v1/namespaces/default/pods must still flow through the normal
+// rule engine (here: safe-default abstains, default-policy decides).
+func TestEvaluateRequest_RealResourceCallStillFlowsThroughProfile(t *testing.T) {
+	st := freshStore(t)
+	profiles, err := profile.LoadProfiles("")
+	require.NoError(t, err)
+	safeDefault, err := profiles.Active(profile.SafeDefaultProfileName)
+	require.NoError(t, err)
+
+	t.Run("real GET pods allowed under safe-default+default-allow", func(t *testing.T) {
+		req := parser.MustParseTestURL(http.MethodGet, "/api/v1/namespaces/default/pods")
+		obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, safeDefault, "")
+		require.NotNil(t, obs)
+		assert.Equal(t, VerdictAllow, obs.DecisionVerdict)
+		assert.NotEqual(t, SourceMetaDiscovery, obs.DecisionSource,
+			"real resource call must NOT be sourced from meta-discovery")
+	})
+
+	t.Run("create privileged pod still denied under safe-default", func(t *testing.T) {
+		req := parser.MustParseTestURL(http.MethodPost, "/api/v1/namespaces/default/pods")
+		obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyDeny, safeDefault, "")
+		require.NotNil(t, obs)
+		assert.Equal(t, VerdictDeny, obs.DecisionVerdict,
+			"create on real resource must still be denied by safe-default")
+		assert.Equal(t, SourceProfile, obs.DecisionSource,
+			"safe-default profile must fire the deny; meta-discovery must not interfere")
+	})
 }
 
 func TestEvaluateRequest_CooperativeNeverEnforces(t *testing.T) {

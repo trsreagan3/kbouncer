@@ -401,6 +401,14 @@ const (
 	SourceDefault = "default"
 	// SourceUnclassifiable means the parser could not classify the URL.
 	SourceUnclassifiable = "unclassifiable"
+	// SourceMetaDiscovery means the parser identified the URL as a
+	// kube-apiserver meta/discovery read (OpenAPI schema, API-version
+	// list, /version, /healthz, /readyz, /livez, /metrics) — see
+	// parser.ParsedRequest.IsMetaRead. The proxy short-circuits these
+	// to ALLOW so kubectl + client-go bootstrap traffic doesn't get
+	// blocked under safe-default (#301). Reported in the audit row so
+	// reviewers can filter discovery noise out of decision queries.
+	SourceMetaDiscovery = "meta-discovery"
 )
 
 // DecisionSourceHeader is the HTTP response header the proxy sets on
@@ -691,6 +699,37 @@ func EvaluateRequestFull(
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
+	}
+
+	// #301: meta / discovery short-circuit. kubectl + client-go bootstrap
+	// by hitting OpenAPI schema, API-version discovery, /version,
+	// /healthz, /readyz, /livez, /metrics BEFORE issuing any resource
+	// call. The parser flags these as IsMetaRead=true (GET-only;
+	// Resource="meta:<kind>"). Without an explicit allow they fall
+	// through to the default-deny policy and every kubectl invocation
+	// fails before doing useful work.
+	//
+	// Per [[creates-never-mutates]] the carve-out is narrow: GET only,
+	// fixed prefix set in parser.classifyMetaPath. Per
+	// [[scorer-is-ground-truth]] the fix is parser-side (recognize the
+	// shape) — we do NOT widen safe-default's DenyVerbs to cover the
+	// gap. Per [[safety-mode-lean-permissive]] the call is read-only
+	// metadata; allowing it without prompting is the correct UX. The
+	// profile check above still runs first so a custom profile that
+	// adds e.g. `deny_keywords: [meta]` keeps full control — IsMetaRead
+	// is a fall-through allow, not a hard override.
+	if parsed.IsMetaRead {
+		obs.DecisionVerdict = VerdictAllow
+		obs.DecisionReason = fmt.Sprintf(
+			"meta/discovery read (%s): kube-apiserver bootstrap surface "+
+				"(OpenAPI / version / health / metrics / api-group discovery)",
+			parsed.Resource)
+		obs.DecisionSource = SourceMetaDiscovery
+		obs.Enforced = false
+		decisionID := writeDecision(st, obs, activePause, agentInfo)
+		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
+		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+		return obs
 	}
 
 	// K-Slice 3: build the request view the rule + task engines consume.

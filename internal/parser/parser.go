@@ -31,6 +31,25 @@
 //	  /apis/{group}/{version}/namespaces/{ns}/{resource}/{name}         namespaced named
 //	  /apis/{group}/{version}/namespaces/{ns}/{resource}/{name}/{sub}   subresource
 //
+//	Apiserver meta / discovery (GET-only, no resource-set; flagged
+//	IsMetaRead=true so the proxy can short-circuit to ALLOW under any
+//	profile that doesn't already enumerate them). #301:
+//	  /openapi/v2[/...]            OpenAPI v2 schema (kubectl + client-go bootstrap)
+//	  /openapi/v3[/...]            OpenAPI v3 schema (kubectl 1.24+ default; per-group document)
+//	  /api                         core-API version list
+//	  /apis                        named-group list
+//	  /api/{version}               core-API resource list (e.g. /api/v1)
+//	  /apis/{group}/{version}      named-group resource list (no /{resource} tail)
+//	  /version                     apiserver build/version info
+//	  /healthz, /readyz, /livez    health/readiness probes (kubelet + load balancers)
+//	  /healthz/*, /readyz/*, /livez/* subprobe paths (etcd, scheduler, etc.)
+//	  /metrics                     Prometheus exposition (apiserver internal metrics)
+//
+//	These are populated with Verb="get", Group="", Resource="meta:<kind>",
+//	IsMetaRead=true. ONLY GET is accepted; POST/PUT/PATCH/DELETE on any
+//	of these prefixes returns ErrMalformedURL so the default policy
+//	decides (apiserver itself would 405 the write).
+//
 // Verb inference combines HTTP method + URL shape + query params:
 //
 //	GET    /resource              → list
@@ -165,6 +184,32 @@ type ParsedRequest struct {
 	// derived. The proxy combines both signals when recording the
 	// audit row.
 	StreamKind string
+
+	// IsMetaRead is true when the request targets a kube-apiserver
+	// meta/discovery surface (OpenAPI schemas, API-version + group
+	// discovery, server version, health/readiness/liveness probes,
+	// Prometheus /metrics) rather than a Kubernetes API resource.
+	// These are bootstrap reads kubectl + client-go issue BEFORE any
+	// real operation; denying them blocks every kubectl call before it
+	// can do useful work (#301).
+	//
+	// When IsMetaRead=true:
+	//   - Verb is "get" (HTTP GET only — POST/PUT/PATCH/DELETE on any
+	//     meta path returns ErrMalformedURL so the default policy
+	//     decides; apiserver itself 405s the write anyway)
+	//   - Group is "" (server-internal; not part of any API group)
+	//   - Resource is "meta:<kind>" — e.g. "meta:openapi-schema",
+	//     "meta:api-discovery", "meta:api-group-discovery",
+	//     "meta:version", "meta:health", "meta:metrics"
+	//   - Namespace / Name / Subresource are "" (no resource targeting)
+	//
+	// The proxy short-circuits to ALLOW under any active profile
+	// (safe-default included) because these surfaces carry no resource
+	// data + no mutating capability. Per [[creates-never-mutates]]
+	// the carve-out is narrow: GET method + exact-prefix match against
+	// the metaPathKinds table; everything else still flows through the
+	// standard rule engine.
+	IsMetaRead bool
 }
 
 // ErrMalformedURL is returned by [Parse] when the request URL does not
@@ -208,10 +253,31 @@ func Parse(r *http.Request) (*ParsedRequest, error) {
 	}
 	segments := strings.Split(trimmed, "/")
 
+	// #301: meta / discovery surfaces (OpenAPI, version, healthz, metrics,
+	// API-group discovery). kubectl + client-go hit these BEFORE any
+	// resource call — denying them blocked every kubectl invocation under
+	// safe-default. Fast-path them as Verb=get + Resource="meta:<kind>" so
+	// the rest of the evaluator treats them as read-only metadata. GET
+	// only; writes are ErrMalformedURL (apiserver 405s them too).
+	if kind, ok := classifyMetaPath(method, segments); ok {
+		out.Verb = "get"
+		out.Group = ""
+		out.Resource = "meta:" + kind
+		out.IsMetaRead = true
+		// Discovery URLs don't honor ?watch / ?dryRun; skip the query
+		// parsing branch below by returning here. Method is already on
+		// the struct; RawPath captured the query string for the audit
+		// log either way.
+		return out, nil
+	}
+
 	switch segments[0] {
 	case "api":
-		// Core API: /api/{version}/...
-		if len(segments) < 2 {
+		// Core API: /api/{version}/{resource}...
+		// /api alone + /api/{version} alone (no /{resource} tail) are
+		// API-version + resource-list discovery — handled above as
+		// IsMetaRead. Anything reaching this branch HAS a resource tail.
+		if len(segments) < 3 {
 			return nil, ErrMalformedURL
 		}
 		out.Group = "" // core
@@ -220,8 +286,10 @@ func Parse(r *http.Request) (*ParsedRequest, error) {
 			return nil, err
 		}
 	case "apis":
-		// Named API group: /apis/{group}/{version}/...
-		if len(segments) < 3 {
+		// Named API group: /apis/{group}/{version}/{resource}...
+		// /apis alone + /apis/{group}/{version} alone (no /{resource}
+		// tail) are group-discovery — handled above as IsMetaRead.
+		if len(segments) < 4 {
 			return nil, ErrMalformedURL
 		}
 		out.Group = segments[1]
@@ -230,10 +298,8 @@ func Parse(r *http.Request) (*ParsedRequest, error) {
 			return nil, err
 		}
 	default:
-		// Other apiserver endpoints (/healthz, /metrics, /openapi/v2, /version)
-		// are not resource calls — the proxy treats them as opaque and
-		// forwards under a special "discovery" rule class. Slice 1 just
-		// flags them malformed so the default policy decides.
+		// Anything else (no /api or /apis prefix and not a recognized
+		// meta path) is unclassifiable; the default policy decides.
 		return nil, ErrMalformedURL
 	}
 
@@ -451,6 +517,97 @@ func isTruthy(s string) bool {
 		return true
 	}
 	return false
+}
+
+// classifyMetaPath inspects the request's method + path segments and
+// returns the meta-path kind (e.g. "openapi-schema", "api-discovery",
+// "version", "health", "metrics") when the request targets a known
+// kube-apiserver meta surface AND uses GET. Returns ("", false) for
+// everything else.
+//
+// Closes #301: kubectl + client-go bootstrap by hitting these surfaces
+// BEFORE any resource call (OpenAPI v3 schema discovery, API-version
+// list, group-resource discovery). Treating them as ErrMalformedURL
+// blocked every kubectl invocation under safe-default.
+//
+// Per [[creates-never-mutates]] the carve-out is narrow:
+//
+//   - GET method only. Any other method (POST/PUT/PATCH/DELETE) is left
+//     unclassifiable so the default policy decides. The apiserver
+//     itself 405s writes on every one of these surfaces, so refusing
+//     to fast-path them is the safe default.
+//   - Exact segment-prefix match against a static table. No wildcards,
+//     no regex, no recursive matching that could be tricked by a
+//     CRD whose plural happens to be "openapi" or "version".
+//   - Discovery paths with /api or /apis prefix only count when the
+//     length is short enough that there's no /{resource} tail (e.g.
+//     "/api/v1" yes; "/api/v1/pods" no — that's a resource list).
+//
+// kinds map to the "meta:<kind>" Resource value the parser writes so
+// audit-log readers can filter "show me only the meta-reads" with a
+// single LIKE 'meta:%' query.
+func classifyMetaPath(method string, segments []string) (string, bool) {
+	if method != http.MethodGet {
+		// Apiserver only serves these as reads; writes 405 upstream.
+		// Refuse to fast-path so the default policy decides on writes.
+		return "", false
+	}
+	if len(segments) == 0 {
+		return "", false
+	}
+	switch segments[0] {
+	case "openapi":
+		// /openapi/v2[/...] or /openapi/v3[/...] — apiserver schema
+		// discovery. kubectl 1.24+ requests per-group v3 documents
+		// (e.g. /openapi/v3/apis/apps/v1) BEFORE any apply. Length >= 2
+		// because /openapi alone is not a real apiserver surface (the
+		// server 404s it); we still recognize it as a meta-read so we
+		// don't surface a confusing unclassifiable verdict to an
+		// operator who pastes the path manually.
+		return "openapi-schema", true
+	case "version":
+		// /version — apiserver build/version info. Single-segment
+		// only; /version/foo is not real.
+		if len(segments) == 1 {
+			return "version", true
+		}
+		return "", false
+	case "healthz", "readyz", "livez":
+		// /healthz, /readyz, /livez and subprobes (e.g. /healthz/etcd,
+		// /readyz/poststarthook/start-kube-apiserver-admission-initializer).
+		// kubelet + load balancers + monitoring scrape these.
+		return "health", true
+	case "metrics":
+		// /metrics — Prometheus exposition. Single segment only.
+		if len(segments) == 1 {
+			return "metrics", true
+		}
+		return "", false
+	case "api":
+		// /api → core-API version list.
+		// /api/{version} → core-API resource list (e.g. /api/v1).
+		// Anything longer has a resource tail; that's NOT a meta read.
+		switch len(segments) {
+		case 1:
+			return "api-discovery", true
+		case 2:
+			return "api-version-discovery", true
+		}
+		return "", false
+	case "apis":
+		// /apis → group list.
+		// /apis/{group} → group versions list (e.g. /apis/apps).
+		// /apis/{group}/{version} → group-resource list (e.g. /apis/apps/v1).
+		// Anything longer has a resource tail.
+		switch len(segments) {
+		case 1:
+			return "api-discovery", true
+		case 2, 3:
+			return "api-group-discovery", true
+		}
+		return "", false
+	}
+	return "", false
 }
 
 // MustParseTestURL is a tiny test helper that builds an *http.Request
