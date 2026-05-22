@@ -5,6 +5,47 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Changed
+
+### BREAKING — §A21 / [[discovery-first-default]] — default flips to DISCOVERY MODE — Shipped 2026-05-22
+
+Per the role-effectiveness eval at
+`iam-roles/tests/dogfood/role-effectiveness-grades.md`, kbouncer's v1.0
+safe-default landed at 0% hit-rate against the 50% launch bar: both K1
+(`rollout restart` PATCH) and K3 (`apply Deployment`) were NEGATIVE-VALUE
+(legit DevOps refused alongside adversarial actions), and K2
+(secret-pivot via `kubectl get secret -A`) was THEATER. gbounce alone
+hit 66.7% with deny_hosts + MITM URL+method primitives — operator-set
+OPT-IN denies, not blanket safe-defaults.
+
+The pivot flips kbouncer's runtime default to match: observe + audit +
+pass-through (the `full-user` profile, which is already the default when
+no `--profile` is set). Named profiles (`safe-default` + any custom)
+stay first-class via explicit opt-in (`kbounce run --profile <name>` or
+`export KBOUNCER_PROFILE=<name>`).
+
+- **internal/cli/cli.go (banner):** headline banner now surfaces
+  `default_mode=discovery|profile` alongside mode + default-policy +
+  profile. Discovery fires when `activeProfile.Name` is empty,
+  `full-user`, or the legacy `none` alias. The "no profile selected"
+  block expands to explicitly name discovery mode (the canonical
+  cross-product term) + frame as audit transparency per
+  `[[security-team-positioning-safety-not-surveillance]]`.
+- **No code path lost:** safe-default profile, OCSF audit, recommender,
+  agent attribution (#318/#320), kubectl meta-discovery (#301) all
+  continue to fire as before. The change is which DEFAULT rule layer
+  is active out of the box. K8s API pass-through verified against the
+  dogfood kind cluster.
+
+**BREAKING-CHANGE for operators upgrading from pre-pivot v1.0 builds**
+that auto-applied or framed `safe-default` as the v1.0 default.
+Fresh installs + upgrades now land in discovery mode by default. To
+keep pre-pivot behavior pin `kbounce run --profile safe-default` or
+`export KBOUNCER_PROFILE=safe-default` in your shell rc. See
+`iam-roles/docs/PROFILE-UPGRADE.md` + iam-roles KNOWN-CAVEATS §A21 for
+the cross-product upgrade path; the re-graded corpus lives at
+`iam-roles/tests/dogfood/role-effectiveness-grades-post-pivot.md`.
+
 ### #321 / §A19 — `kbounce profile doctor` upgrade-blindness fix — Shipped 2026-05-22
 
 Cross-product fix for silent profile-upgrade-blindness across the

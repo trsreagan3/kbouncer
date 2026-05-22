@@ -28,16 +28,25 @@ go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest
 
 Then:
 
-```sh
-# Default run: cooperative mode, no profile (passthrough), audit-only.
-# Banner reminds you about --profile safe-default for the deny layer.
-kbounce run
+### First 60 seconds with kbounce (discovery mode default)
 
-# Opt into the safe-default safety net:
-kbounce run --profile safe-default
+Per `[[discovery-first-default]]` (2026-05-22) + iam-roles KNOWN-CAVEATS
+§A21 the canonical shape is **discovery mode** — observe + audit +
+pass-through. Closes the K1/K3 NEGATIVE-VALUE failures from the
+role-effectiveness eval where the pre-pivot safe-default-as-default
+blocked legit DevOps (`rollout restart`, `apply Deployment`) alongside
+adversarial actions.
+
+```sh
+# Default run: discovery mode (no profile applied; calls forwarded + audit-logged).
+# Headline banner reports default_mode=discovery; full OCSF event stream operates as usual.
+kbounce run --upstream https://<your-cluster-api>:6443
+
+# Opt into the safe-default safety net (the pre-pivot behavior):
+kbounce run --profile safe-default --upstream ...
 # Or, persistent for your shell:
 export KBOUNCER_PROFILE=safe-default
-kbounce run
+kbounce run --upstream ...
 ```
 
 ### After upgrade: `kbounce profile doctor` (one-time)

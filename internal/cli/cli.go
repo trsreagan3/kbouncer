@@ -612,9 +612,22 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			if cfg.TLSCertPath != "" {
 				scheme = "https"
 			}
+			// [[discovery-first-default]] (2026-05-22): surface
+			// default_mode (discovery|profile) on the headline banner
+			// so operators immediately see the operating shape. discovery
+			// = no profile selected (full-user); profile = operator
+			// explicitly picked a named profile via --profile NAME or
+			// KBOUNCER_PROFILE env var. Cross-product parity with
+			// ibounce + dbounce + gbounce per [[cross-product-agent-
+			// parity]].
+			defaultModeLabel := "discovery"
+			if activeProfile != nil && activeProfile.Name != "" &&
+				activeProfile.Name != "full-user" && activeProfile.Name != "none" {
+				defaultModeLabel = "profile"
+			}
 			fmt.Fprintf(os.Stderr,
-				"kbounce proxy starting on %s://%s:%d (mode=%s, default-policy=%s, profile=%s)\n",
-				scheme, cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name)
+				"kbounce proxy starting on %s://%s:%d (mode=%s, default-policy=%s, profile=%s, default_mode=%s)\n",
+				scheme, cfg.Host, cfg.Port, cfg.Mode, cfg.DefaultPolicy, activeProfile.Name, defaultModeLabel)
 			// #254 — preset-derivation banner sits RIGHT AFTER the
 			// address line so the operator immediately sees which
 			// settings came from the preset. Same format across all
@@ -698,14 +711,27 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				fmt.Fprintln(os.Stderr,
 					"upstream: <none> — observation-only mode; no kubectl traffic will reach an apiserver")
 			}
-			// Default-profile guidance banner per [[bounce-default-profile-pattern]]:
-			// when the operator didn't explicitly opt into a profile,
-			// print a one-line reminder that they're in passthrough mode
-			// + the two ways to opt into readonly.
+			// [[discovery-first-default]] (2026-05-22): banner copy
+			// explicitly names this DISCOVERY MODE (the canonical
+			// cross-product term) — observe + audit + pass-through.
+			// Named profiles (e.g. safe-default) stay first-class via
+			// `--profile NAME` opt-in. Per [[security-team-positioning-
+			// safety-not-surveillance]]: framed as audit transparency
+			// NOT "we're not enforcing anything." Closes the K1/K3
+			// NEGATIVE-VALUE failures from the 2026-05-22 role-
+			// effectiveness eval — see KNOWN-CAVEATS §A21.
 			if !profileFromFlag && os.Getenv(envProfileVar) == "" {
 				fmt.Fprintln(os.Stderr,
-					"profile: no profile selected; calls forwarded as-is + audit-logged. "+
-						"To block write/destructive verbs + privilege primitives, "+
+					"profile: no profile selected.")
+				fmt.Fprintln(os.Stderr,
+					"  default mode: discovery — observing all requests, denying none.")
+				fmt.Fprintln(os.Stderr,
+					"    every kubectl call is parsed, audit-logged, and forwarded "+
+						"verbatim to the apiserver.")
+				fmt.Fprintln(os.Stderr,
+					"    full OCSF event stream + recommender operate as usual.")
+				fmt.Fprintln(os.Stderr,
+					"    To block write/destructive verbs + privilege primitives, "+
 						"run with --profile safe-default OR "+
 						"`export KBOUNCER_PROFILE=safe-default` in your shell rc.")
 			}
