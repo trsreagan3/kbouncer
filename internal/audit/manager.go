@@ -93,6 +93,12 @@ type Status struct {
 	// here keeps the MCP audit-export status surface unified.
 	SecurityLake SecurityLakeStatus `json:"security_lake"`
 
+	// #317 — object-storage NDJSON writer state. Nested status is the
+	// same shape ObjectStorageWriter.Status() returns; embedding it
+	// here keeps the MCP audit-export status surface unified across
+	// the parquet + NDJSON variants.
+	ObjectStorage ObjectStorageStatus `json:"object_storage"`
+
 	// AuditExportHealthy is the AGGREGATE health verdict surfaced to
 	// /healthz + the `kbounce audit-export health` CLI subcommand.
 	// True when every configured export channel (log + webhook +
@@ -154,6 +160,11 @@ type Manager struct {
 	// the operator's S3 bucket in the Security-Lake-compatible
 	// partition layout.
 	securityLake *SecurityLakeWriter
+	// #317 — optional cloud-neutral S3-compat NDJSON object-storage
+	// writer. Nil disables this channel. When wired, every event is
+	// also buffered + finalized into the operator-owned bucket per
+	// the Hive-partitioned NDJSON.gz layout.
+	objectStorage *ObjectStorageWriter
 	// #285 — optional per-session NDJSON recorder. Nil disables this
 	// channel. When wired, every event is teed to
 	// {dir}/{session_id}.ndjson so the cross-product replay CLI can
@@ -180,8 +191,9 @@ type ManagerOptions struct {
 	// both passed at the same time but the Manager defensively skips
 	// the single-webhook on every emit anyway).
 	RoutesEngine       *RoutesEngine
-	SecurityLakeWriter *SecurityLakeWriter
-	SessionRecorder    *SessionRecorder
+	SecurityLakeWriter  *SecurityLakeWriter
+	ObjectStorageWriter *ObjectStorageWriter
+	SessionRecorder     *SessionRecorder
 }
 
 // NewManager constructs a Manager with the given (possibly nil)
@@ -190,11 +202,12 @@ type ManagerOptions struct {
 // confirm the proxy was actually called.
 func NewManager(opts ManagerOptions) *Manager {
 	return &Manager{
-		log:          opts.LogWriter,
-		webhook:      opts.WebhookPusher,
-		routes:       opts.RoutesEngine,
-		securityLake: opts.SecurityLakeWriter,
-		recorder:     opts.SessionRecorder,
+		log:           opts.LogWriter,
+		webhook:       opts.WebhookPusher,
+		routes:        opts.RoutesEngine,
+		securityLake:  opts.SecurityLakeWriter,
+		objectStorage: opts.ObjectStorageWriter,
+		recorder:      opts.SessionRecorder,
 	}
 }
 
@@ -224,6 +237,13 @@ func (m *Manager) Emit(ctx context.Context, ev Event) {
 	// an unreachable bucket never blocks the hot path.
 	if m.securityLake != nil {
 		m.securityLake.Write(ctx, ev)
+	}
+	// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
+	// Synchronous in-memory append; the background rotator handles
+	// finalize uploads. Fail-soft so an unreachable bucket never
+	// blocks the hot path.
+	if m.objectStorage != nil {
+		m.objectStorage.Write(ctx, ev)
 	}
 	// #285 — per-session NDJSON tee. Fail-soft inside Record.
 	if m.recorder != nil {
@@ -276,6 +296,9 @@ func (m *Manager) Status() Status {
 	}
 	if m.securityLake != nil {
 		s.SecurityLake = m.securityLake.Status()
+	}
+	if m.objectStorage != nil {
+		s.ObjectStorage = m.objectStorage.Status()
 	}
 	if m.heartbeater != nil && m.heartbeater.interval > 0 {
 		s.HeartbeatEnabled = true
@@ -395,6 +418,12 @@ func (m *Manager) Close() {
 	// in-memory rows.
 	if m.securityLake != nil {
 		m.securityLake.Close()
+	}
+	// #317 — object-storage teardown finalizes the active NDJSON
+	// buffer synchronously (per the spec) so a clean shutdown
+	// doesn't drop in-memory rows.
+	if m.objectStorage != nil {
+		m.objectStorage.Close()
 	}
 	// #285 — recorder shutdown atomic-renames every still-open
 	// session's .partial -> .ndjson. SIGKILL-leftover .partials are
