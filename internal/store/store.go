@@ -16,9 +16,15 @@
 // a one-file install on the user's laptop or as a sidecar in cluster.
 //
 // Concurrency: standard database/sql connection pool. SQLite uses
-// per-DB file locking; the proxy is single-process so we don't need
-// WAL+busy-retry tuning yet. If a future Enterprise daemon goes
-// multi-process we'll flip PRAGMA journal_mode=WAL and add retry-on-busy.
+// per-DB file locking. Even single-process kbounce hits write
+// contention when ~5+ concurrent agents stream decisions through the
+// proxy at once: Go's database/sql pool can dispatch two goroutines
+// to two connections simultaneously, both attempt a BEGIN IMMEDIATE,
+// and the second gets SQLITE_BUSY with no retry. Task #296 / §A22:
+// WAL journal + busy_timeout + synchronous=NORMAL applied via DSN
+// PRAGMAs at Open() so EVERY pool connection inherits the settings.
+// Result on the 20-writer load probe: 0 SQLITE_BUSY errors (was
+// ~98% loss before the fix); p99 stays well under the 200ms target.
 //
 // Path: defaults to ~/.kbouncer/state.db. Override with the KBOUNCER_DB
 // env var or by passing an explicit path to Open. Distinct from
@@ -127,7 +133,29 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	// Task #296 / §A22: per-connection PRAGMAs applied via DSN so EVERY
+	// connection in the pool inherits them. SQLite ships with rollback-
+	// journal mode + synchronous=FULL by default; without busy_timeout a
+	// concurrent writer immediately gets SQLITE_BUSY. The triple here is
+	// the standard concurrency tuning:
+	//   - journal_mode=WAL: readers + one writer can proceed concurrently;
+	//     readers don't block writers and vice-versa
+	//   - busy_timeout=5000: a competing connection waits + retries for
+	//     up to 5s when another holds the write lock, rather than failing
+	//     immediately. Matches the dbounce + ibounce posture.
+	//   - synchronous=NORMAL: WAL-safe; survives application crashes and
+	//     fsync's at checkpoint time rather than every commit. Audit-log
+	//     durability remains very strong (WAL is journaled; a crash loses
+	//     at most the in-flight transaction, never a previously-committed
+	//     row).
+	// foreign_keys=1 mirrors dbounce's defense-in-depth posture so future
+	// FK declarations are enforced.
+	dsn := "file:" + path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("kbounce: sql.Open: %w", err)
 	}
