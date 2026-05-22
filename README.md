@@ -182,6 +182,12 @@ Start the HTTP proxy. The most-used flags:
   `docs/DEPLOYMENT-PRESETS.md` for the framework + override
   semantics; same preset NAME ships across all four Bounce products.
 
+For the full "where do my audit logs go in production" decision tree
+(JSONL / webhook + presets / Security Lake / Lambda → S3 / GCP / Azure
+/ CI runners / Enterprise fan-out) see the cross-product runbook in the
+iam-roles repo:
+[docs/PRODUCTION-LOG-STORAGE.md](https://github.com/trsreagan3/iam-roles/blob/main/docs/PRODUCTION-LOG-STORAGE.md).
+
 ### `kbounce init-tls`
 
 One-time setup. Writes `ca.crt` / `ca.key` / `server.crt` / `server.key`
