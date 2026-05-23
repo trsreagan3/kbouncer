@@ -134,6 +134,13 @@ jobs:
           # loopback per kbounce's threat-model gate. --upstream is a
           # placeholder URL — cooperative mode never actually forwards
           # /healthz requests upstream (health is served locally).
+          #
+          # --audit-events-token is ALSO mandatory when --host is non-
+          # loopback (binding 0.0.0.0 inside the container is needed so
+          # the docker bridge can forward host requests in). The smoke
+          # isn't exercising /audit/events; we just need a value that
+          # satisfies the gate. Random hex is fine for a throwaway run.
+          SMOKE_TOKEN="$(openssl rand -hex 16)"
           docker run -d --name kb-smoke \
             -p 18766:8766 \
             -v "${DATA_DIR}:/home/nonroot/.kbouncer" \
@@ -143,6 +150,7 @@ jobs:
               --port 8766 \
               --i-know-this-binds-externally \
               --mode cooperative \
+              --audit-events-token "${SMOKE_TOKEN}" \
               --upstream https://kubernetes.default.svc
 
           # Wait for the proxy to come up + answer /healthz. 30s ceiling
