@@ -49,6 +49,7 @@ import (
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/rules"
 	"github.com/trsreagan3/kbouncer/internal/store"
+	"github.com/trsreagan3/kbouncer/internal/structureddeny"
 	"github.com/trsreagan3/kbouncer/internal/tasks"
 	"github.com/trsreagan3/kbouncer/internal/upstream"
 )
@@ -2305,6 +2306,27 @@ func writeK8sForbidden(w http.ResponseWriter, obs *RequestObservation) {
 	w.Header().Set(VerdictHeader, obs.DecisionVerdict)
 	w.Header().Set("x-kbouncer-mode", obs.ModeAtDecision)
 	w.WriteHeader(http.StatusForbidden)
+
+	// #459 / §A57b — merge the structured-deny payload (built by the
+	// internal structureddeny package, the Go port of the Python
+	// iam_jit.structured_deny module) into the wire body. Per
+	// [[creates-never-mutates]] the existing K8s-Status-shaped fields
+	// (kind / apiVersion / metadata / status / message / reason /
+	// details / code) are PRESERVED unchanged so kubectl + client-go
+	// keep parsing the body natively; the structured-deny fields are
+	// additive. Per [[cross-product-agent-parity]] the wire field
+	// names match Python ibounce exactly so an agent can grep either
+	// bouncer's 403 with the same jq query.
+	deny := structureddeny.Build(structureddeny.BuildOptions{
+		Bouncer:               "kbouncer",
+		Action:                kbouncerStructuredDenyAction(obs),
+		Resource:              kbouncerStructuredDenyResource(obs),
+		DenyReason:            obs.DecisionReason,
+		DenySource:            kbouncerStructuredDenySource(obs),
+		RuleIDIfDynamic:       obs.DynamicDenyRuleID,
+		SuggestedAllowCommand: kbouncerSuggestedAllowCommand(obs),
+	})
+
 	body := map[string]any{
 		"kind":       "Status",
 		"apiVersion": "v1",
@@ -2321,10 +2343,109 @@ func writeK8sForbidden(w http.ResponseWriter, obs *RequestObservation) {
 			"kbouncer_namespace":       obs.ParsedNamespace,
 		},
 		"code": 403,
+		// #459 — structured-deny additive fields per
+		// [[ambient-value-prop-and-friction-framing]] +
+		// [[cross-product-agent-parity]].
+		"caught_by_bouncer":                  deny.CaughtByBouncer,
+		"is_likely_injection_classification": deny.IsLikelyInjectionClassification,
+		"suggested_allow_command":            deny.SuggestedAllowCommand,
+		"recommended_action":                 deny.RecommendedAction,
+		"deny_event_id":                      deny.DenyEventID,
+		"classifier_hook":                    deny.ClassifierHook,
+		"deny_source_classified":             deny.DenySourceClassified,
+		"structured_deny_schema_version":     deny.StructuredDenySchemaVersion,
 	}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
 		log.Warn().Err(err).Msg("kbounce: encode forbidden response failed")
 	}
+}
+
+// kbouncerStructuredDenyAction builds the kbouncer-shaped action
+// "<group>/<resource>:<verb>" used by the structureddeny heuristic.
+// Falls back to the verb alone when no group/resource is parsed.
+func kbouncerStructuredDenyAction(obs *RequestObservation) string {
+	verb := obs.ParsedVerb
+	resource := obs.ParsedResource
+	group := obs.ParsedGroup
+	if resource == "" && verb == "" {
+		return ""
+	}
+	var head string
+	switch {
+	case group != "" && resource != "":
+		head = group + "/" + resource
+	case resource != "":
+		head = resource
+	default:
+		return verb
+	}
+	if verb == "" {
+		return head
+	}
+	return head + ":" + verb
+}
+
+// kbouncerStructuredDenyResource builds the kbouncer-shaped resource
+// identifier ("<namespace>/<name>" / "<namespace>" / "<name>" / "").
+func kbouncerStructuredDenyResource(obs *RequestObservation) string {
+	switch {
+	case obs.ParsedNamespace != "" && obs.ParsedName != "":
+		return obs.ParsedNamespace + "/" + obs.ParsedName
+	case obs.ParsedNamespace != "":
+		return obs.ParsedNamespace
+	default:
+		return obs.ParsedName
+	}
+}
+
+// kbouncerStructuredDenySource maps kbouncer's DecisionSource +
+// DenySource onto the Python deny_source enum the structureddeny
+// package understands. Keeps the wire-level deny_source_classified
+// stable across the Python+Go bouncers per [[cross-product-agent-parity]].
+func kbouncerStructuredDenySource(obs *RequestObservation) string {
+	if obs.DenySource == "dynamic" {
+		return "dynamic_deny"
+	}
+	switch obs.DecisionSource {
+	case SourceProfile:
+		return "static_profile"
+	case SourceTask:
+		return "task_scope"
+	case SourceGlobal:
+		return "global_scope"
+	case SourceDefault:
+		return "safe_default"
+	case SourceUnclassifiable:
+		return "unclassifiable"
+	}
+	if obs.DecisionSource != "" {
+		return obs.DecisionSource
+	}
+	return "unknown"
+}
+
+// kbouncerSuggestedAllowCommand synthesizes the one-line `kbounce
+// profile allow ...` command the agent SHOULD prompt the operator to
+// run if the deny looks legitimate. When the deny is a dynamic-deny
+// rule the command starts with `#` so DeriveRecommendedAction routes
+// to rephrase+retry (dynamic-deny rules aren't allow-able from the
+// CLI; the operator has to edit the rule file).
+func kbouncerSuggestedAllowCommand(obs *RequestObservation) string {
+	if obs.DenySource == "dynamic" {
+		return "# dynamic-deny rule " + obs.DynamicDenyRuleID +
+			" — edit the dynamic-deny YAML to allow this; rephrase+retry"
+	}
+	action := kbouncerStructuredDenyAction(obs)
+	if action == "" {
+		return ""
+	}
+	target := kbouncerStructuredDenyResource(obs)
+	if target == "" {
+		target = "*"
+	}
+	return "kbounce profile allow --target " + target +
+		" --action " + action +
+		" --reason '<why is this safe?>'"
 }
 
 // writeHostMismatch refuses with 403 + x-kbouncer-refusal=
