@@ -407,6 +407,23 @@ func ToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name": "kbounce_posture",
+			"description": "Return kbounce's local posture: running / port / " +
+				"mode / active-profile / KUBECONFIG wiring / MISCONFIG flag. " +
+				"Read-only single-bouncer view; for the cross-product view " +
+				"(all 4 bouncers + iam-jit role state + per-traffic-class " +
+				"effective protection) use the `iam_jit_posture` tool from " +
+				"the iam-jit MCP server. Per [[cross-product-agent-parity]] " +
+				"every Bounce ships this same shape. Per " +
+				"[[ibounce-honest-positioning]] reports MISCONFIGURED rather " +
+				"than silently claiming intercept when env wiring + process " +
+				"state disagree.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			"name": "kbounce_pending_sync_prompts",
 			"description": "List the pending_prompts rows that the " +
 				"running proxy is CURRENTLY blocked on waiting for an " +

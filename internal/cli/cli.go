@@ -142,6 +142,13 @@ func newRootCmd() *cobra.Command {
 	// retention surface. Ships in lockstep with the sibling products
 	// + the cross-product runbook at iam-roles/docs/LOG-RETENTION.md.
 	root.AddCommand(newLogsCmd())
+	// #383 / §A42 — `kbounce posture` per-bouncer posture surface.
+	// Cross-product parity command per [[cross-product-agent-parity]];
+	// every Bounce (ibounce/kbounce/dbounce/gbounce) ships the same
+	// `<bouncer> posture` shape so an operator's muscle memory works
+	// across protocols. For the cross-product roll-up use
+	// `iam-jit posture` from iam-roles.
+	root.AddCommand(newPostureCmd())
 	return root
 }
 

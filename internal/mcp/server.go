@@ -58,6 +58,7 @@ import (
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/parser"
+	"github.com/trsreagan3/kbouncer/internal/posture"
 	"github.com/trsreagan3/kbouncer/internal/presets"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
@@ -448,8 +449,30 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolAuditExportStatus(args)
 	case "list_audit_webhook_presets":
 		return s.toolListAuditWebhookPresets(args)
+	case "kbounce_posture":
+		return s.toolPosture(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
+}
+
+// toolPosture surfaces kbounce's local posture (running / mode /
+// profile / KUBECONFIG wiring / MISCONFIG). Read-only; takes no
+// arguments; never makes a Kubernetes API call. Mirrors the
+// `kbounce posture --json` CLI output schema. #383 / §A42.
+func (s *Server) toolPosture(_ map[string]any) (map[string]any, error) {
+	block := posture.Capture()
+	// Marshal -> map[string]any so the existing JSON-RPC writer
+	// emits the same shape the CLI's `--json` does (json tags
+	// drive both paths).
+	bs, err := json.Marshal(block)
+	if err != nil {
+		return nil, fmt.Errorf("posture: marshal: %w", err)
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(bs, &out); err != nil {
+		return nil, fmt.Errorf("posture: unmarshal: %w", err)
+	}
+	return out, nil
 }
 
 // toolAuditExportStatus surfaces the runtime counters for the
