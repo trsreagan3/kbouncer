@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1932,23 +1933,33 @@ func newProfileInstallCmd() *cobra.Command {
 		auditLogPath   string
 	)
 	cmd := &cobra.Command{
-		Use:   "install --from URL [--sha256 HEX] [--force] [--timeout 10]",
-		Short: "Fetch + install profiles from an HTTPS URL",
-		Long: `Fetch a profiles.yaml fragment from an HTTPS URL and install
-the profiles it contains. Composes with the enterprise-profile-
-distribution onboarding pattern: IT teams publish curated profiles
-at an internal URL, and engineers install them on day 1.
+		Use:   "install --from URL_OR_PATH [--sha256 HEX] [--force] [--timeout 10]",
+		Short: "Fetch + install profiles from a URL or local path",
+		Long: `Install profiles from any of:
 
-  kbounce profile install --from https://internal.example/profiles.yaml
+  * an HTTPS URL — preferred + recommended distribution channel
+    (IT teams publish curated profiles at an internal URL, engineers
+    install them on day 1).
 
-The fetched URL becomes the ` + "`source`" + ` of each installed profile.
-Profiles with a non-local source are READ-ONLY at the CLI surface —
-engineers cannot edit them to bypass org guardrails (the canonical
-write entry point, UpsertProfile, refuses to overwrite them).
+      kbounce profile install --from https://internal.example/profiles.yaml
 
-HTTPS-only: http:// URLs are refused because plaintext distribution
-is MITM-substitutable. IT teams should ALSO pin --sha256 in their
-onboarding docs to defend against a compromised distribution server.
+  * an HTTP URL — accepted for local-dev parity with the
+    audit-export HTTP surface. A one-line WARN fires for non-
+    loopback hosts; loopback gets a silent pass.
+
+  * file:///abs/path/...  or a bare local path (relative or
+    absolute) — accepts a single YAML file OR a bundle directory
+    produced by ` + "`iam-jit profile generate-from-audit`" + `; the
+    directory form looks for ` + "`kbounce.yaml`" + ` first then
+    falls back to ` + "`index.yaml`" + ` + the bouncer entry naming
+    kbounce.
+
+      kbounce profile install --from ./profiles/
+
+The source string becomes the ` + "`source`" + ` of each installed
+profile. Profiles with a non-local source are READ-ONLY at the CLI
+surface — engineers cannot edit them to bypass org guardrails (the
+canonical write entry point, UpsertProfile, refuses to overwrite).
 
 Conflict policy: if a profile of the same name already exists,
 install refuses without --force. --force overrides the conflict
@@ -1962,7 +1973,25 @@ gate but still records the new source.`,
 				Timeout:        time.Duration(timeoutSecs) * time.Second,
 				ProfilesPath:   profilesPath,
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "fetching %s ...\n", fromURL)
+			// Per §A26 (#350) print a WARN for non-loopback HTTP. The
+			// profile package itself accepts http:// without gating;
+			// surfacing the warning at the CLI keeps the package
+			// purely-functional + makes the message visible to the
+			// operator who's actually running the command.
+			if parsed, perr := neturl.Parse(fromURL); perr == nil &&
+				strings.EqualFold(parsed.Scheme, "http") {
+				host := parsed.Hostname()
+				isLoopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+				if !isLoopback {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"WARN: fetching %q over plaintext HTTP — a network "+
+							"attacker can MITM-substitute a permissive profile. "+
+							"Prefer https:// for IT-distributed profiles. This "+
+							"warning does NOT block the install (per §A26 local-"+
+							"dev parity with audit-export HTTP).\n", fromURL)
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "loading %s ...\n", fromURL)
 			result, err := profile.Install(cmd.Context(), opts)
 			if err != nil {
 				var ie *profile.InstallError

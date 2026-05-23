@@ -307,6 +307,108 @@ type Profile struct {
 	compileErr       error
 }
 
+// generatorProfileShim is the shape `iam-jit profile generate-from-
+// audit` emits per-bouncer (see iam-roles/src/iam_jit/llm/
+// profile_generator.py:_render_profile_yaml). UnmarshalYAML on
+// Profile decodes BOTH the canonical shape AND this shape so the
+// generated YAML can install without a manual translation step.
+//
+// Per §A26 (#349). Pre-fix, a generator-emitted kbounce.yaml parsed
+// into a Profile with every enforcement field empty — denies fired
+// for nothing.
+type generatorProfileShim struct {
+	SchemaVersion    any           `yaml:"schema_version,omitempty"`
+	ProfileName      any           `yaml:"profile_name,omitempty"`
+	Bouncer          any           `yaml:"bouncer,omitempty"`
+	Provenance       any           `yaml:"provenance,omitempty"`
+	Allows           []generatorRule `yaml:"allows,omitempty"`
+	Denies           []generatorRule `yaml:"denies,omitempty"`
+	FlaggedForReview []any         `yaml:"flagged_for_review,omitempty"`
+	Skipped          []any         `yaml:"skipped,omitempty"`
+}
+
+// generatorRule is one entry under generator-shape `denies:` /
+// `allows:`. The fields are a superset across the four bouncers so
+// the same struct decodes ibounce / kbounce / dbounce / gbounce
+// rules; the kbouncer translator only consults Verbs + Resources +
+// Bouncer.
+type generatorRule struct {
+	Target      any      `yaml:"target,omitempty"`
+	Actions     []string `yaml:"actions,omitempty"`
+	Verbs       []string `yaml:"verbs,omitempty"`
+	Resources   []string `yaml:"resources,omitempty"`
+	Scope       any      `yaml:"scope,omitempty"`
+	SQLPatterns []string `yaml:"sql_patterns,omitempty"`
+	Reason      string   `yaml:"reason,omitempty"`
+	Bouncer     string   `yaml:"bouncer,omitempty"`
+}
+
+// UnmarshalYAML accepts the canonical Profile shape AND the generator
+// shape. Per §A26 (#349). The two shapes never collide structurally
+// (canonical has no `denies:` list; generator has no `deny_verbs:`).
+// Per [[creates-never-mutates]] operator-authored canonical profiles
+// continue to parse identically.
+func (p *Profile) UnmarshalYAML(node *yaml.Node) error {
+	type rawProfile Profile
+	var canonical rawProfile
+	if err := node.Decode(&canonical); err != nil {
+		return err
+	}
+	*p = Profile(canonical)
+
+	var shim generatorProfileShim
+	if err := node.Decode(&shim); err != nil {
+		return err
+	}
+	if len(shim.Denies) == 0 && len(shim.Allows) == 0 {
+		return nil
+	}
+
+	// Merge generator-shape denies into the canonical DenyVerbs +
+	// DenyKeywords fields. For kbouncer the canonical mappings are:
+	//   - rule.Verbs   → DenyVerbs (case-insensitive existing field)
+	//   - rule.Resources → DenyKeywords against TargetResource (a
+	//     keyword match on the resource name covers e.g.
+	//     `secrets` / `nodes`)
+	seenVerbs := make(map[string]struct{}, len(p.DenyVerbs))
+	for _, v := range p.DenyVerbs {
+		seenVerbs[strings.ToLower(v)] = struct{}{}
+	}
+	seenKW := make(map[string]struct{}, len(p.DenyKeywords))
+	for _, k := range p.DenyKeywords {
+		seenKW[strings.ToLower(k)] = struct{}{}
+	}
+	for _, rule := range shim.Denies {
+		if rule.Bouncer != "" && !strings.EqualFold(rule.Bouncer, "kbounce") &&
+			!strings.EqualFold(rule.Bouncer, "kbouncer") {
+			continue
+		}
+		for _, v := range rule.Verbs {
+			lv := strings.ToLower(strings.TrimSpace(v))
+			if lv == "" {
+				continue
+			}
+			if _, ok := seenVerbs[lv]; ok {
+				continue
+			}
+			seenVerbs[lv] = struct{}{}
+			p.DenyVerbs = append(p.DenyVerbs, v)
+		}
+		for _, r := range rule.Resources {
+			lr := strings.ToLower(strings.TrimSpace(r))
+			if lr == "" {
+				continue
+			}
+			if _, ok := seenKW[lr]; ok {
+				continue
+			}
+			seenKW[lr] = struct{}{}
+			p.DenyKeywords = append(p.DenyKeywords, r)
+		}
+	}
+	return nil
+}
+
 // IsLocalSource reports whether the profile is editable at the CLI
 // surface (i.e., it was not installed from an org URL). The empty
 // string and "local" both count as local — the embedded defaults

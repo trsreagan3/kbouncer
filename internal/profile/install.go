@@ -200,47 +200,163 @@ type InstallResult struct {
 // profiles to disk. All errors except success return an *InstallError
 // with a populated ExitCode so the CLI can `os.Exit(err.ExitCode)`.
 //
-// The function is intentionally a pure orchestration over
-// InstallFromBytes — splitting them lets tests cover the fetch path
-// and the in-memory path independently.
+// Per §A26 (#350) the From field accepts:
+//   - https://...  (preferred; recommended distribution channel)
+//   - http://...   (loopback gets silent pass; CLI layer prints a
+//     WARN for non-loopback hosts — local-dev parity with the
+//     audit-export HTTP surface)
+//   - file:///abs/path/...  (single YAML file or bundle directory)
+//   - bare local path: ./relative or /absolute
+//
+// When From is a directory the install looks for `kbounce.yaml`
+// first (the per-bouncer slot in the generator's bundle layout); it
+// falls back to `index.yaml` + the bouncer entry naming kbounce.
 func Install(ctx context.Context, opts InstallOptions) (*InstallResult, error) {
-	if err := requireHTTPS(opts.From); err != nil {
-		return nil, err
+	payload, canonical, fetchErr := fetchInstallPayload(ctx, opts)
+	if fetchErr != nil {
+		return nil, fetchErr
 	}
-
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
+	if canonical != "" {
+		opts.From = canonical
 	}
-	client := opts.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: timeout}
-	}
-
-	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, opts.From, nil)
-	if err != nil {
-		return nil, installErrWrap(InstallExitPayload,
-			fmt.Sprintf("build fetch request: %v", err), err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, installErrWrap(InstallExitPayload,
-			fmt.Sprintf("fetch failed: %v", err), err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, installErr(InstallExitPayload,
-			fmt.Sprintf("fetch failed: HTTP %d", resp.StatusCode))
-	}
-	payload, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, installErrWrap(InstallExitPayload,
-			fmt.Sprintf("fetch failed: read body: %v", err), err)
-	}
-
 	return InstallFromBytes(payload, opts)
+}
+
+// fetchInstallPayload resolves opts.From to the (bytes, canonical-
+// source-string) pair. Canonical-source is what gets written into
+// each installed profile's Source field; for local files this is
+// the absolute resolved path so SIEM viewers + the UpsertProfile
+// read-only check both see a stable non-"local" string.
+//
+// Per §A26 (#350).
+func fetchInstallPayload(ctx context.Context, opts InstallOptions) ([]byte, string, error) {
+	if opts.From == "" {
+		return nil, "", installErr(InstallExitOperator,
+			"refusing to fetch: --from URL is required")
+	}
+	parsed, perr := url.Parse(opts.From)
+	if perr != nil {
+		return nil, "", installErrWrap(InstallExitOperator,
+			fmt.Sprintf("refusing to fetch from %q: not a valid URL: %v",
+				opts.From, perr), perr)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+
+	switch scheme {
+	case "https", "http":
+		timeout := opts.Timeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		client := opts.HTTPClient
+		if client == nil {
+			client = &http.Client{Timeout: timeout}
+		}
+		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, opts.From, nil)
+		if err != nil {
+			return nil, "", installErrWrap(InstallExitPayload,
+				fmt.Sprintf("build fetch request: %v", err), err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, "", installErrWrap(InstallExitPayload,
+				fmt.Sprintf("fetch failed: %v", err), err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, "", installErr(InstallExitPayload,
+				fmt.Sprintf("fetch failed: HTTP %d", resp.StatusCode))
+		}
+		payload, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, "", installErrWrap(InstallExitPayload,
+				fmt.Sprintf("fetch failed: read body: %v", err), err)
+		}
+		return payload, opts.From, nil
+
+	case "file":
+		return readLocalInstallSource(filepath.Clean(parsed.Path), opts.From)
+	case "":
+		return readLocalInstallSource(filepath.Clean(opts.From), opts.From)
+	default:
+		return nil, "", installErr(InstallExitOperator,
+			fmt.Sprintf("refusing to fetch from %q: scheme %q is not supported. "+
+				"Use one of https://, http://, file://, or a local path.",
+				opts.From, parsed.Scheme))
+	}
+}
+
+// readLocalInstallSource resolves a local file or directory to a
+// payload + canonical source string. Directories are treated as
+// generator-emitted bundles: kbounce.yaml is preferred; index.yaml +
+// the kbounce entry is the fallback.
+func readLocalInstallSource(path, original string) ([]byte, string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", installErr(InstallExitOperator,
+				fmt.Sprintf("refusing to fetch from %q: path does not exist "+
+					"(resolved to %q).", original, path))
+		}
+		return nil, "", installErrWrap(InstallExitPayload,
+			fmt.Sprintf("stat %q: %v", path, err), err)
+	}
+	if info.IsDir() {
+		candidate := filepath.Join(path, "kbounce.yaml")
+		if st, serr := os.Stat(candidate); serr == nil && !st.IsDir() {
+			body, rerr := os.ReadFile(candidate)
+			if rerr != nil {
+				return nil, "", installErrWrap(InstallExitPayload,
+					fmt.Sprintf("read %q: %v", candidate, rerr), rerr)
+			}
+			abs, _ := filepath.Abs(candidate)
+			return body, abs, nil
+		}
+		idx := filepath.Join(path, "index.yaml")
+		if st, serr := os.Stat(idx); serr == nil && !st.IsDir() {
+			idxBody, rerr := os.ReadFile(idx)
+			if rerr != nil {
+				return nil, "", installErrWrap(InstallExitPayload,
+					fmt.Sprintf("read %q: %v", idx, rerr), rerr)
+			}
+			var idxDoc struct {
+				Profiles []struct {
+					File    string `yaml:"file"`
+					Bouncer string `yaml:"bouncer"`
+				} `yaml:"profiles"`
+			}
+			if yerr := yaml.Unmarshal(idxBody, &idxDoc); yerr != nil {
+				return nil, "", installErrWrap(InstallExitPayload,
+					fmt.Sprintf("%q is not valid YAML: %v", idx, yerr), yerr)
+			}
+			for _, entry := range idxDoc.Profiles {
+				if entry.Bouncer == "kbounce" && entry.File != "" {
+					target := filepath.Join(path, entry.File)
+					body, rerr := os.ReadFile(target)
+					if rerr != nil {
+						return nil, "", installErrWrap(InstallExitPayload,
+							fmt.Sprintf("read %q: %v", target, rerr), rerr)
+					}
+					abs, _ := filepath.Abs(target)
+					return body, abs, nil
+				}
+			}
+		}
+		return nil, "", installErr(InstallExitOperator,
+			fmt.Sprintf("refusing to fetch from %q: directory contains "+
+				"neither `kbounce.yaml` nor a usable `index.yaml` with a "+
+				"kbounce entry.", original))
+	}
+
+	body, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return nil, "", installErrWrap(InstallExitPayload,
+			fmt.Sprintf("read %q: %v", path, rerr), rerr)
+	}
+	abs, _ := filepath.Abs(path)
+	return body, abs, nil
 }
 
 // InstallFromBytes is the half of Install that operates on already-
@@ -256,8 +372,9 @@ func Install(ctx context.Context, opts InstallOptions) (*InstallResult, error) {
 // upstream; we intentionally do NOT add a file:// shortcut here, to
 // keep the trust model "URL = remote-supplied = read-only" everywhere.
 func InstallFromBytes(payload []byte, opts InstallOptions) (*InstallResult, error) {
-	if err := requireHTTPS(opts.From); err != nil {
-		return nil, err
+	if opts.From == "" {
+		return nil, installErr(InstallExitOperator,
+			"refusing to install: opts.From is required (source string)")
 	}
 
 	sum := sha256.Sum256(payload)
@@ -281,19 +398,15 @@ func InstallFromBytes(payload []byte, opts InstallOptions) (*InstallResult, erro
 		return nil, installErrWrap(InstallExitPayload,
 			fmt.Sprintf("payload is not valid YAML: %v", err), err)
 	}
-	profilesAny, ok := raw["profiles"]
-	if !ok {
-		return nil, installErr(InstallExitPayload,
-			"payload must contain a non-empty `profiles` object")
-	}
-	profilesMap, ok := profilesAny.(map[string]any)
-	if !ok {
-		return nil, installErr(InstallExitPayload,
-			"payload must contain a non-empty `profiles` object")
+	profilesMap, perr := normalizeInstallDocument(raw, opts.From)
+	if perr != nil {
+		return nil, perr
 	}
 	if len(profilesMap) == 0 {
 		return nil, installErr(InstallExitPayload,
-			"payload must contain a non-empty `profiles` object")
+			"payload must contain a non-empty `profiles` object (or be a "+
+				"generator-emitted single-profile file with `profile_name:` "+
+				"+ `bouncer:` at the top level)")
 	}
 
 	// Parse each profile into a typed Profile via a roundtrip through
@@ -409,6 +522,72 @@ func normalizeSHA256(s string) string {
 	s = strings.ReplaceAll(s, ":", "")
 	s = strings.TrimSpace(s)
 	return s
+}
+
+// normalizeInstallDocument lifts a parsed install YAML into the
+// `{<name>: <body>}` shape the install loop consumes. Accepts:
+//   - `{profiles: {<name>: {...}}}` — canonical fragment.
+//   - `{schema_version, profile_name, bouncer, denies, allows, ...}` —
+//     `iam-jit profile generate-from-audit` per-bouncer file. The
+//     name is derived from `profile_name:` (preferred) or a fallback
+//     based on the source basename.
+//
+// Per §A26 (#349 + #350).
+func normalizeInstallDocument(raw map[string]any, source string) (map[string]any, *InstallError) {
+	if raw == nil {
+		return nil, nil
+	}
+	if profilesAny, ok := raw["profiles"]; ok {
+		profilesMap, ok := profilesAny.(map[string]any)
+		if !ok {
+			return nil, installErr(InstallExitPayload,
+				"payload `profiles` field must be an object")
+		}
+		return profilesMap, nil
+	}
+
+	hasGenShape := false
+	for _, k := range []string{"profile_name", "bouncer", "denies", "allows"} {
+		if _, ok := raw[k]; ok {
+			hasGenShape = true
+			break
+		}
+	}
+	if !hasGenShape {
+		return nil, nil
+	}
+
+	name := ""
+	if n, ok := raw["profile_name"].(string); ok {
+		name = strings.TrimSpace(n)
+	}
+	if name == "" {
+		base := source
+		if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
+			base = base[i+1:]
+		}
+		if i := strings.LastIndex(base, "."); i > 0 {
+			base = base[:i]
+		}
+		if base == "" {
+			base = "generated-profile"
+		}
+		name = base
+	}
+	body := make(map[string]any, len(raw))
+	for k, v := range raw {
+		body[k] = v
+	}
+	if _, ok := body["description"]; !ok {
+		bouncerName := "kbounce"
+		if bv, ok := body["bouncer"].(string); ok && bv != "" {
+			bouncerName = bv
+		}
+		body["description"] = fmt.Sprintf(
+			"Generator-emitted profile (bouncer=%s) — installed from %s.",
+			bouncerName, source)
+	}
+	return map[string]any{name: body}, nil
 }
 
 // parseInstallPayload validates every profile in the payload BEFORE

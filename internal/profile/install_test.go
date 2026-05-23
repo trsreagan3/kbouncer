@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
 )
@@ -77,21 +78,22 @@ profiles:
 	assert.Equal(t, srv.URL, ro.Source)
 }
 
-// TestInstall_HTTPSchemeRefused — http:// URL is rejected before any
-// network access.
-func TestInstall_HTTPSchemeRefused(t *testing.T) {
+// TestInstall_UnknownSchemeRefused — per §A26 (#350) http:// is no
+// longer hard-refused (the CLI prints a stderr WARN for non-
+// loopback hosts; the install proceeds). The hard refusal now
+// applies only to genuinely-unknown schemes.
+func TestInstall_UnknownSchemeRefused(t *testing.T) {
 	target := tmpProfilesPath(t)
 	_, err := Install(context.Background(), InstallOptions{
-		From:         "http://example.invalid/p.yaml",
-		HTTPClient:   InsecureTLSClientForTests(), // never used
+		From:         "gopher://example.invalid/p.yaml",
+		HTTPClient:   InsecureTLSClientForTests(),
 		ProfilesPath: target,
 	})
 	require.Error(t, err)
 	var ie *InstallError
 	require.ErrorAs(t, err, &ie)
 	assert.Equal(t, InstallExitOperator, ie.ExitCode)
-	assert.Contains(t, ie.Message, "https://")
-	// No file written.
+	assert.Contains(t, ie.Message, "gopher")
 	_, statErr := os.Stat(target)
 	assert.True(t, os.IsNotExist(statErr), "no profiles file should have been created")
 }
@@ -578,4 +580,191 @@ profiles:
 	assert.Equal(t, "read pods anywhere", p.AllowRules[0].Note)
 	assert.Equal(t, "list namespaces", p.AllowRules[1].Pattern)
 	assert.Equal(t, "*", p.AllowRules[1].ArnScope)
+}
+
+// -------------------------------------------------------------------
+// §A26 (#349 + #350) — schema bridge + local-path install
+// -------------------------------------------------------------------
+
+// TestInstall_FromLocalFilePath — per §A26 (#350) `--from` accepts a
+// bare local file path. Closes the gap where the documented quick-
+// start `kbounce profile install --from ./profiles/` used to refuse
+// with `https://-only`.
+func TestInstall_FromLocalFilePath(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "local.yaml")
+	require.NoError(t, os.WriteFile(src, []byte(
+		"profiles:\n  local-disk:\n    description: from disk\n"+
+			"    deny_keywords: [prod]\n",
+	), 0o600))
+	target := tmpProfilesPath(t)
+	r, err := Install(context.Background(), InstallOptions{
+		From:         src,
+		ProfilesPath: target,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"local-disk"}, r.InstalledNames)
+	abs, _ := filepath.Abs(src)
+	assert.Equal(t, abs, r.SourceURL)
+
+	ps, err := LoadProfiles(target)
+	require.NoError(t, err)
+	p, err := ps.Active("local-disk")
+	require.NoError(t, err)
+	assert.Equal(t, abs, p.Source)
+	assert.Contains(t, p.DenyKeywords, "prod")
+}
+
+// TestInstall_FromFileURL — file:// scheme parses to the same local
+// path as a bare path.
+func TestInstall_FromFileURL(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "file-url.yaml")
+	require.NoError(t, os.WriteFile(src, []byte(
+		"profiles:\n  via-file-url:\n    description: ok\n",
+	), 0o600))
+	target := tmpProfilesPath(t)
+	_, err := Install(context.Background(), InstallOptions{
+		From:         "file://" + src,
+		ProfilesPath: target,
+	})
+	require.NoError(t, err)
+	ps, err := LoadProfiles(target)
+	require.NoError(t, err)
+	_, perr := ps.Active("via-file-url")
+	require.NoError(t, perr)
+}
+
+// TestInstall_FromMissingPathFails — exit 2 (operator-fixable) with
+// a clear "does not exist" message.
+func TestInstall_FromMissingPathFails(t *testing.T) {
+	dir := t.TempDir()
+	_, err := Install(context.Background(), InstallOptions{
+		From:         filepath.Join(dir, "absent.yaml"),
+		ProfilesPath: tmpProfilesPath(t),
+	})
+	require.Error(t, err)
+	var ie *InstallError
+	require.ErrorAs(t, err, &ie)
+	assert.Equal(t, InstallExitOperator, ie.ExitCode)
+	assert.Contains(t, ie.Message, "does not exist")
+}
+
+// TestInstall_FromBundleDirectory — `--from` pointed at a directory
+// finds `kbounce.yaml` inside. Closes the documented quick-start
+// `kbounce profile install --from ./profiles/`.
+func TestInstall_FromBundleDirectory(t *testing.T) {
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "audit-pinned")
+	require.NoError(t, os.MkdirAll(bundle, 0o700))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(bundle, "kbounce.yaml"),
+		[]byte("profile_name: from-bundle\nbouncer: kbounce\n"+
+			"deny_keywords: [prod]\n"),
+		0o600,
+	))
+	target := tmpProfilesPath(t)
+	r, err := Install(context.Background(), InstallOptions{
+		From:         bundle,
+		ProfilesPath: target,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"from-bundle"}, r.InstalledNames)
+}
+
+// TestInstall_FromGeneratorShapeSingleFile — per §A26 (#349) the
+// `iam-jit profile generate-from-audit` per-bouncer file shape
+// installs successfully + translates into enforceable
+// DenyVerbs + DenyKeywords. Pre-fix this YAML parsed to a Profile
+// with empty enforcement fields.
+func TestInstall_FromGeneratorShapeSingleFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "kbounce.yaml")
+	require.NoError(t, os.WriteFile(src, []byte(`schema_version: 1
+profile_name: audit-pinned-kbounce
+bouncer: kbounce
+provenance:
+  source: generate-from-audit
+denies:
+  - target: cluster
+    verbs: [delete, deletecollection]
+    resources: [namespaces, nodes, clusterroles, clusterrolebindings]
+    reason: cluster-scoped destruction requires human approval
+  - target: cluster
+    verbs: [get, list, watch]
+    resources: [secrets]
+    scope: all-namespaces
+    reason: agents must not exfiltrate cluster-wide secrets
+`), 0o600))
+	target := tmpProfilesPath(t)
+	_, err := Install(context.Background(), InstallOptions{
+		From:         src,
+		ProfilesPath: target,
+	})
+	require.NoError(t, err)
+
+	ps, err := LoadProfiles(target)
+	require.NoError(t, err)
+	p, perr := ps.Active("audit-pinned-kbounce")
+	require.NoError(t, perr)
+	// The translator pulls verbs → DenyVerbs.
+	require.NotEmpty(t, p.DenyVerbs,
+		"generator-shape verbs must translate into DenyVerbs")
+	verbsLower := make(map[string]struct{}, len(p.DenyVerbs))
+	for _, v := range p.DenyVerbs {
+		verbsLower[strings.ToLower(v)] = struct{}{}
+	}
+	for _, want := range []string{"delete", "deletecollection", "get", "list", "watch"} {
+		_, ok := verbsLower[want]
+		assert.True(t, ok, "expected DenyVerbs to contain %q; got %v", want, p.DenyVerbs)
+	}
+	// Resources land in DenyKeywords (substring match against the
+	// resource name).
+	require.NotEmpty(t, p.DenyKeywords,
+		"generator-shape resources must translate into DenyKeywords")
+	kwLower := make(map[string]struct{}, len(p.DenyKeywords))
+	for _, k := range p.DenyKeywords {
+		kwLower[strings.ToLower(k)] = struct{}{}
+	}
+	for _, want := range []string{"secrets", "namespaces"} {
+		_, ok := kwLower[want]
+		assert.True(t, ok, "expected DenyKeywords to contain %q; got %v", want, p.DenyKeywords)
+	}
+}
+
+// TestParseProfile_CanonicalShapeUnchanged — per [[creates-never-
+// mutates]] hand-written profiles using the canonical fields must
+// keep parsing identically.
+func TestParseProfile_CanonicalShapeUnchanged(t *testing.T) {
+	body := []byte(`description: hand-written
+deny_keywords: [prod]
+deny_verbs: [delete, patch]
+only_clusters: [prod-1, prod-2]
+deny_on_impersonation: true
+`)
+	var p Profile
+	require.NoError(t, yaml.Unmarshal(body, &p))
+	assert.Equal(t, []string{"prod"}, p.DenyKeywords)
+	assert.Equal(t, []string{"delete", "patch"}, p.DenyVerbs)
+	assert.Equal(t, []string{"prod-1", "prod-2"}, p.OnlyClusters)
+	assert.True(t, p.DenyOnImpersonation)
+}
+
+// TestParseProfile_GeneratorShapeBridges — unit-level: a generator-
+// shape body decodes into a Profile whose canonical enforcement
+// fields are populated.
+func TestParseProfile_GeneratorShapeBridges(t *testing.T) {
+	body := []byte(`schema_version: 1
+profile_name: bridge-test
+bouncer: kbounce
+denies:
+  - target: cluster
+    verbs: [delete]
+    resources: [namespaces]
+    reason: catalog ddl
+`)
+	var p Profile
+	require.NoError(t, yaml.Unmarshal(body, &p))
+	require.Contains(t, p.DenyVerbs, "delete")
+	require.Contains(t, p.DenyKeywords, "namespaces")
 }
