@@ -33,6 +33,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 
@@ -55,7 +56,8 @@ func (s *Server) profileReloadHandler(requireBearer string, profilesPath string)
 				return
 			}
 			tok, ok := parseBearerToken(ah)
-			if !ok || tok != requireBearer {
+			// §A99 — constant-time compare; see audit_events.go.
+			if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(requireBearer)) != 1 {
 				writeProfileReloadError(w, http.StatusForbidden, "bearer token rejected")
 				return
 			}

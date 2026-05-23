@@ -31,6 +31,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,7 +78,11 @@ func auditEventsHandler(st *store.Store, requireBearer string) http.HandlerFunc 
 				return
 			}
 			tok, ok := parseBearerToken(ah)
-			if !ok || tok != requireBearer {
+			// §A99 — constant-time compare; a wall-clock-string
+			// compare leaks the configured token byte-by-byte over
+			// enough requests. Mirrors the pattern already used in
+			// internal/mcp/bulk_answer.go.
+			if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(requireBearer)) != 1 {
 				writeAuditEventsError(w, http.StatusForbidden,
 					"bearer token rejected")
 				return

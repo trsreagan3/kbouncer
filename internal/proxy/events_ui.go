@@ -36,6 +36,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"html"
 	"net/http"
 	"strings"
@@ -81,7 +82,8 @@ func auditEventsUIHandler(requireBearer string) http.HandlerFunc {
 			ah := r.Header.Get("Authorization")
 			if ah != "" {
 				tok, ok := parseBearerToken(ah)
-				if !ok || tok != requireBearer {
+				// §A99 — constant-time compare; see audit_events.go.
+				if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(requireBearer)) != 1 {
 					http.Error(w, "bearer token rejected", http.StatusForbidden)
 					return
 				}
