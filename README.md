@@ -533,6 +533,14 @@ shipped binary, not a library other Go programs link against.
 
 ---
 
+## License
+
+Apache-2.0 — see [LICENSE](./LICENSE).
+
+Copyright 2026 trsreagan3.
+
+---
+
 ## Position in the Bounce suite
 
 The LLC ships five products under one umbrella, all built on the same

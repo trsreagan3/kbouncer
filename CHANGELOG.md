@@ -32,6 +32,24 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ### Added
 
+- **#342 / §A23 — Formal Apache-2.0 LICENSE + NOTICE + README license attribution** (2026-05-23) —
+  kbouncer had NO `LICENSE` file at all (the most acute gap surfaced
+  by the 2026-05-23 verification; technically rendered the repo
+  all-rights-reserved by default per Berne Convention despite the
+  "open source" positioning). This slice ships the canonical
+  Apache-2.0 LICENSE text with `Copyright 2026 trsreagan3` (founder
+  direction), a `NOTICE` file with per-product attribution
+  (`kbouncer — Kubernetes API bouncer (part of the iam-jit Bouncer
+  suite)`), and a new `## License` section in the README. Same change
+  shipped in iam-roles + gbounce + dbounce so the Bounce suite
+  presents one coherent license posture per
+  `[[cross-product-agent-parity]]`. Unblocks: Anthropic Cyber
+  Verification Program application + iam-jit-vs-OneCLI competitive-
+  matrix accuracy + pkg.go.dev license badge (Go tooling reads
+  LICENSE directly — no go.mod change needed). Per-source-file
+  SPDX-License-Identifier headers DEFERRED to v1.1 per
+  `[[deliberate-feature-completion]]`.
+
 - **#324b — dynamic-deny YAML watcher + matcher + mgmt-port reload endpoint** (2026-05-22) —
   kbouncer now consumes the cross-product
   `~/.iam-jit/dynamic-denies.yaml` file. The on-disk shape + cross-bouncer
