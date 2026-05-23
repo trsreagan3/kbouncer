@@ -172,6 +172,18 @@ const (
 	// installed an invalid file sees it immediately rather than
 	// "silently 0 rules applied."
 	AdminActionDynamicDenyParseError AdminAction = "dynamic_deny.parse_error"
+
+	// AdminActionDiskPressureTransition — #461 / §A63c. The
+	// disk-pressure subsystem's status crossed a threshold
+	// (ok → degraded, degraded → critical, critical → emergency, or
+	// any reverse transition). Surfaced so a SIEM dashboard can
+	// answer "when did this bouncer cross into critical / emergency /
+	// recover to ok?" from the same event stream that carries proxy
+	// decisions + admin actions. Wire-shape parity with Python
+	// ibounce's iam_jit.bouncer.audit_export.disk_pressure.
+	// ADMIN_ACTION_DISK_PRESSURE_TRANSITION per
+	// [[cross-product-agent-parity]].
+	AdminActionDiskPressureTransition AdminAction = "disk_pressure.transition"
 )
 
 // AdminActionActivityID returns the OCSF activity_id (class 6003 enum)
@@ -199,7 +211,8 @@ func AdminActionActivityID(a AdminAction) int {
 		AdminActionDiagnosticsBundle,
 		AdminActionStoreBackup,
 		AdminActionDynamicDenyReloaded,
-		AdminActionDynamicDenyParseError:
+		AdminActionDynamicDenyParseError,
+		AdminActionDiskPressureTransition:
 		return ActivityOther
 	case AdminActionStoreRestore:
 		// Restore wholesale REPLACES the destination DB. CRUD-wise

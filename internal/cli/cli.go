@@ -291,6 +291,15 @@ func newRunCmd() *cobra.Command {
 		// haven't installed the cross-product CLI yet.
 		dynamicDeniesPath    string
 		disableDynamicDenies bool
+		// #461 / §A63c — disk-pressure circuit-breaker. Mode +
+		// thresholds match the cross-product spec; kbouncer defaults
+		// to rotate-aggressively per the spec's "dev workflows trend
+		// toward rotate-aggressively" note.
+		diskPressureMode     string
+		diskPressureWarnPct  int
+		diskPressureCritPct  int
+		diskPressureEmergPct int
+		stopOnDiskCritical   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -618,6 +627,28 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				}
 			}
 
+			// #461 / §A63c — resolve the disk-pressure mode + build the
+			// state container. --stop-on-disk-critical is a shorthand
+			// for --disk-pressure-mode pause-requests; when both are
+			// passed pause-requests wins. Empty audit-log-path means
+			// no logDir → state is a no-op (Snapshot still surfaces
+			// the mode but RefuseRequests is always false).
+			effectiveDPMode := diskPressureMode
+			if stopOnDiskCritical {
+				effectiveDPMode = audit.DiskPressureModePauseRequests
+			}
+			normalizedMode, dpErr := audit.NormalizeDiskPressureMode(effectiveDPMode)
+			if dpErr != nil {
+				return fmt.Errorf("kbouncer: --disk-pressure-mode: %w", dpErr)
+			}
+			diskPressureState := audit.NewDiskPressureState(
+				normalizedMode,
+				audit.ResolveLogDir(resolveAuditLogPath(auditLogPath)),
+				diskPressureWarnPct,
+				diskPressureCritPct,
+				diskPressureEmergPct,
+			)
+
 			cfg := proxy.Config{
 				Host:                    host,
 				Port:                    port,
@@ -640,6 +671,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				BulkAnswerCooldown:      bulkAnswerCooldown,
 				AuditEventsToken:        auditEventsToken,
 				DynamicDenyWatcher:      ddWatcher,
+				DiskPressure:            diskPressureState,
 			}.Normalize()
 
 			// Cooperative mode + --sync-prompt-on-deny: per spec the
@@ -1055,6 +1087,37 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"LOG-RETENTION.md spec). Active audit DB is NEVER deleted by "+
 			"this path; only rotated archives are eligible. Honors "+
 			"$KBOUNCE_AUDIT_DB_RETENTION_DAYS for non-flag overrides.")
+	// #461 / §A63c — disk-pressure circuit breaker. kbouncer's default
+	// is rotate-aggressively per the §A63c note "dev workflows trend
+	// toward rotate-aggressively." Operators in compliance-heavy
+	// deployments should pass --disk-pressure-mode pause-requests OR
+	// the shorthand --stop-on-disk-critical to honor audit integrity
+	// over liveness. Per [[cross-product-agent-parity]] the flag
+	// names match dbounce + gbounce + ibounce.
+	cmd.Flags().StringVar(&diskPressureMode, "disk-pressure-mode",
+		audit.DiskPressureModeRotateAggressively,
+		"#461 — disk-pressure response mode. One of: "+
+			"pause-requests (compliance-heavy: refuses new requests with 503 at "+
+			"critical), rotate-aggressively (default for kbouncer: drops oldest "+
+			"archives at critical), archive-and-purge (drops oldest archives + "+
+			"signals operator-configured object-storage sink should ship before "+
+			"next tick). Cross-product field name matches ibounce + dbounce + "+
+			"gbounce so a single playbook covers all four.")
+	cmd.Flags().BoolVar(&stopOnDiskCritical, "stop-on-disk-critical", false,
+		"#461 — shorthand for --disk-pressure-mode pause-requests. Equivalent "+
+			"to setting disk-pressure-mode to pause-requests. When both flags "+
+			"are passed pause-requests wins (the more conservative choice).")
+	cmd.Flags().IntVar(&diskPressureWarnPct, "disk-pressure-warn-pct", audit.DefaultDiskWarnPercent,
+		"#461 — disk-usage percent at which the audit_log status flips to "+
+			"degraded (informational; no behavior change). Default 85.")
+	cmd.Flags().IntVar(&diskPressureCritPct, "disk-pressure-crit-pct", audit.DefaultDiskCritPercent,
+		"#461 — disk-usage percent at which the operator-declared mode reacts "+
+			"(refuse-requests / rotate-aggressively / archive-and-purge). "+
+			"Default 95.")
+	cmd.Flags().IntVar(&diskPressureEmergPct, "disk-pressure-emergency-pct", audit.DefaultDiskEmergencyPercent,
+		"#461 — disk-usage percent at which the bouncer surfaces an emergency "+
+			"status (always honored regardless of mode; ALL modes treat "+
+			"emergency the same way). Default 98.")
 	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
 		"HTTPS URL of an operator-owned audit-event collector. Each decision "+
 			"event POSTed as JSON. ENTERPRISE-tier feature (license-gated; "+

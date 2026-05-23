@@ -284,6 +284,21 @@ type Config struct {
 	// + `unmapped.iam_jit.ext.dynamic_deny_rule_id="dd_..."` so a SIEM
 	// analyst can pivot on either field.
 	DynamicDenyWatcher *dynamicdeny.Watcher
+
+	// DiskPressure (#461 / §A63c) is the optional disk-pressure
+	// circuit-breaker state. When non-nil the proxy:
+	//   - surfaces an audit_log block on /healthz with disk usage +
+	//     mode + refuse_requests flag,
+	//   - returns 503 (with the #459 structured-deny shape) on every
+	//     request when state.RefuseRequests() reports true (pause-
+	//     requests mode at critical / emergency),
+	//   - starts a background periodic goroutine in Serve() that ticks
+	//     every DiskPressureCheckInterval to re-evaluate state +
+	//     emit admin-action disk_pressure.transition OCSF events on
+	//     status changes.
+	// When nil the proxy behavior is byte-identical to the pre-#461
+	// shape per [[creates-never-mutates]].
+	DiskPressure *audit.DiskPressureState
 }
 
 // DefaultConfig returns the production-safe defaults applied when CLI
@@ -1548,6 +1563,12 @@ type Server struct {
 	// time regardless). nil when no sweeper was launched.
 	expiredRulesSweepStop chan struct{}
 
+	// diskPressureStop cancels the background disk-pressure check
+	// loop (#461 / §A63c). nil when DiskPressure was not configured
+	// in cfg. Closed by Shutdown so the audit emit channel can drain
+	// before the manager close fires.
+	diskPressureStop chan struct{}
+
 	// lastSeenPauseID tracks the most recently observed active pause id
 	// (0 = no pause active). The proxy hot-path's pause-lookup
 	// observes transitions from this value to detect:
@@ -1806,11 +1827,26 @@ const ExpiredRulesSweepInterval = 30 * time.Second
 // a NewServer-only test doesn't leak goroutines. Idempotent on multiple
 // calls (no-ops the second time).
 func (s *Server) startBackgroundWatchers() {
-	if s == nil || s.store == nil {
+	if s == nil {
 		return
 	}
 	s.watcherMu.Lock()
 	defer s.watcherMu.Unlock()
+	// #461 / §A63c — start disk-pressure check loop. Doesn't depend
+	// on s.store; runs even on observation-only deploys so a
+	// kbouncer with no upstream still surfaces disk state on
+	// /healthz. Per [[deliberate-feature-completion]].
+	if s.cfg.DiskPressure != nil && s.diskPressureStop == nil {
+		s.diskPressureStop = make(chan struct{})
+		s.watcherWG.Add(1)
+		go func(stop chan struct{}) {
+			defer s.watcherWG.Done()
+			audit.RunDiskPressureLoop(context.Background(), s.cfg.DiskPressure, s.cfg.AuditEmitter, stop)
+		}(s.diskPressureStop)
+	}
+	if s.store == nil {
+		return
+	}
 	if s.profileReloadStop == nil {
 		s.profileReloadStop = make(chan struct{})
 		s.watcherWG.Add(1)
@@ -1851,6 +1887,10 @@ func (s *Server) stopBackgroundWatchers() {
 	if s.expiredRulesSweepStop != nil {
 		close(s.expiredRulesSweepStop)
 		s.expiredRulesSweepStop = nil
+	}
+	if s.diskPressureStop != nil {
+		close(s.diskPressureStop)
+		s.diskPressureStop = nil
 	}
 	s.watcherMu.Unlock()
 	// Wait WITHOUT the mutex held so a mid-flight watcher reaching
@@ -2133,6 +2173,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 //     operator can tell "the proxy reached but couldn't talk to the
 //     apiserver" from "the proxy refused."
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
+	// #461 / §A63c — disk-pressure circuit breaker. In pause-requests
+	// mode at critical / emergency the proxy refuses every inbound
+	// request with 503 + the #459 structured-deny body BEFORE
+	// running the evaluator. Refusing pre-evaluation avoids a
+	// metadata-write race when the disk is already at the wall.
+	// Other modes (rotate-aggressively / archive-and-purge) never
+	// flip refuse_requests so this is a no-op for them.
+	if s.cfg.DiskPressure != nil && s.cfg.DiskPressure.RefuseRequests() {
+		writeDiskPressurePause(w, s.cfg.DiskPressure.Snapshot())
+		return
+	}
 	// K-Slice 5: classify streaming BEFORE evaluating so the audit row
 	// can be tagged is_stream + stream_kind. The classification is a
 	// pure read of the inbound headers + query — no I/O.
@@ -2517,21 +2568,22 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Reason    string `json:"reason,omitempty"`
 	}
 	payload := struct {
-		Status                      string        `json:"status"`
-		Mode                        string        `json:"mode"`
-		DefaultPolicy               string        `json:"default_policy"`
-		ActiveProfile               string        `json:"active_profile"`
-		DecisionsCount              int64         `json:"decisions_count"`
-		LookupErrorsCounter         int64         `json:"lookup_errors_counter"`
-		AuditExportHealthy          bool          `json:"audit_export_healthy"`
-		TotalAgentHeadersRejected   int64         `json:"total_agent_headers_rejected"`
-		Pause                       *HealthzPause `json:"pause"`
-		DynamicDeniesEnabled        bool          `json:"dynamic_denies_enabled"`
-		DynamicDeniesCount          int           `json:"dynamic_denies_count"`
-		DynamicDeniesPath           string        `json:"dynamic_denies_path,omitempty"`
-		TotalDynamicDenyMatches     int64         `json:"total_dynamic_deny_matches"`
-		TotalDynamicDenyReloads     int64         `json:"total_dynamic_deny_reloads"`
-		TotalDynamicDenyParseErrors int64         `json:"total_dynamic_deny_parse_errors"`
+		Status                      string                       `json:"status"`
+		Mode                        string                       `json:"mode"`
+		DefaultPolicy               string                       `json:"default_policy"`
+		ActiveProfile               string                       `json:"active_profile"`
+		DecisionsCount              int64                        `json:"decisions_count"`
+		LookupErrorsCounter         int64                        `json:"lookup_errors_counter"`
+		AuditExportHealthy          bool                         `json:"audit_export_healthy"`
+		TotalAgentHeadersRejected   int64                        `json:"total_agent_headers_rejected"`
+		Pause                       *HealthzPause                `json:"pause"`
+		DynamicDeniesEnabled        bool                         `json:"dynamic_denies_enabled"`
+		DynamicDeniesCount          int                          `json:"dynamic_denies_count"`
+		DynamicDeniesPath           string                       `json:"dynamic_denies_path,omitempty"`
+		TotalDynamicDenyMatches     int64                        `json:"total_dynamic_deny_matches"`
+		TotalDynamicDenyReloads     int64                        `json:"total_dynamic_deny_reloads"`
+		TotalDynamicDenyParseErrors int64                        `json:"total_dynamic_deny_parse_errors"`
+		AuditLog                    *audit.DiskPressureSnapshot  `json:"audit_log,omitempty"`
 	}{
 		Status:                      "ok",
 		Mode:                        string(s.cfg.Mode),
@@ -2587,9 +2639,65 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		payload.AuditExportHealthy = false
 		statusCode = http.StatusServiceUnavailable
 	}
+	// #461 / §A63c — surface the disk-pressure subsystem on /healthz
+	// + flip the HTTP response to 503 in pause-requests mode at
+	// critical / emergency so an external supervisor (k8s liveness,
+	// monit) sees the same paused-bouncer signal the proxy hot path
+	// uses to refuse requests. Per [[ibounce-honest-positioning]] we
+	// surface the state regardless of mode so operators see disk
+	// trends before they cross the threshold.
+	if s.cfg.DiskPressure != nil {
+		snap := s.cfg.DiskPressure.Snapshot()
+		payload.AuditLog = &snap
+		if snap.RefuseRequests {
+			payload.Status = "degraded"
+			statusCode = http.StatusServiceUnavailable
+		}
+	}
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		log.Warn().Err(err).Msg("kbounce: encode /healthz response failed")
+	}
+}
+
+// writeDiskPressurePause emits the 503 refusal body when the
+// disk-pressure subsystem is in pause-requests mode at critical /
+// emergency. Wire shape mirrors the #459 structured-deny payload so
+// agents can grep the same fields they'd see from a routine policy
+// deny.
+//
+// Per [[ambient-value-prop-and-friction-framing]] the message body
+// LEADS with caught_by_bouncer + tells the operator exactly what to
+// configure to change behavior. Never says "ERROR" / "BLOCKED".
+func writeDiskPressurePause(w http.ResponseWriter, snap audit.DiskPressureSnapshot) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("x-kbouncer-refusal", "disk-pressure-pause")
+	usedPct := 0.0
+	if snap.UsedPct != nil {
+		usedPct = *snap.UsedPct
+	}
+	reason := fmt.Sprintf(audit.PauseRequestsRefusalReasonTemplate, usedPct, snap.CritPct)
+	sd := structureddeny.Build(structureddeny.BuildOptions{
+		Bouncer:    "kbouncer",
+		Action:     "disk_pressure.pause",
+		DenyReason: reason,
+		DenySource: "disk_pressure",
+	})
+	body := map[string]any{
+		"kind":          "Status",
+		"apiVersion":    "v1",
+		"status":        "Failure",
+		"message":       reason,
+		"reason":        "ServiceUnavailable",
+		"code":          http.StatusServiceUnavailable,
+		"disk_pressure": snap,
+	}
+	for k, v := range sd.AsMap() {
+		body[k] = v
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Warn().Err(err).Msg("kbounce: encode disk-pressure pause response failed")
 	}
 }
 
