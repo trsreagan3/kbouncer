@@ -1379,6 +1379,17 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 // license-file infrastructure gets a clear error rather than a
 // silent bypass.
 //
+// v1.0 update per [[oss-only-launch-decision]]: license enforcement
+// is DISABLED at v1.0; the webhook + alert-rules + alert-routes
+// transports ship FREE in the OSS-only launch. The license error
+// sentinels (ErrLicenseRequired / ErrAlertRulesLicenseRequired /
+// ErrRoutesLicenseRequired) + the audit.LoadLicense scaffolding
+// remain in the repo for the future v1.1+ paid tier (per the memo,
+// "license code stays but does NOT enforce"). When that paid tier
+// lands the gate sites below re-introduce a `licensed()` check;
+// today they wire the transport unconditionally + emit an INFO log
+// noting the feature is FREE at v1.0.
+//
 // Heartbeat wiring per [[prompt-injection-disable-bouncer-threat]]:
 // when --heartbeat-interval is non-zero, a Heartbeater goroutine is
 // launched against the returned emitter + bound to the rule engine
@@ -1446,11 +1457,30 @@ func buildAuditManager(
 		securityLakeBucket == "" && auditObjectStorageBucket == "" {
 		return nil, nil, noop, nil
 	}
-	// #280 — per-org routing engine. License-gated (placeholder until
-	// #235). When set, the engine takes precedence over the single-
-	// webhook pusher (see the "ignored with warning" check below).
+	// #280 — per-org routing engine. Per [[oss-only-launch-decision]]
+	// this ships FREE at v1.0; the prior license gate (which returned
+	// audit.ErrRoutesLicenseRequired) was a calibration-drift gap vs
+	// the help-text claim that the feature is free at v1.0 per
+	// [[ibounce-honest-positioning]]. When the v1.1+ paid tier lands,
+	// reinstate the gate here; today the routes engine wires
+	// unconditionally.
+	var routesEngine *audit.RoutesEngine
 	if alertRoutesPath != "" {
-		return nil, nil, noop, audit.ErrRoutesLicenseRequired
+		log.Info().
+			Str("path", alertRoutesPath).
+			Msg("kbounce: --alert-routes ships FREE at v1.0 per [[oss-only-launch-decision]] (license enforcement disabled; sentinel audit.ErrRoutesLicenseRequired retained for future v1.1+ paid tier)")
+		routesCfg, err := audit.LoadRoutesConfig(alertRoutesPath)
+		if err != nil {
+			return nil, nil, noop, fmt.Errorf("kbounce: --alert-routes: %w", err)
+		}
+		eng, err := audit.NewRoutesEngine(ctx, audit.RoutesEngineOptions{
+			Cfg:     routesCfg,
+			Product: "kbouncer",
+		})
+		if err != nil {
+			return nil, nil, noop, fmt.Errorf("kbounce: routes engine: %w", err)
+		}
+		routesEngine = eng
 	}
 	// Validate the preset name up front so a typo surfaces before
 	// the license gate (gives the operator a single clear error per
@@ -1466,11 +1496,25 @@ func buildAuditManager(
 			"kbounce: --heartbeat-interval must be 0 (disabled) or >= %s; got %s",
 			audit.MinHeartbeatInterval, heartbeatInterval)
 	}
-	// Slice 2 of #252 — alert-rule engine is an Enterprise feature
-	// per [[security-team-audit-export]]. Same placeholder license
-	// gate as the webhook flags; both wait on #235.
+	// Slice 2 of #252 — alert-rule engine. Per
+	// [[oss-only-launch-decision]] this ships FREE at v1.0; the prior
+	// license gate (which returned audit.ErrAlertRulesLicenseRequired)
+	// was a calibration-drift gap vs the help-text claim per
+	// [[ibounce-honest-positioning]]. When the v1.1+ paid tier lands,
+	// reinstate the gate here; today the rule engine wires
+	// unconditionally. Rules are loaded here so a YAML parse error
+	// surfaces at startup; the RuleEngine itself is constructed after
+	// the underlying Manager (it wraps the Manager as the Emitter).
+	var alertRulesCfg *audit.RulesConfig
 	if alertRulesPath != "" {
-		return nil, nil, noop, audit.ErrAlertRulesLicenseRequired
+		log.Info().
+			Str("path", alertRulesPath).
+			Msg("kbounce: --alert-rules ships FREE at v1.0 per [[oss-only-launch-decision]] (license enforcement disabled; sentinel audit.ErrAlertRulesLicenseRequired retained for future v1.1+ paid tier)")
+		c, err := audit.LoadRulesConfig(alertRulesPath)
+		if err != nil {
+			return nil, nil, noop, fmt.Errorf("kbounce: --alert-rules: %w", err)
+		}
+		alertRulesCfg = c
 	}
 	var logWriter *audit.LogWriter
 	var webhookPusher *audit.WebhookPusher
@@ -1504,16 +1548,41 @@ func buildAuditManager(
 		logWriter = lw
 	}
 	if webhookURL != "" {
-		// Enterprise license gate — placeholder until #235 lands.
-		// Once license-file plumbing exists, replace this with the
-		// real verifier; the audit package doesn't change.
-		return nil, nil, noop, audit.ErrLicenseRequired
+		// Per [[oss-only-launch-decision]] the audit-export webhook
+		// transport ships FREE at v1.0; the prior license gate (which
+		// returned audit.ErrLicenseRequired) was a calibration-drift
+		// gap vs the help-text claim per
+		// [[ibounce-honest-positioning]]. When the v1.1+ paid tier
+		// lands, reinstate a licensed() check here; today the webhook
+		// pusher wires unconditionally. Token required for auth (an
+		// unauthenticated webhook would surface audit events to anyone
+		// who guesses the URL — defense-in-depth that's orthogonal to
+		// licensing).
+		log.Info().
+			Str("url", webhookURL).
+			Msg("kbounce: --audit-webhook-url ships FREE at v1.0 per [[oss-only-launch-decision]] (license enforcement disabled; sentinel audit.ErrLicenseRequired retained for future v1.1+ paid tier)")
+		preset, err := audit.ParsePreset(webhookPreset)
+		if err != nil {
+			return nil, nil, noop, err
+		}
+		sentinelTable := webhookSentinelTable
+		if sentinelTable == "" {
+			sentinelTable = audit.SentinelDefaultTable
+		}
+		wp, err := audit.NewWebhookPusher(ctx, audit.WebhookOptions{
+			URL:           webhookURL,
+			Token:         webhookToken,
+			AllowInternal: allowInternal,
+			BatchSize:     webhookBatch,
+			Preset:        preset,
+			Tags:          webhookTags,
+			SentinelTable: sentinelTable,
+		})
+		if err != nil {
+			return nil, nil, noop, fmt.Errorf("kbounce: audit-webhook pusher: %w", err)
+		}
+		webhookPusher = wp
 	}
-	_ = webhookToken // referenced when license-file plumbing lands
-	_ = webhookBatch
-	_ = allowInternal
-	_ = webhookTags
-	_ = webhookSentinelTable
 	// #285 — per-session NDJSON recorder. Default off; only constructed
 	// when the operator passed --record-sessions-dir. Start() creates
 	// the dir + recovers any stale .partial files. Fatal on failure so
@@ -1593,28 +1662,48 @@ func buildAuditManager(
 	mgr := audit.NewManager(audit.ManagerOptions{
 		LogWriter:           logWriter,
 		WebhookPusher:       webhookPusher,
+		RoutesEngine:        routesEngine,
 		SecurityLakeWriter:  securityLakeWriter,
 		ObjectStorageWriter: objectStorageWriter,
 		SessionRecorder:     sessRecorder,
 	})
-	// Heartbeat wiring. When the rule engine is enabled (which the
-	// license gate currently blocks pre-#235), we'd bind the
-	// heartbeater into it; without the engine, the heartbeater still
+	// Rule engine wraps the Manager so registered alert rules observe
+	// every event emitted into the manager + can re-emit synthesized
+	// alert events back through the same fan-out. Per
+	// [[oss-only-launch-decision]] the engine is unconditionally wired
+	// when --alert-rules is set (license enforcement disabled at
+	// v1.0). The emitter handed to the proxy / heartbeater is the
+	// RuleEngine when alert-rules is on, the Manager otherwise.
+	var ruleEng *audit.RuleEngine
+	var emitter audit.Emitter = mgr
+	if alertRulesCfg != nil {
+		rules := audit.BuildBuiltinRules(alertRulesCfg)
+		eng, err := audit.NewRuleEngine(mgr, rules)
+		if err != nil {
+			return nil, nil, noop, fmt.Errorf("kbounce: rule engine: %w", err)
+		}
+		ruleEng = eng
+		emitter = ruleEng
+	}
+	// Heartbeat wiring. When the rule engine is enabled (now
+	// available at v1.0 per [[oss-only-launch-decision]]), bind the
+	// heartbeater into it so the heartbeat_gap rule can flip /healthz
+	// on a missed tick. Without the engine, the heartbeater still
 	// emits HEARTBEAT events so the SIEM-side gap rule has its
 	// liveness signal, and Healthy() always reports true (no local
 	// watchdog without the rule engine — the gap is observable on
 	// the SIEM side via the missing seq numbers).
 	var hb *audit.Heartbeater
-	var emitter audit.Emitter = mgr
 	if heartbeatInterval > 0 {
 		hb = audit.NewHeartbeater(emitter, heartbeatInterval)
 		// Bind into the Manager so its Status() surfaces the
 		// heartbeat fields for the MCP audit-export status tool +
 		// the startup banner — symmetric with the engine-wrapped
-		// path. (When/if the rule engine lights up post-#235, the
-		// CLI also calls eng.BindHeartbeater so the local
-		// heartbeat_gap rule can flip /healthz on a missed tick.)
+		// path.
 		mgr.BindHeartbeater(hb)
+		if ruleEng != nil {
+			ruleEng.BindHeartbeater(hb)
+		}
 		hb.Start(ctx)
 	}
 	// Per [[audit-export-failure-visibility]]: /healthz flips to 503
@@ -1642,6 +1731,9 @@ func buildAuditManager(
 	closer := func() {
 		if hb != nil {
 			hb.Close()
+		}
+		if routesEngine != nil {
+			routesEngine.Close()
 		}
 		mgr.Close()
 	}
