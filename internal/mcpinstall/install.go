@@ -1,14 +1,16 @@
 // Package mcpinstall implements the `kbounce mcp install-*` commands +
 // the `show-config` / `list-tools` helpers.
 //
-// Cross-product parity: this package mirrors the iam-jit `ibounce mcp
-// install-*` shape so an operator who learned one product gets the
-// same shape on the other ([[cross-product-agent-parity]]). The MCP
-// server entrypoint command differs (`kbounce` vs `ibounce`); the
-// tool-name prefix differs (`kbounce_*` vs `ibounce_*`); everything
-// else — flag names, path detection logic, atomic write pattern,
-// `show-config` output structure, `list-tools` output format — is
-// the same shape on both sides.
+// Cross-product parity: this package mirrors dbounce's
+// internal/mcpinstall + iam-jit's `ibounce mcp install-*` shape so
+// an operator who learned one product gets the same shape on the
+// other ([[cross-product-agent-parity]]). The MCP server entrypoint
+// command differs (`kbounce` vs `dbounce` vs `ibounce`); the
+// tool-name prefix differs (`kbounce_*` vs `dbounce_*` vs
+// `ibounce_*`); everything else — flag names, path detection logic,
+// atomic write pattern, `show-config` output structure,
+// `list-tools` output format, agent-attribution env vars — is the
+// same shape on all three sides.
 //
 // Audit-cadence notes (per [[audit-cadence-discipline]]):
 //
@@ -61,31 +63,111 @@ const ServerCommand = "kbounce"
 // written to operator laptops keep working.
 var ServerArgs = []string{"mcp", "serve"}
 
+// DefaultAgentName is the agent-attribution name stamped into the
+// generated MCP entry when the caller doesn't pass one explicitly.
+// "claude-code" matches the install-claude-code default; the cursor +
+// codex installers override per [[cross-product-agent-parity]] + #308
+// + #375 / §A35b (cross-bouncer agent-attribution env-var injection).
+// Mirrors ibounce's _ibounce_mcp_config_dict(agent_name_default=...)
+// default + dbounce's mcpinstall.DefaultAgentName.
+const DefaultAgentName = "claude-code"
+
+// AgentNameEnvVar is the env-var key the agent runtime reads to stamp
+// the X-Agent-Name HTTP header. The KBOUNCE_ prefix keeps the env-var
+// namespace consistent across the Bounce suite (IBOUNCE_AGENT_NAME /
+// DBOUNCE_AGENT_NAME ship the same shape on the sibling products).
+const AgentNameEnvVar = "KBOUNCE_AGENT_NAME"
+
+// AgentSessionIDEnvVar is the env-var key the agent runtime reads to
+// stamp the X-Agent-Session-Id HTTP header. Deliberately left EMPTY
+// in the static snippet — the agent runtime mints a fresh UUID v7 per
+// session. kbouncer itself never reads this env var; it's a hint to
+// the AGENT runtime, not configuration kbouncer consumes.
+const AgentSessionIDEnvVar = "KBOUNCE_AGENT_SESSION_ID"
+
+// agentNameForClient returns the agent-name attribution value to
+// stamp for the given install-* client. Names match ibounce + dbounce
+// per [[cross-product-agent-parity]]:
+//
+//	claude-code  → "claude-code"
+//	cursor       → "cursor"
+//	codex        → "openai-codex"
+//	anything else → DefaultAgentName ("claude-code")
+//
+// Exposed (lowercase) for the cli wrapper; the JSON-merge path uses
+// it to vary per-installer without duplicating snippet construction.
+func agentNameForClient(clientName string) string {
+	switch clientName {
+	case "claude-code":
+		return "claude-code"
+	case "cursor":
+		return "cursor"
+	case "codex":
+		return "openai-codex"
+	default:
+		return DefaultAgentName
+	}
+}
+
 // ServerConfigDict is the canonical JSON snippet shape any MCP client
 // ingests to use kbounce as an MCP server (stdio transport). Centralized
 // so show-config, install-claude-code, install-cursor, install-codex,
 // and any future installer emit the SAME shape. Mirrors the
-// _mcp_server_config_dict() helper on the ibounce side.
+// _ibounce_mcp_config_dict() helper on the ibounce side. Defaults
+// agent-name attribution to DefaultAgentName; see
+// ServerConfigDictForAgent for per-client overrides.
 func ServerConfigDict() map[string]any {
+	return ServerConfigDictForAgent(DefaultAgentName)
+}
+
+// ServerConfigDictForAgent is the per-agent variant of
+// ServerConfigDict. The env block carries the #308 / §A35b agent-
+// attribution hints (AgentNameEnvVar + AgentSessionIDEnvVar); the
+// session id is deliberately empty in the static snippet because the
+// agent runtime mints a fresh UUID v7 per session. kbouncer itself
+// never reads these env vars — they're a hint to the AGENT runtime,
+// not config kbouncer consumes. See iam-roles/docs/AGENT-ATTRIBUTION.md
+// for the per-runtime header-injection patterns.
+func ServerConfigDictForAgent(agentName string) map[string]any {
+	if agentName == "" {
+		agentName = DefaultAgentName
+	}
 	return map[string]any{
 		"mcpServers": map[string]any{
-			ServerName: map[string]any{
-				"command": ServerCommand,
-				"args":    append([]string{}, ServerArgs...),
-				"env":     map[string]any{},
-			},
+			ServerName: ServerEntryForAgent(agentName),
 		},
 	}
 }
 
 // ServerEntry is the per-server portion of ServerConfigDict — the
 // value most clients want to merge into their own existing
-// mcpServers map.
+// mcpServers map. Uses DefaultAgentName; see ServerEntryForAgent for
+// per-client overrides.
 func ServerEntry() map[string]any {
+	return ServerEntryForAgent(DefaultAgentName)
+}
+
+// ServerEntryForAgent is the per-agent variant of ServerEntry. See
+// ServerConfigDictForAgent for the env-block design rationale.
+func ServerEntryForAgent(agentName string) map[string]any {
+	if agentName == "" {
+		agentName = DefaultAgentName
+	}
 	return map[string]any{
 		"command": ServerCommand,
 		"args":    append([]string{}, ServerArgs...),
-		"env":     map[string]any{},
+		"env": map[string]any{
+			// #308 + #375 / §A35b — agent-attribution env-var
+			// injection. The agent's MCP host inherits these into the
+			// child process; the agent's HTTP client stamps them as
+			// X-Agent-Name + X-Agent-Session-Id on every outbound
+			// call back through the Bouncers' HTTP-shaped surfaces
+			// (gbounce; ibounce's AWS-API proxy mode). The session
+			// id is deliberately empty — the runtime mints a UUID
+			// v7 per session.
+			AgentNameEnvVar:      agentName,
+			AgentSessionIDEnvVar: "",
+		},
 	}
 }
 
@@ -347,7 +429,12 @@ func installJSON(target, clientName string, opts Options) (*InstallResult, error
 	if _, hadKbounce := servers[ServerName]; hadKbounce {
 		res.Updated = true
 	}
-	servers[ServerName] = ServerEntry()
+	// #375 / §A35b — per-client agent-attribution. installJSON is the
+	// single write-path for claude-code / cursor / codex JSON installs;
+	// agentNameForClient varies the AgentNameEnvVar value per client
+	// so the agent runtime stamps the correct X-Agent-Name on
+	// outbound HTTP traffic. Mirrors dbounce + ibounce.
+	servers[ServerName] = ServerEntryForAgent(agentNameForClient(clientName))
 	existing["mcpServers"] = servers
 
 	res.Created = !existed
@@ -445,6 +532,17 @@ func snippetTOML() (string, error) {
 		b.WriteString("\"")
 	}
 	b.WriteString("]\n")
+	// #375 / §A35b — agent-attribution env vars. Codex install is the
+	// "openai-codex" client; the TOML snippet matches the JSON shape
+	// so an operator who hand-pastes gets the same agent attribution
+	// as the auto-install paths.
+	b.WriteString("\n[mcp_servers.")
+	b.WriteString(ServerName)
+	b.WriteString(".env]\n")
+	b.WriteString(AgentNameEnvVar)
+	b.WriteString(" = \"openai-codex\"\n")
+	b.WriteString(AgentSessionIDEnvVar)
+	b.WriteString(" = \"\"\n")
 	return b.String(), nil
 }
 
@@ -479,8 +577,10 @@ func ShowConfig(w io.Writer, shape Shape) error {
 		}
 	case ShapeYAML:
 		// Hand-emit the YAML so we don't add a yaml dep just for this
-		// 6-line document. The shape is fixed by ServerConfigDict so
-		// the output is deterministic.
+		// short document. The shape is fixed by ServerConfigDict so
+		// the output is deterministic. #375 / §A35b — env block
+		// carries the agent-attribution hints; matches the JSON
+		// branch above.
 		yaml := "mcpServers:\n" +
 			"  " + ServerName + ":\n" +
 			"    command: " + ServerCommand + "\n" +
@@ -488,7 +588,9 @@ func ShowConfig(w io.Writer, shape Shape) error {
 		for _, a := range ServerArgs {
 			yaml += "      - " + a + "\n"
 		}
-		yaml += "    env: {}\n"
+		yaml += "    env:\n" +
+			"      " + AgentNameEnvVar + ": " + DefaultAgentName + "\n" +
+			"      " + AgentSessionIDEnvVar + ": \"\"\n"
 		if _, err := w.Write([]byte(yaml)); err != nil {
 			return err
 		}
@@ -502,7 +604,13 @@ func ShowConfig(w io.Writer, shape Shape) error {
 	footer := "\n# Or for the common MCP clients:\n" +
 		"#   kbounce mcp install-claude-code\n" +
 		"#   kbounce mcp install-cursor\n" +
-		"#   kbounce mcp install-codex\n"
+		"#   kbounce mcp install-codex\n" +
+		"#\n" +
+		"# Agent attribution (#375 / §A35b): the " + AgentNameEnvVar + " +\n" +
+		"# " + AgentSessionIDEnvVar + " env vars wire the agent's\n" +
+		"# X-Agent-Name + X-Agent-Session-Id HTTP headers. See\n" +
+		"# iam-roles/docs/AGENT-ATTRIBUTION.md for the per-runtime\n" +
+		"# patterns (Claude Code / Cursor / Codex / custom).\n"
 	if _, err := w.Write([]byte(footer)); err != nil {
 		return err
 	}

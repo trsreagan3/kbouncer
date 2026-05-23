@@ -5,6 +5,47 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Fixed
+
+- **#375 / §A35b — kbounce mcp install-* now ACTUALLY emits agent-attribution env block** (2026-05-23) —
+  The 2026-05-22 #308 entry (lines 436-461 below) claimed
+  `kbounce mcp install-*` stamped `KBOUNCE_AGENT_NAME` +
+  `KBOUNCE_AGENT_SESSION_ID` env vars on the generated MCP server
+  entry, but the actual code path in
+  `internal/mcpinstall/install.go` emitted `"env": map[string]any{}`
+  on every install (claude-code / cursor / codex JSON + TOML +
+  show-config YAML). Same regression #366 fixed on dbounce two days
+  ago — kbouncer's slice landed without the wiring. This slice:
+  adds `DefaultAgentName` + `AgentNameEnvVar` ("KBOUNCE_AGENT_NAME") +
+  `AgentSessionIDEnvVar` ("KBOUNCE_AGENT_SESSION_ID") constants;
+  splits `ServerConfigDict` / `ServerEntry` into base + `*ForAgent`
+  variants so the JSON snippet construction mirrors dbounce; adds
+  `agentNameForClient` for the per-client mapping (claude-code →
+  "claude-code", cursor → "cursor", codex → "openai-codex"); updates
+  the `installJSON` write path to call `ServerEntryForAgent(agentNameForClient(clientName))`;
+  updates `snippetTOML` to include the `[mcp_servers.kbounce.env]`
+  block; updates `ShowConfig` YAML branch to render the populated env
+  block (was `env: {}`); updates the show-config footer to point at
+  `iam-roles/docs/AGENT-ATTRIBUTION.md`. Validated by 7 new tests in
+  `internal/mcpinstall/install_test.go`
+  (`TestInstallJSON_EmitsAgentEnv_ClaudeCode`,
+  `TestInstallJSON_EmitsAgentEnv_Cursor`,
+  `TestInstallJSON_EmitsAgentEnv_Codex`,
+  `TestInstallCodex_TOMLSnippet_ContainsAgentEnv`,
+  `TestShowConfig_YAML_ContainsEnvBlock`,
+  `TestShowConfig_JSON_ContainsEnvBlock`,
+  `TestAgentNameForClient_KnownClients`) + tightening of the
+  existing `TestServerConfigDict_Shape` env assertion. Smoke
+  verified: `kbounce mcp install-claude-code --path /tmp/kb.json`
+  → `jq .mcpServers.kbounce.env` → `{"KBOUNCE_AGENT_NAME":
+  "claude-code", "KBOUNCE_AGENT_SESSION_ID": ""}` (cursor →
+  `"cursor"`, codex → `"openai-codex"`). Per
+  `[[cross-product-agent-parity]]` + `[[deliberate-feature-completion]]`:
+  the CHANGELOG promise from #308 now matches behavior. Ibounce
+  (`iam-roles/src/iam_jit/bouncer_cli.py:_ibounce_mcp_config_dict`)
+  was independently verified during the #375 audit and already
+  emits the populated env block — no parallel fix needed there.
+
 ### Changed
 
 - **#296 / §A22 — SQLite store concurrency hardening (CRITICAL audit-loss fix)** (2026-05-22) —

@@ -43,10 +43,151 @@ func TestServerConfigDict_Shape(t *testing.T) {
 	assert.Equal(t, []string{"mcp", "serve"}, args,
 		"generated MCP configs must invoke `kbounce mcp serve` so they don't depend on the back-compat bare default")
 
-	// env is present but empty so clients that require the field don't
-	// blow up.
-	_, hasEnv := entry["env"]
-	assert.True(t, hasEnv)
+	// #375 / §A35b — env block carries the agent-attribution hints.
+	// KBOUNCE_AGENT_NAME defaults to "claude-code"; KBOUNCE_AGENT_SESSION_ID
+	// is deliberately empty (the runtime mints a fresh UUID v7 per session).
+	env, hasEnv := entry["env"].(map[string]any)
+	require.True(t, hasEnv, "env block must be present + an object")
+	assert.Equal(t, DefaultAgentName, env[AgentNameEnvVar])
+	assert.Equal(t, "", env[AgentSessionIDEnvVar])
+}
+
+// ---------------------------------------------------------------------
+// #375 / §A35b — agent-attribution env-var injection (per-client).
+// ---------------------------------------------------------------------
+
+// TestInstallJSON_EmitsAgentEnv_ClaudeCode asserts the JSON written by
+// install-claude-code carries KBOUNCE_AGENT_NAME=claude-code so the
+// agent runtime stamps X-Agent-Name="claude-code" on outbound HTTP.
+func TestInstallJSON_EmitsAgentEnv_ClaudeCode(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "config.json")
+
+	_, err := InstallClaudeCode(Options{Path: target, Out: &bytes.Buffer{}})
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(target)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(data, &got))
+	servers := got["mcpServers"].(map[string]any)
+	entry := servers[ServerName].(map[string]any)
+	env, ok := entry["env"].(map[string]any)
+	require.True(t, ok, "env block must be a JSON object")
+	assert.Equal(t, "claude-code", env[AgentNameEnvVar])
+	assert.Equal(t, "", env[AgentSessionIDEnvVar])
+}
+
+// TestInstallJSON_EmitsAgentEnv_Cursor asserts install-cursor stamps
+// KBOUNCE_AGENT_NAME=cursor.
+func TestInstallJSON_EmitsAgentEnv_Cursor(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "mcp.json")
+
+	_, err := InstallCursor(Options{Path: target, Out: &bytes.Buffer{}})
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(target)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(data, &got))
+	servers := got["mcpServers"].(map[string]any)
+	entry := servers[ServerName].(map[string]any)
+	env, ok := entry["env"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "cursor", env[AgentNameEnvVar])
+	assert.Equal(t, "", env[AgentSessionIDEnvVar])
+}
+
+// TestInstallJSON_EmitsAgentEnv_Codex asserts install-codex (JSON
+// path) stamps KBOUNCE_AGENT_NAME=openai-codex.
+func TestInstallJSON_EmitsAgentEnv_Codex(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "codex-mcp.json")
+
+	_, err := InstallCodex(Options{Path: target, Out: &bytes.Buffer{}})
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(target)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(data, &got))
+	servers := got["mcpServers"].(map[string]any)
+	entry := servers[ServerName].(map[string]any)
+	env, ok := entry["env"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "openai-codex", env[AgentNameEnvVar])
+	assert.Equal(t, "", env[AgentSessionIDEnvVar])
+}
+
+// TestInstallCodex_TOMLSnippet_ContainsAgentEnv asserts the manual
+// TOML snippet for codex includes the agent-attribution env vars
+// so an operator who hand-pastes gets the same shape as the JSON
+// auto-install paths.
+func TestInstallCodex_TOMLSnippet_ContainsAgentEnv(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "config.toml")
+
+	out := &bytes.Buffer{}
+	res, err := InstallCodex(Options{Path: target, Out: out})
+	require.NoError(t, err)
+	require.True(t, res.Manual)
+
+	assert.Contains(t, res.Snippet, AgentNameEnvVar)
+	assert.Contains(t, res.Snippet, "openai-codex")
+	assert.Contains(t, res.Snippet, AgentSessionIDEnvVar)
+}
+
+// TestShowConfig_YAML_ContainsEnvBlock asserts the YAML branch of
+// show-config emits the agent-attribution env block (not `env: {}`).
+func TestShowConfig_YAML_ContainsEnvBlock(t *testing.T) {
+	out := &bytes.Buffer{}
+	require.NoError(t, ShowConfig(out, ShapeYAML))
+	s := out.String()
+	assert.Contains(t, s, "    env:")
+	assert.Contains(t, s, "      "+AgentNameEnvVar+": "+DefaultAgentName)
+	assert.Contains(t, s, "      "+AgentSessionIDEnvVar+": \"\"")
+	// Footer must point operators at AGENT-ATTRIBUTION.md.
+	assert.Contains(t, s, "Agent attribution")
+}
+
+// TestShowConfig_JSON_ContainsEnvBlock asserts the JSON branch
+// embeds the agent-attribution env vars (mirrors the YAML test).
+func TestShowConfig_JSON_ContainsEnvBlock(t *testing.T) {
+	out := &bytes.Buffer{}
+	require.NoError(t, ShowConfig(out, ShapeJSON))
+	s := out.String()
+	// Strip footer to parse JSON.
+	idx := strings.Index(s, "\n#")
+	require.Greater(t, idx, 0)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(s[:idx]), &got))
+	entry := got["mcpServers"].(map[string]any)[ServerName].(map[string]any)
+	env, ok := entry["env"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, DefaultAgentName, env[AgentNameEnvVar])
+	assert.Equal(t, "", env[AgentSessionIDEnvVar])
+}
+
+// TestAgentNameForClient_KnownClients locks the per-client mapping
+// down so a careless edit to agentNameForClient can't silently
+// reshape the X-Agent-Name HTTP header. Names match dbounce + ibounce.
+func TestAgentNameForClient_KnownClients(t *testing.T) {
+	cases := []struct {
+		client string
+		want   string
+	}{
+		{"claude-code", "claude-code"},
+		{"cursor", "cursor"},
+		{"codex", "openai-codex"},
+		{"unknown-client", DefaultAgentName},
+		{"", DefaultAgentName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.client, func(t *testing.T) {
+			assert.Equal(t, tc.want, agentNameForClient(tc.client))
+		})
+	}
 }
 
 // ---------------------------------------------------------------------
