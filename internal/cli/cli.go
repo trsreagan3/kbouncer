@@ -346,10 +346,11 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 					"alert-rules":        auditAlertRulesPath,
 					"heartbeat-interval": auditHeartbeatInterval.String(),
 				}
-				// #254 + #235 — until license-file plumbing lands,
-				// kbounce's --alert-rules surface is a hard ENTERPRISE
-				// gate (returns ErrAlertRulesLicenseRequired before any
-				// rule loads). The preset SKIPS this setting in v1.0
+				// #254 + #235 — license-file plumbing retained for any
+				// future paid tier per project_oss_only_launch_decision.md
+				// but does NOT gate features at v1.0; the current code
+				// path returns ErrAlertRulesLicenseRequired pending the
+				// license-disable refactor. The preset SKIPS this setting in v1.0
 				// per the spec's "if a product doesn't support a
 				// canonical setting, skip + annotate in the banner;
 				// don't error" guidance. When #235 lands, drop this
@@ -1120,8 +1121,10 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"emergency the same way). Default 98.")
 	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
 		"HTTPS URL of an operator-owned audit-event collector. Each decision "+
-			"event POSTed as JSON. ENTERPRISE-tier feature (license-gated; "+
-			"see #235 for license-file plumbing status). Bounded queue + "+
+			"event POSTed as JSON. Ships in the v1.0 free + open-source release "+
+			"(license-file plumbing #235 retained for any future paid tier per "+
+				"project_oss_only_launch_decision.md but does NOT gate this "+
+				"flag at v1.0). Bounded queue + "+
 			"exponential backoff retry + drop-on-overflow with synthetic "+
 			"AUDIT_DROPPED marker so consumers see the gap. SSRF-gated: "+
 			"refuses RFC1918 / loopback / .internal / .local without "+
@@ -1163,8 +1166,11 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"the table on first ingest. Ignored by other presets.")
 	// Slice 2 of #252 — suspicious-activity alert rule engine.
 	cmd.Flags().StringVar(&auditAlertRoutesPath, "alert-routes", "",
-		"#280 (ENTERPRISE tier — license-gated) — YAML file describing "+
-			"per-org notification routing. When set, the multi-destination "+
+		"#280 — YAML file describing "+
+			"per-org notification routing. Ships in the v1.0 free + open-source "+
+				"release (license-file plumbing #235 retained for any future "+
+				"paid tier per project_oss_only_launch_decision.md but does "+
+				"NOT gate this flag at v1.0). When set, the multi-destination "+
 			"routing engine activates: each event is matched against the "+
 			"configured routes' match blocks + dispatched to the route's "+
 			"destinations (webhook / pagerduty / slack). When unset, the "+
@@ -1183,8 +1189,10 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"built-in defaults (so an empty file enables all five rules with "+
 			"their defaults). Alert events ride the same JSONL log + HTTPS "+
 			"webhook transport as decision events (OCSF class 6003, "+
-			"activity_id 99, activity_name 'anomaly_detected'). ENTERPRISE-"+
-			"tier (license-gated; see #235 for license-file plumbing status).")
+			"activity_id 99, activity_name 'anomaly_detected'). v1.0 free + open-"+
+			"source release (license-file plumbing #235 retained for any future "+
+				"paid tier per project_oss_only_launch_decision.md but does "+
+				"NOT gate this flag at v1.0).")
 	// Heartbeat liveness emitter — per [[prompt-injection-disable-
 	// bouncer-threat]] + [[audit-export-failure-visibility]]. OFF
 	// by default; 30s recommended for Enterprise.
@@ -1209,7 +1217,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 		"Audit-export heartbeat cadence. When non-zero, a background "+
 			"goroutine emits a HEARTBEAT OCSF event at this interval so a "+
 			"downstream SIEM has a positive liveness signal for the audit-"+
-			"export channel. Recommended: 30s for Enterprise deployments. "+
+			"export channel. Recommended: 30s for compliance-heavy deployments. "+
 			"Default 0 (DISABLED) per [[security-team-positioning-safety-"+
 			"not-surveillance]] — opt in once the SIEM has a `heartbeat_gap` "+
 			"rule wired. Pairs with the local heartbeat_gap rule (enabled "+
@@ -1218,7 +1226,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"export channel itself may be the failure source, so the "+
 			"fallback surfaces must not ride through it). Minimum 1s; "+
 			"requires --alert-rules to be a non-empty path for the local "+
-			"gap detection (ENTERPRISE-tier).")
+			"gap detection.")
 	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "",
 		"Bearer token required for GET /audit/events (#271) when the "+
 			"proxy is bound externally. Empty + loopback bind = no auth "+

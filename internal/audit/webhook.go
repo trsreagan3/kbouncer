@@ -20,8 +20,11 @@ import (
 // consumer sees the gap rather than getting silently-dropped
 // events.
 //
-// Enterprise-tier feature (license-gated at the CLI; this package
-// does the transport, the CLI decides whether to construct one).
+// Ships in the v1.0 free + open-source release per
+// project_oss_only_launch_decision.md. The license-gate code path
+// in internal/cli/cli.go is retained for any future paid tier but
+// does NOT gate this transport at v1.0; this package does the
+// transport, the CLI decides whether to construct one.
 //
 // Token handling: the bearer token is set on outgoing requests
 // only. It is NEVER logged, NEVER printed in error messages, NEVER
