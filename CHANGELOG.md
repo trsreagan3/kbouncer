@@ -5,6 +5,45 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Docs
+
+- **#367 / §A36 — Docker bind-mount UID 65532 + colima caveat documented in README** (2026-05-23) —
+  The distroless `:nonroot` runtime runs as UID 65532 (non-root for
+  security). Operators bind-mounting a host directory hit a cryptic
+  `open store: unable to open database file` because the host dir
+  wasn't writable by 65532, and the existing Docker docs gave no
+  fix-it hint. This slice adds a **"Bind-mounting volumes (UID 65532)"**
+  section showing two remediation paths (`chown 65532:65532 <hostdir>`
+  OR `--user $(id -u):$(id -g)`), a docker-compose example with
+  matching `user:` setting + pre-up chown comment, a **macOS / colima
+  caveat** about `/Users/*` paths being the only reliable bind-mount
+  surface (mounts under `/tmp`, `/var`, `/private` silently diverge),
+  and a **"Common errors"** table mapping the store-open error and
+  three other usual-suspect symptoms back to the bind-mount section.
+  Closes the gap an operator following docs-as-written would hit on
+  their first `docker run` with persistence enabled.
+
+### CI
+
+- **#368 / §A37 — docker-publish smoke now boots proxy + asserts audit DB written** (2026-05-23) —
+  Previously the smoke between local build and multi-arch push was
+  `--version` + `--help` only. Per the auditor that smoke would NOT
+  have caught the Helm-chart flag drift surfaced in §A33
+  (`--active-profile` vs `--profile`) if the binary changed — running
+  `--help` proves the binary starts, not that any `run`-time flag
+  actually wires through. This slice adds a **Real-deploy smoke**
+  step after the size report: boots `kbounce run` in a container
+  with a chown'd bind-mounted host data dir (mirroring the
+  bind-mount docs that just landed for §A36), waits up to 30s for
+  `/healthz` to answer, asserts the response is HTTP 200, and asserts
+  `state.db` exists on the host bind-mount (proving the binary
+  actually opened the SQLite store under `run`). If `run` rejects a
+  flag, fails to bind, or silently never opens persistence, the
+  smoke fails before the multi-arch push fires. The step block is
+  annotated with `RUN_LOCALLY:` comments so operators can copy-run
+  the same smoke against `ghcr.io/trsreagan3/kbounce:latest` on a
+  dev machine. Validated by yaml-parse smoke locally.
+
 ### Fixed
 
 - **#375 / §A35b — kbounce mcp install-* now ACTUALLY emits agent-attribution env block** (2026-05-23) —

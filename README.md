@@ -118,6 +118,84 @@ Notes:
   `trsreagan3/helm-charts` (not yet published; the repo reference is
   forward-looking).
 
+#### Bind-mounting volumes (UID 65532)
+
+The distroless `:nonroot` base runs as **UID 65532** (no shell, no
+package manager, non-root for security). When you bind-mount a host
+directory into the container, that directory must be writable by UID
+65532 — otherwise kbounce's first attempt to open the SQLite audit
+DB or write profiles to the mount will fail with a cryptic error
+like:
+
+```
+open store: unable to open database file
+```
+
+Two ways to fix this:
+
+```sh
+# Option A — chown the host directory once (preferred for daemons).
+mkdir -p ~/.kbouncer
+sudo chown -R 65532:65532 ~/.kbouncer
+docker run --rm \
+  -p 8766:8766 \
+  -v ~/.kbouncer:/home/nonroot/.kbouncer \
+  ghcr.io/trsreagan3/kbounce:latest \
+  run --upstream https://kubernetes.default.svc
+
+# Option B — run as your host UID (preferred for short-lived dev runs
+# where you don't want to leave a host directory owned by 65532).
+mkdir -p ~/.kbouncer
+docker run --rm \
+  --user $(id -u):$(id -g) \
+  -p 8766:8766 \
+  -v ~/.kbouncer:/home/nonroot/.kbouncer \
+  ghcr.io/trsreagan3/kbounce:latest \
+  run --upstream https://kubernetes.default.svc
+```
+
+**macOS / colima caveat**: colima only bind-mounts `/Users/*` paths
+reliably. Mounts under `/tmp`, `/var`, or `/private` silently diverge
+between the host and the colima VM — files written by the container
+may not appear on the host, and vice versa. Always mount paths under
+`/Users/<you>/` on Mac.
+
+#### docker-compose example
+
+```yaml
+# compose.yaml — kbounce with host-owned audit dir + cooperative mode.
+services:
+  kbounce:
+    image: ghcr.io/trsreagan3/kbounce:latest
+    user: "65532:65532"             # match the distroless :nonroot UID
+    command:
+      - run
+      - --upstream
+      - https://kubernetes.default.svc
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8766"
+      - --kubeconfig
+      - /home/nonroot/.kube/config
+    ports:
+      - "127.0.0.1:8766:8766"       # loopback-only on the host
+    volumes:
+      - ./kube:/home/nonroot/.kube:ro
+      - ./kbouncer-data:/home/nonroot/.kbouncer
+    # Before `docker compose up`, run once:
+    #   mkdir -p ./kbouncer-data && sudo chown 65532:65532 ./kbouncer-data
+```
+
+#### Common errors
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `open store: unable to open database file` | Bind-mounted dir not writable by UID 65532 | See **Bind-mounting volumes** above |
+| `permission denied` on `/home/nonroot/.kbouncer/...` | Same UID-65532 ownership issue | `chown -R 65532:65532 <hostdir>` or `--user $(id -u):$(id -g)` |
+| Files written in container don't appear on host (macOS) | Mount path under `/tmp` or `/var` on colima | Move mount under `/Users/<you>/` |
+| `bind: address already in use` on `:8766` | Another kbounce / process already on the port | `lsof -i :8766` then stop the conflicting process or `-p 8767:8766` |
+
 ---
 
 ## Operating modes
