@@ -451,6 +451,10 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolListAuditWebhookPresets(args)
 	case "kbounce_posture":
 		return s.toolPosture(args)
+	case "kbounce_profile_allow":
+		return s.toolProfileAllow(args)
+	case "kbounce_denies_recent":
+		return s.toolDeniesRecent(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }

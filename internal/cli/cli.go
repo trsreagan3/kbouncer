@@ -37,6 +37,7 @@ import (
 	"github.com/trsreagan3/kbouncer/internal/mcp"
 	"github.com/trsreagan3/kbouncer/internal/mcpinstall"
 	"github.com/trsreagan3/kbouncer/internal/profile"
+	"github.com/trsreagan3/kbouncer/internal/profileallow"
 	"github.com/trsreagan3/kbouncer/internal/proxy"
 	"github.com/trsreagan3/kbouncer/internal/store"
 	"github.com/trsreagan3/kbouncer/internal/tlsmat"
@@ -1680,7 +1681,221 @@ prints the full record for a single profile.`,
 	cmd.AddCommand(newProfileInstallCmd())
 	cmd.AddCommand(newProfileInstallDefaultsCmd())
 	cmd.AddCommand(newProfileDoctorCmd())
+	cmd.AddCommand(newProfileAllowCmd())
+	cmd.AddCommand(newDeniesCmd())
 	return cmd
+}
+
+// newProfileAllowCmd implements `kbounce profile allow` per #386 /
+// §A25 Phase 2. Mirrors the iam-jit Python `iam-jit profile allow`
+// shape so the cross-bouncer fan-out from iam-jit sees an
+// identical surface in kbounce. Per [[cross-product-agent-parity]].
+func newProfileAllowCmd() *cobra.Command {
+	var (
+		target       string
+		actions      []string
+		reason       string
+		duration     string
+		profileName  string
+		profilesPath string
+		jsonOut      bool
+	)
+	cmd := &cobra.Command{
+		Use:   "allow",
+		Short: "Add an allow rule to a kbounce profile (operator easy-allow)",
+		Long: `Append a profile allow rule with provenance metadata.
+
+  kbounce profile allow --target 'namespaces/staging' \
+    --action 'apps/deployments:get' \
+    --reason "agent reads staging deployments for synthesis"
+
+Refuses --target '*' (force operator specificity) + actions without a
+':' separator. Refuses to mutate org-distributed profiles
+(operators create a local override profile to layer on top).
+
+The provenance note format is:
+  [easy_allow] <reason> -- by=<actor> via=cli [duration=... | expires=...]
+
+Mirrors the iam-jit Python CLI surface 1:1 per
+[[cross-product-agent-parity]].`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			res, err := profileallow.AddProfileAllowRule(profileallow.Options{
+				Target:       target,
+				Actions:      actions,
+				Reason:       reason,
+				Duration:     duration,
+				ProfileName:  profileName,
+				ProfilesPath: profilesPath,
+				Source:       profileallow.SourceCLI,
+			})
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(res)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"kbounce: %s allow rule(s) appended to profile %q (now %d rule(s))\n"+
+					"  target  : %s\n"+
+					"  actions : %s\n"+
+					"  reason  : %s\n"+
+					"  written : %s\n",
+				res.Status, res.ProfileName, res.RuleCountAfter,
+				res.Target, strings.Join(res.Actions, ", "),
+				res.Reason, res.ProfilePath)
+			if res.ExpiresAt != "" {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"  expires : %s (advisory metadata; remove via YAML edit)\n",
+					res.ExpiresAt)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&target, "target", "",
+		"Target pattern to allow (e.g. 'namespaces/staging'). '*' is refused.")
+	cmd.Flags().StringSliceVar(&actions, "action", nil,
+		"One or more 'verb:resource' strings (repeat to pass multiple).")
+	cmd.Flags().StringVar(&reason, "reason", "",
+		"Operator-supplied explanation (surfaces in note + audit event).")
+	cmd.Flags().StringVar(&duration, "duration", "",
+		"Optional Go-style duration ('3h', '7d'); empty/'permanent' = permanent.")
+	cmd.Flags().StringVar(&profileName, "profile", "",
+		"Profile to mutate (default: active profile).")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Emit JSON instead of human-readable output.")
+	_ = cmd.MarkFlagRequired("target")
+	_ = cmd.MarkFlagRequired("action")
+	_ = cmd.MarkFlagRequired("reason")
+	return cmd
+}
+
+// newDeniesCmd implements `kbounce denies recent` per #386 / §A25
+// Phase 2. Reads from the local SQLite store + projects DENY rows
+// into the cross-product shape (when, action, resource, deny_reason,
+// deny_source, suggested_allow_command).
+func newDeniesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "denies",
+		Short: "Inspect recent DENY decisions",
+		Args:  cobra.NoArgs,
+	}
+	cmd.RunE = parentRequiresSubcommand("denies", cmd)
+	cmd.AddCommand(newDeniesRecentCmd())
+	return cmd
+}
+
+func newDeniesRecentCmd() *cobra.Command {
+	var (
+		dbPath         string
+		since          string
+		limit          int
+		jsonOut        bool
+		agentSessionID string
+	)
+	cmd := &cobra.Command{
+		Use:   "recent",
+		Short: "List recent DENY decisions from the local audit store",
+		Long: `Reads from ~/.kbouncer/audit.db and projects each DENY row
+into the cross-product DenyRow shape (matches the iam-jit Python
+denies module byte-for-byte). Each row carries a
+suggested_allow_command an operator can copy-paste to lift the deny
+via 'kbounce profile allow'.
+
+  kbounce denies recent --since 5m
+  kbounce denies recent --agent-session <id> --json`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if dbPath == "" {
+				p, err := store.DefaultDBPath()
+				if err != nil {
+					return err
+				}
+				dbPath = p
+			}
+			st, err := store.Open(dbPath)
+			if err != nil {
+				return fmt.Errorf("kbounce: open store at %s: %w", dbPath, err)
+			}
+			defer st.Close()
+			lower, perr := parseSinceFlag(since)
+			if perr != nil {
+				return perr
+			}
+			rows, err := profileallow.RecentDenies(profileallow.RecentDeniesOptions{
+				Store:          st,
+				Since:          lower,
+				AgentSessionID: agentSessionID,
+				Limit:          limit,
+			})
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(rows)
+			}
+			if len(rows) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "kbounce: no recent denies")
+				return nil
+			}
+			for _, r := range rows {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"%s  action=%s  resource=%s  source=%s  reason=%s\n  suggested: %s\n",
+					r.When, r.Action, r.Resource, r.DenySource, r.DenyReason, r.SuggestedAllowCommand)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dbPath, "db", "",
+		"Path to kbounce SQLite store (default: ~/.kbouncer/audit.db).")
+	cmd.Flags().StringVar(&since, "since", "5m",
+		"Lower bound for `at` ('5m'/'1h'/'1d') or ISO 8601 timestamp.")
+	cmd.Flags().IntVar(&limit, "limit", 50, "Max rows to return.")
+	cmd.Flags().StringVar(&agentSessionID, "agent-session", "",
+		"Filter to one MCP session id.")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Emit JSON.")
+	return cmd
+}
+
+// parseSinceFlag converts '5m'/'1h'/'1d' or an ISO 8601 timestamp
+// into a time.Time lower bound.
+func parseSinceFlag(spec string) (time.Time, error) {
+	s := strings.TrimSpace(spec)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if strings.Contains(s, "T") || (len(s) >= 10 && s[4] == '-') {
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("kbounce: --since %q: %w", spec, err)
+		}
+		return t, nil
+	}
+	if len(s) < 2 {
+		return time.Time{}, fmt.Errorf("kbounce: --since %q: too short", spec)
+	}
+	unit := s[len(s)-1]
+	qty, err := strconv.Atoi(s[:len(s)-1])
+	if err != nil {
+		return time.Time{}, fmt.Errorf("kbounce: --since %q: %w", spec, err)
+	}
+	var d time.Duration
+	switch unit {
+	case 's':
+		d = time.Duration(qty) * time.Second
+	case 'm':
+		d = time.Duration(qty) * time.Minute
+	case 'h':
+		d = time.Duration(qty) * time.Hour
+	case 'd':
+		d = time.Duration(qty) * 24 * time.Hour
+	case 'w':
+		d = time.Duration(qty) * 7 * 24 * time.Hour
+	default:
+		return time.Time{}, fmt.Errorf("kbounce: --since %q: unknown unit %q", spec, string(unit))
+	}
+	return time.Now().UTC().Add(-d), nil
 }
 
 // newProfileInstallDefaultsCmd implements `kbounce profile install-

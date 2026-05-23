@@ -1719,6 +1719,15 @@ func NewServer(cfg Config, st *store.Store) *Server {
 	// catch-all "/" so the exact path wins ServeMux precedence.
 	mux.HandleFunc("/admin/dynamic-denies/reload",
 		s.dynamicDenyReloadHandler(cfg.AuditEventsToken))
+	// #386 / §A25 Phase 2 — POST /admin/profile/reload mgmt endpoint.
+	// Re-reads profiles.yaml from disk + hot-swaps the active profile
+	// pointer so a `kbounce profile allow` mutation takes effect on
+	// the very next decision without a bouncer restart. Same auth
+	// model as /audit/events. Mirrors ibounce's response shape so the
+	// cross-bouncer fan-out (iam-jit profile allow) sees consistent
+	// JSON across products per [[cross-product-agent-parity]].
+	mux.HandleFunc("/admin/profile/reload",
+		s.profileReloadHandler(cfg.AuditEventsToken, ""))
 	// #272 — GET / serves the minimal live audit-stream web UI. The
 	// page polls /audit/events every 2 s. kbounce's proxy port doubles
 	// as the mgmt port, so the UI shares the ServeMux with the k8s
