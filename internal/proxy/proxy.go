@@ -2567,6 +2567,19 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		EndsAt    string `json:"ends_at"`
 		Reason    string `json:"reason,omitempty"`
 	}
+	// #544 / MRR-5 M3 — cross-bouncer parity llm_budget shape. Go
+	// bouncers don't run LLM per [[bouncer-zero-llm-when-agent-in-loop]]
+	// (they're deterministic by default), so the field is the constant
+	// {"enabled": false}. Honest per [[ibounce-honest-positioning]] —
+	// NOT a stub. Returned unconditionally so a cross-bouncer SRE
+	// composite monitor (MRR-5 §2) sees the same key set across all
+	// four bouncers. If kbouncer ever adds optional LLM features,
+	// expand to match ibounce's full enabled-shape (used_today_usd,
+	// cap_per_day_usd, remaining_usd, percent_consumed,
+	// approaching_limit).
+	type HealthzLlmBudget struct {
+		Enabled bool `json:"enabled"`
+	}
 	payload := struct {
 		Status                      string                       `json:"status"`
 		Mode                        string                       `json:"mode"`
@@ -2584,6 +2597,17 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyReloads     int64                        `json:"total_dynamic_deny_reloads"`
 		TotalDynamicDenyParseErrors int64                        `json:"total_dynamic_deny_parse_errors"`
 		AuditLog                    *audit.DiskPressureSnapshot  `json:"audit_log,omitempty"`
+		// #544 / MRR-5 M2 — top-level chain_initialized bool. True iff
+		// the audit-export emitter is wired (cfg.AuditEmitter != nil);
+		// False covers both "audit export not configured at all" AND
+		// "emitter construction failed". Closes the cold-start gap
+		// noted in MRR-5-MONITORING-RUNBOOK.md §6 M2 where audit-init
+		// failure surfaced in the bouncer log but NOT on /healthz
+		// until the first decision tried to emit. Per
+		// [[cross-product-agent-parity]] all four bouncers surface the
+		// same field for SRE composite monitors.
+		ChainInitialized bool             `json:"chain_initialized"`
+		LlmBudget        HealthzLlmBudget `json:"llm_budget"`
 	}{
 		Status:                      "ok",
 		Mode:                        string(s.cfg.Mode),
@@ -2597,6 +2621,8 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyMatches:     s.totalDynamicDenyMatches.Load(),
 		TotalDynamicDenyReloads:     s.totalDynamicDenyReloads.Load(),
 		TotalDynamicDenyParseErrors: s.totalDynamicDenyParseErrors.Load(),
+		ChainInitialized:            s.cfg.AuditEmitter != nil,
+		LlmBudget:                   HealthzLlmBudget{Enabled: false},
 	}
 	if ap := s.ActiveProfile(); ap != nil {
 		payload.ActiveProfile = ap.Name
