@@ -1739,8 +1739,17 @@ func NewServer(cfg Config, st *store.Store) *Server {
 	// then POSTs each Bounce product's mgmt port to confirm rules are
 	// live. Same auth model as /audit/events. Registered BEFORE the
 	// catch-all "/" so the exact path wins ServeMux precedence.
+	//
+	// #524 BB-3 — defense-in-depth middleware closes the residual gap
+	// when a future code path bypasses the CLI's bind-time
+	// --audit-events-token requirement (config-file loader, programmatic
+	// embed, test harness). Handler-internal bearer check ALSO fires
+	// (belt-and-suspenders); requireMgmtAuth adds the "external bind
+	// without token → 503" failure case the handler-internal check
+	// can't enforce because it has no view of the bind host.
 	mux.HandleFunc("/admin/dynamic-denies/reload",
-		s.dynamicDenyReloadHandler(cfg.AuditEventsToken))
+		requireMgmtAuth(s.dynamicDenyReloadHandler(cfg.AuditEventsToken),
+			cfg.AuditEventsToken, cfg.Host))
 	// #386 / §A25 Phase 2 — POST /admin/profile/reload mgmt endpoint.
 	// Re-reads profiles.yaml from disk + hot-swaps the active profile
 	// pointer so a `kbounce profile allow` mutation takes effect on
@@ -1749,7 +1758,8 @@ func NewServer(cfg Config, st *store.Store) *Server {
 	// cross-bouncer fan-out (iam-jit profile allow) sees consistent
 	// JSON across products per [[cross-product-agent-parity]].
 	mux.HandleFunc("/admin/profile/reload",
-		s.profileReloadHandler(cfg.AuditEventsToken, ""))
+		requireMgmtAuth(s.profileReloadHandler(cfg.AuditEventsToken, ""),
+			cfg.AuditEventsToken, cfg.Host))
 	// #272 — GET / serves the minimal live audit-stream web UI. The
 	// page polls /audit/events every 2 s. kbounce's proxy port doubles
 	// as the mgmt port, so the UI shares the ServeMux with the k8s
