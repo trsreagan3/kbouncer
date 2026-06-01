@@ -48,11 +48,11 @@ func TestHealthzIncludesAuditLogBlock(t *testing.T) {
 }
 
 // TestHealthz503AtCriticalInPauseMode asserts the response flips to
-// 503 when refuse_requests is true.
+// 503 when refuse_requests is true (98.5% crosses default crit=98%).
 func TestHealthz503AtCriticalInPauseMode(t *testing.T) {
 	tmp := t.TempDir()
 	st := audit.NewDiskPressureState(audit.DiskPressureModePauseRequests, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatForProxy(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatForProxy(98.5), time.Now())
 	srv := NewServer(Config{DiskPressure: st}.Normalize(), freshStore(t))
 
 	rec := httptest.NewRecorder()
@@ -65,8 +65,8 @@ func TestHealthz503AtCriticalInPauseMode(t *testing.T) {
 	if !strings.Contains(body, `"refuse_requests":true`) {
 		t.Errorf("/healthz body missing refuse_requests=true: %s", body)
 	}
-	if !strings.Contains(body, `"status":"degraded"`) {
-		t.Errorf("/healthz body missing status=degraded: %s", body)
+	if !strings.Contains(body, `"status":"critical"`) {
+		t.Errorf("/healthz body missing status=critical: %s", body)
 	}
 }
 
@@ -76,7 +76,8 @@ func TestHealthz503AtCriticalInPauseMode(t *testing.T) {
 func TestHandle_DiskPressurePauseReturns503WithStructuredDeny(t *testing.T) {
 	tmp := t.TempDir()
 	st := audit.NewDiskPressureState(audit.DiskPressureModePauseRequests, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatForProxy(96.0), time.Now())
+	// 98.5% crosses the crit threshold (default 98%).
+	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatForProxy(98.5), time.Now())
 	srv := NewServer(Config{DiskPressure: st}.Normalize(), freshStore(t))
 
 	rec := httptest.NewRecorder()
