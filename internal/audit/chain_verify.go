@@ -54,9 +54,36 @@ func (r VerifyResult) OK() bool { return len(r.Inconsistencies) == 0 }
 // VerifyChain walks logDir's rotated archives + active audit.jsonl in
 // chronological order and validates the chain. stateFileMissing (if
 // known) is recorded in the result.
+//
+// The scan is file-scoped to the canonical "audit.jsonl" name:
+// only audit-TIMESTAMP.jsonl.gz siblings are included. Use
+// VerifyChainFile when the operator specified a non-default active
+// file path.
 func VerifyChain(logDir string, stateFileMissing bool) (VerifyResult, error) {
+	return verifyChainScoped(logDir, "audit.jsonl", stateFileMissing)
+}
+
+// VerifyChainFile is like VerifyChain but file-scoped to the named
+// active log file (activeFile is an absolute or relative path; the
+// directory is derived from it). Only rotated archives whose names
+// share the same stem as activeFile are included, so sibling files
+// from a different chain or an unrelated JSONL file never produce
+// false TAMPER reports.
+func VerifyChainFile(activeFilePath string, stateFileMissing bool) (VerifyResult, error) {
+	abs, err := filepath.Abs(activeFilePath)
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("chain verify: resolve path: %w", err)
+	}
+	logDir := filepath.Dir(abs)
+	base := filepath.Base(abs)
+	return verifyChainScoped(logDir, base, stateFileMissing)
+}
+
+// verifyChainScoped is the shared implementation for VerifyChain and
+// VerifyChainFile.
+func verifyChainScoped(logDir, activeFile string, stateFileMissing bool) (VerifyResult, error) {
 	res := VerifyResult{StateFileMissingAtStart: stateFileMissing}
-	files, err := chainSourceFiles(logDir)
+	files, err := chainSourceFilesScoped(logDir, activeFile)
 	if err != nil {
 		return res, err
 	}
@@ -291,13 +318,44 @@ func VerifyChainAndManifests(logDir string, publicKeyOverrideB64 string) (FullVe
 	return full, nil
 }
 
-// chainSourceFiles returns rotated archives (audit-*.jsonl.gz, sorted)
-// followed by the active audit.jsonl, in chronological order.
+// chainSourceFiles returns rotated archives followed by the active
+// JSONL file, in chronological order. It is SCOPED to the named
+// active file so that sibling files with different prefixes (other
+// chains, unrelated JSONL files) are never pulled in and do not
+// produce false TAMPER reports.
+//
+// Scoping rule (mirrors gbounce + dbounce fix for the dir-glob FP):
+//   - activeBase is the basename of the active log (e.g. "audit.jsonl").
+//   - The archive prefix is derived as <stem>- (e.g. "audit-").
+//   - Only files whose name starts with <stem>- AND ends with .jsonl.gz
+//     are included; all other siblings are ignored.
+//
+// This means passing --audit-log /logs/run1.jsonl only verifies
+// run1-TIMESTAMP.jsonl.gz archives, never run2-*.jsonl.gz or any
+// other unrelated file in /logs/.
 func chainSourceFiles(logDir string) ([]string, error) {
+	return chainSourceFilesScoped(logDir, "audit.jsonl")
+}
+
+// chainSourceFilesScoped is the file-scoped implementation. activeFile
+// is the basename (not path) of the active log. Callers that know the
+// exact active file pass it here; chainSourceFiles uses the canonical
+// "audit.jsonl" default.
+func chainSourceFilesScoped(logDir, activeFile string) ([]string, error) {
 	info, err := os.Stat(logDir)
 	if err != nil || !info.IsDir() {
 		return nil, nil
 	}
+
+	// Derive the archive prefix from the active file's stem.
+	// "audit.jsonl" → stem "audit" → prefix "audit-"
+	stem := strings.TrimSuffix(activeFile, ".jsonl")
+	if stem == activeFile {
+		// activeFile doesn't end in .jsonl; use it verbatim as the stem.
+		stem = activeFile
+	}
+	archivePrefix := stem + "-"
+
 	entries, err := os.ReadDir(logDir)
 	if err != nil {
 		return nil, err
@@ -305,12 +363,13 @@ func chainSourceFiles(logDir string) ([]string, error) {
 	var archives []string
 	for _, e := range entries {
 		n := e.Name()
-		if strings.HasPrefix(n, "audit-") && strings.HasSuffix(n, ".jsonl.gz") {
+		// Only include rotated archives belonging to THIS chain's stem.
+		if strings.HasPrefix(n, archivePrefix) && strings.HasSuffix(n, ".jsonl.gz") {
 			archives = append(archives, filepath.Join(logDir, n))
 		}
 	}
 	sort.Strings(archives)
-	active := filepath.Join(logDir, "audit.jsonl")
+	active := filepath.Join(logDir, activeFile)
 	if fi, err := os.Stat(active); err == nil && !fi.IsDir() {
 		archives = append(archives, active)
 	}
