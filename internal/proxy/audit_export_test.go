@@ -146,25 +146,54 @@ func TestAuditExport_TokenNeverInLogFile(t *testing.T) {
 // audit-export]] hot-path invariant: even with a wedged webhook,
 // proxy decision evaluation completes promptly. We use a webhook
 // that sleeps forever + queue depth = 1.
+//
+// The bound is race-aware: hotPathBound is 2s under normal builds and
+// 15s under -race (race instrumentation adds ~10-20x overhead per
+// synchronisation point). 15s is still well below the 30s wedge and
+// proves the enqueue never serialises behind the wedged worker.
+//
+// Teardown fix: the original test used plain defer ordering that left
+// the webhook worker stuck inside sendOnce for the full 30s wedge
+// sleep before Close() could return (defers are LIFO, so
+// wp.Close() ran before cancel()). We now:
+//  1. Give the fake server handler a cancellable context so it exits
+//     promptly when teardown starts (srv.CloseClientConnections lets
+//     httptest.Server.Close() return without waiting for the handler).
+//  2. Cancel the worker context before calling mgr.Close() so the
+//     in-flight HTTP request is aborted via context cancellation
+//     rather than waiting for the client.Timeout.
 func TestAuditExport_HotPathNeverBlocks(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(30 * time.Second) // pretend the collector is wedged
-	}))
-	defer srv.Close()
+	// wedgeCtx gates the server-side 30s sleep. Cancelling it lets
+	// the handler exit immediately so httptest.Server.Close() doesn't
+	// block waiting for the active connection to drain.
+	wedgeCtx, wedgeCancel := context.WithCancel(context.Background())
 
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-time.After(30 * time.Second): // pretend the collector is wedged
+		case <-wedgeCtx.Done():
+		}
+	}))
+
+	// Worker context: cancelled before Close() so sendOnce aborts via
+	// context rather than waiting for client.Timeout.
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+
+	// Belt-and-suspenders: short client timeout so any race between
+	// context cancellation and the HTTP round-trip doesn't leave the
+	// worker goroutine blocked indefinitely.
+	baseClient := srv.Client()
+	baseClient.Timeout = 3 * time.Second
+
 	wp, err := audit.NewWebhookPusher(ctx, audit.WebhookOptions{
 		URL:           srv.URL + "/audit",
 		Token:         integrationToken,
 		AllowInternal: true,
-		HTTPClient:    srv.Client(),
+		HTTPClient:    baseClient,
 		QueueDepth:    1,
 	})
 	require.NoError(t, err)
-	defer wp.Close()
 	mgr := audit.NewManager(audit.ManagerOptions{WebhookPusher: wp})
-	defer mgr.Close()
 
 	st := freshStore(t)
 	start := time.Now()
@@ -174,6 +203,19 @@ func TestAuditExport_HotPathNeverBlocks(t *testing.T) {
 			nil, "", EvalOptions{AuditEmitter: mgr})
 	}
 	elapsed := time.Since(start)
-	assert.Less(t, elapsed, 2*time.Second,
-		"500 decisions with wedged webhook must complete in well under 2s")
+	assert.Less(t, elapsed, hotPathBound,
+		"500 decisions with wedged webhook must complete in well under the wedge timeout (%s bound; 30s wedge)", hotPathBound)
+
+	// Tear down in an order that avoids all blocking paths:
+	//  1. Cancel the server-side wedge so the handler exits promptly.
+	//  2. Cancel the worker context so the in-flight HTTP request is
+	//     aborted (sendOnce uses NewRequestWithContext).
+	//  3. Close the manager (waits for the worker goroutine to exit —
+	//     now fast because the context is already cancelled).
+	//  4. Close the httptest server (now fast because the handler has
+	//     already returned, freeing the active connection).
+	wedgeCancel()
+	cancel()
+	mgr.Close()
+	srv.Close()
 }
