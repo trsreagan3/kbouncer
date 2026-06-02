@@ -3144,6 +3144,7 @@ the same way it does for Claude Code / Cursor.`,
 // address, never 127.0.0.1, because the cloud sandbox cannot route to
 // the operator's loopback.
 func newMCPInstallDevinCmd() *cobra.Command {
+	var devinHost string
 	cmd := &cobra.Command{
 		Use:   "install-devin",
 		Short: "Print the Devin (cloud agent) wiring recipe — no local config to write",
@@ -3163,16 +3164,24 @@ wiring paths instead of editing a config:
 
 Load-bearing caveat: a kbounce on 127.0.0.1 is NOT visible to Devin's
 cloud sandbox — kbounce must be bound to a host the sandbox can reach
-over the network.`,
+over the network.
+
+Pass --devin-host HOST to bake a concrete reachable address into the
+recipe's kubectl server + kubeconfig lines (default: <kbounce-host>
+placeholder + a substitute note on stderr).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := mcpinstall.InstallDevin(mcpinstall.Options{
-				Out:    cmd.OutOrStdout(),
-				Stderr: cmd.ErrOrStderr(),
+				DevinHost: devinHost,
+				Out:       cmd.OutOrStdout(),
+				Stderr:    cmd.ErrOrStderr(),
 			})
 			return err
 		},
 	}
+	cmd.Flags().StringVar(&devinHost, "devin-host", "",
+		"Reachable kbounce HOST to bake into the recipe's kubectl server "+
+			"address + kubeconfig server field (default: <kbounce-host> placeholder).")
 	return cmd
 }
 
