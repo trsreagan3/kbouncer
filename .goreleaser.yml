@@ -1,0 +1,176 @@
+# .goreleaser.yml — kbouncer pre-built binary release pipeline
+#
+# Triggered by: push of a v* tag (see .github/workflows/release.yml)
+# Produces: .deb + .rpm + .tar.gz + .zip for linux/amd64 + linux/arm64 + darwin + windows
+# Artifacts uploaded to the GitHub Release created by the tag push.
+#
+# NOTE: "published to public APT/RPM registries" is follow-up work (post-v1.0).
+# This config: builds artifacts + attaches them to GitHub Releases.
+# Users install via `curl | dpkg -i` or `curl | rpm -i` per docs/INSTALL-APT.md
+# and docs/INSTALL-RPM.md.
+#
+# Per [[vendor-integration-claim-qualifier]]: artifacts are built + smoke-tested
+# locally in CI containers; NOT published to public deb/rpm package registry.
+
+version: 2
+
+project_name: kbounce
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: kbounce
+    binary: kbounce
+    main: ./cmd/kbounce
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/trsreagan3/kbouncer/internal/cli.version={{.Version}}
+      - -X github.com/trsreagan3/kbouncer/internal/cli.commit={{.Commit}}
+      - -X github.com/trsreagan3/kbouncer/internal/cli.buildTime={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  # Deprecation shim: ships alongside the main binary for v1.0 only.
+  # Removed in v1.1 per [[bounce-suite-rename]].
+  - id: kbouncer-shim
+    binary: kbouncer
+    main: ./cmd/kbouncer
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/trsreagan3/kbouncer/internal/cli.version={{.Version}}
+      - -X github.com/trsreagan3/kbouncer/internal/cli.commit={{.Commit}}
+      - -X github.com/trsreagan3/kbouncer/internal/cli.buildTime={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: kbounce-archive
+    builds:
+      - kbounce
+      - kbouncer-shim
+    name_template: "kbounce_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+nfpms:
+  - id: kbounce-deb-rpm
+    package_name: kbounce
+    builds:
+      - kbounce
+    vendor: trsreagan3
+    homepage: https://github.com/trsreagan3/kbouncer
+    maintainer: trsreagan3
+    description: |
+      Kubernetes API-call gating proxy for AI agents and dev workflows.
+      kbounce sits between kubectl/Helm/agent tooling and the real kube-apiserver,
+      auditing every call and (optionally) denying out-of-profile requests.
+    license: Apache-2.0
+    section: net
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/local/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/kbounce/copyright
+      - src: README.md
+        dst: /usr/share/doc/kbounce/README.md
+    # Post-install: remind user of the canonical way to confirm install
+    scripts:
+      postinstall: scripts/nfpm/postinstall.sh
+
+brews:
+  - name: kbounce
+    repository:
+      owner: trsreagan3
+      name: homebrew-tap
+      branch: "bump-kbounce-{{.Version}}"
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        base:
+          owner: trsreagan3
+          name: homebrew-tap
+          branch: main
+    homepage: https://github.com/trsreagan3/kbouncer
+    description: "Kubernetes API-call gating proxy for AI agents and dev workflows"
+    license: Apache-2.0
+    # install block mirrors Formula/kbounce.rb — kept in sync with tap
+    install: |
+      ldflags = %W[
+        -s -w
+        -X github.com/trsreagan3/kbouncer/internal/cli.version=#{version}
+        -X github.com/trsreagan3/kbouncer/internal/cli.commit=homebrew
+        -X github.com/trsreagan3/kbouncer/internal/cli.buildTime=#{time.iso8601}
+      ]
+      system "go", "build", "-trimpath", "-ldflags", ldflags.join(" "), "-o", bin/"kbounce", "./cmd/kbounce"
+      system "go", "build", "-trimpath", "-ldflags", ldflags.join(" "), "-o", bin/"kbouncer", "./cmd/kbouncer"
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/kbounce --version")
+      assert_match "kbounce", shell_output("#{bin}/kbounce --help")
+
+scoops:
+  - repository:
+      owner: trsreagan3
+      name: scoop-bucket
+      branch: "bump-kbounce-{{.Version}}"
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        base:
+          owner: trsreagan3
+          name: scoop-bucket
+          branch: main
+    name: kbounce
+    homepage: https://github.com/trsreagan3/kbouncer
+    description: "Kubernetes API-call gating proxy for AI agents and dev workflows"
+    license: Apache-2.0
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: trsreagan3
+    name: kbouncer
+  name_template: "v{{.Version}}"
+  draft: false
+  prerelease: auto
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
