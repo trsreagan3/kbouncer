@@ -62,6 +62,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 )
 
@@ -611,7 +612,7 @@ func buildActiveProfileSection(opts BundleOptions) []byte {
 	// the bundle is one-shot CLI — there's no running-proxy IPC to
 	// query "what profile did the daemon resolve?" The name lives
 	// in env (KBOUNCER_PROFILE) which we read separately.
-	if envVal := os.Getenv("KBOUNCER_PROFILE"); envVal != "" {
+	if envVal := kbenv.Get("PROFILE"); envVal != "" {
 		out["env_KBOUNCER_PROFILE"] = envVal
 	}
 	body, _ := json.MarshalIndent(out, "", "  ")
@@ -789,7 +790,7 @@ func buildListenerSection(opts BundleOptions) []byte {
 			"stats endpoint (post-launch). Remote addresses are NEVER " +
 			"recorded in this bundle.",
 	}
-	if v := os.Getenv("KBOUNCER_PORT"); v != "" {
+	if v := kbenv.Get("PORT"); v != "" {
 		listener["env_KBOUNCER_PORT"] = v
 	}
 	body, _ := json.MarshalIndent(listener, "", "  ")

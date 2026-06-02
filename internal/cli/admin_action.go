@@ -30,11 +30,11 @@ package cli
 
 import (
 	"context"
-	"os"
 
 	"github.com/spf13/cobra"
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 )
 
 // envAdminAuditLogPath is the env-var fallback for --audit-log-path on
@@ -78,7 +78,7 @@ func addAdminAuditFlag(cmd *cobra.Command, dst *string) {
 func emitAdminAction(cmd *cobra.Command, auditLogPathFlag string, in audit.AdminActionInput) {
 	path := auditLogPathFlag
 	if path == "" {
-		path = os.Getenv(envAdminAuditLogPath)
+		path = kbenv.Get(envAdminAuditLogPath)
 	}
 	if path == "" {
 		return

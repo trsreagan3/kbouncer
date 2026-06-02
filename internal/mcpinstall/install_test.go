@@ -138,6 +138,31 @@ func TestInstallCodex_TOMLSnippet_ContainsAgentEnv(t *testing.T) {
 	assert.Contains(t, res.Snippet, AgentSessionIDEnvVar)
 }
 
+// TestInstallDevin_PrintsCloudRecipe_WritesNoFile asserts the Devin
+// installer (cloud agent) prints the host-address wiring recipe and
+// NEVER writes a local config file (Devin runs in Cognition's sandbox).
+// Mirrors ibounce's install-devin test.
+func TestInstallDevin_PrintsCloudRecipe_WritesNoFile(t *testing.T) {
+	out := &bytes.Buffer{}
+	res, err := InstallDevin(Options{Out: out})
+	require.NoError(t, err)
+	require.True(t, res.Manual, "Devin install must be manual (no local config)")
+	require.Empty(t, res.Path, "Devin install must not resolve a local config path")
+
+	s := out.String()
+	// Both wiring paths must be surfaced.
+	assert.Contains(t, s, "PATH A")
+	assert.Contains(t, s, "PATH B")
+	// The load-bearing cloud-agent caveat: HOST address, not loopback.
+	assert.Contains(t, s, "127.0.0.1 is NOT")
+	assert.Contains(t, s, "<kbounce-host>")
+	assert.Contains(t, s, "--i-know-this-binds-externally")
+	// The MCP snippet must carry the "devin" agent attribution.
+	assert.Contains(t, res.Snippet, AgentNameEnvVar)
+	assert.Contains(t, res.Snippet, "devin")
+	assert.Contains(t, res.Snippet, ServerCommand)
+}
+
 // TestShowConfig_YAML_ContainsEnvBlock asserts the YAML branch of
 // show-config emits the agent-attribution env block (not `env: {}`).
 func TestShowConfig_YAML_ContainsEnvBlock(t *testing.T) {
@@ -180,6 +205,7 @@ func TestAgentNameForClient_KnownClients(t *testing.T) {
 		{"claude-code", "claude-code"},
 		{"cursor", "cursor"},
 		{"codex", "openai-codex"},
+		{"devin", "devin"},
 		{"unknown-client", DefaultAgentName},
 		{"", DefaultAgentName},
 	}

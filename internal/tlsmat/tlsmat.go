@@ -62,6 +62,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 )
 
 // FileNameCAKey / FileNameCACert / FileNameServerKey / FileNameServerCert
@@ -118,10 +120,11 @@ type InitResult struct {
 	ServerCertPath string
 }
 
-// DefaultDir is ~/.kbouncer/tls when KBOUNCER_TLS_DIR is unset.
-// Tests + CI use the env var to point at a tempdir.
+// DefaultDir is ~/.kbouncer/tls when KBOUNCER_TLS_DIR (and its
+// KBOUNCE_TLS_DIR alias) are unset. Tests + CI use the env var to
+// point at a tempdir.
 func DefaultDir() (string, error) {
-	if override := os.Getenv("KBOUNCER_TLS_DIR"); override != "" {
+	if override := kbenv.Get("TLS_DIR"); override != "" {
 		return override, nil
 	}
 	home, err := os.UserHomeDir()

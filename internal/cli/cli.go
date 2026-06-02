@@ -34,6 +34,7 @@ import (
 	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/caveats"
 	"github.com/trsreagan3/kbouncer/internal/dynamicdeny"
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 	"github.com/trsreagan3/kbouncer/internal/mcp"
 	"github.com/trsreagan3/kbouncer/internal/mcpinstall"
 	"github.com/trsreagan3/kbouncer/internal/profile"
@@ -58,22 +59,26 @@ var loopbackHosts = map[string]struct{}{
 	"ip6-loopback":  {},
 }
 
-// envProfileVar is the env-var name used to select the active profile
-// when --profile is not passed. Documented in the README + on the run
-// subcommand's flag help text. The KBOUNCER_ prefix is preserved
-// (rather than KBOUNCE_) so existing shell configs keep working; see
-// [[bounce-suite-rename]] decision #6.
+// envProfileVar is the CANONICAL env-var name used to select the active
+// profile when --profile is not passed. Documented in the README + on
+// the run subcommand's flag help text. The KBOUNCER_ prefix is the
+// documented canonical (per [[bounce-suite-rename]] decision #6) but
+// reads go through kbenv.Get, which ALSO accepts the KBOUNCE_ alias so
+// `export KBOUNCE_PROFILE=...` (dropping the trailing 'R' to match the
+// binary name) is no longer a silent no-op.
 const envProfileVar = "KBOUNCER_PROFILE"
 
 // envUpstreamCABundleVar is the env-var fallback for --upstream-ca-bundle
 // (#379). When the flag is empty this env var is consulted; the flag
-// wins when both are set. KBOUNCER_ prefix per [[bounce-suite-rename]].
+// wins when both are set. Canonical KBOUNCER_ prefix; the KBOUNCE_ alias
+// also resolves via kbenv (flagOrEnv → kbenv.Get).
 const envUpstreamCABundleVar = "KBOUNCER_UPSTREAM_CA_BUNDLE"
 
 // envAuditEventsTokenVar is the env-var fallback for --audit-events-token
 // (#380). Passing the token as a CLI flag leaks it into `ps` /process
 // listings; the env var keeps it out of the process table. The flag
-// wins when both are set. KBOUNCER_ prefix per [[bounce-suite-rename]].
+// wins when both are set. Canonical KBOUNCER_ prefix; the KBOUNCE_ alias
+// also resolves via kbenv (flagOrEnv → kbenv.Get).
 const envAuditEventsTokenVar = "KBOUNCER_AUDIT_EVENTS_TOKEN"
 
 // dbFlagHelp documents the --db flag + the container-friendly default
@@ -91,11 +96,15 @@ const dbFlagHelp = "SQLite DB path. An explicit value overrides everything. " +
 // token (#380) and --upstream-ca-bundle (#379). Keeping it in one
 // helper means the precedence is identical everywhere and unit-testable
 // without standing up the whole run command.
+//
+// envName may be a base name ("PROFILE") or a legacy full var name
+// ("KBOUNCER_PROFILE"); either resolves under both the KBOUNCER_ and
+// KBOUNCE_ prefixes via kbenv (kbenv.Get strips a known prefix).
 func flagOrEnv(flagVal, envName string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	return os.Getenv(envName)
+	return kbenv.Get(envName)
 }
 
 // version is overridden at build time via
@@ -555,7 +564,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			// survive upgrades.
 			profileFromFlag := profileName != ""
 			if profileName == "" {
-				profileName = os.Getenv(envProfileVar)
+				profileName = kbenv.Get(envProfileVar)
 			}
 			resolvedProfilesPath := profilesPath
 			if resolvedProfilesPath == "" {
@@ -610,31 +619,35 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			// it; sentinel -1 left intact for downstream "use default"
 			// resolution. Env-var names match the cross-product spec at
 			// iam-roles/docs/LOG-RETENTION.md.
-			resolveInt64Env := func(flagVal int64, envName string) int64 {
-				if cmd.Flags().Changed(strings.TrimPrefix(strings.ToLower(envName), "kbounce_")) {
+			// An explicit --flag wins; otherwise fall back to the env
+			// var (envBase resolves under both KBOUNCER_ and KBOUNCE_
+			// via kbenv.Get). flagName is the cobra flag to test for an
+			// explicit set.
+			resolveInt64Env := func(flagVal int64, flagName, envBase string) int64 {
+				if cmd.Flags().Changed(flagName) {
 					return flagVal
 				}
-				if v := os.Getenv(envName); v != "" {
+				if v := kbenv.Get(envBase); v != "" {
 					if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
 						return parsed
 					}
 				}
 				return flagVal
 			}
-			resolveIntEnv := func(flagVal int, envName string) int {
-				if cmd.Flags().Changed(strings.TrimPrefix(strings.ToLower(envName), "kbounce_")) {
+			resolveIntEnv := func(flagVal int, flagName, envBase string) int {
+				if cmd.Flags().Changed(flagName) {
 					return flagVal
 				}
-				if v := os.Getenv(envName); v != "" {
+				if v := kbenv.Get(envBase); v != "" {
 					if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
 						return parsed
 					}
 				}
 				return flagVal
 			}
-			effAuditLogMaxSizeMB := resolveInt64Env(auditLogMaxSizeMB, "KBOUNCE_AUDIT_LOG_MAX_SIZE_MB")
-			effAuditLogMaxAgeDays := resolveIntEnv(auditLogMaxAgeDays, "KBOUNCE_AUDIT_LOG_MAX_AGE_DAYS")
-			effAuditDBRetentionDays := resolveIntEnv(auditDBRetentionDays, "KBOUNCE_AUDIT_DB_RETENTION_DAYS")
+			effAuditLogMaxSizeMB := resolveInt64Env(auditLogMaxSizeMB, "audit-log-max-size-mb", "AUDIT_LOG_MAX_SIZE_MB")
+			effAuditLogMaxAgeDays := resolveIntEnv(auditLogMaxAgeDays, "audit-log-max-age-days", "AUDIT_LOG_MAX_AGE_DAYS")
+			effAuditDBRetentionDays := resolveIntEnv(auditDBRetentionDays, "audit-db-retention-days", "AUDIT_DB_RETENTION_DAYS")
 			auditEmitter, auditHealth, auditCloser, auditErr := buildAuditManager(
 				cmd.Context(),
 				auditLogPath, auditLogFsync,
@@ -932,7 +945,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			// NOT "we're not enforcing anything." Closes the K1/K3
 			// NEGATIVE-VALUE failures from the 2026-05-22 role-
 			// effectiveness eval — see KNOWN-CAVEATS §A21.
-			if !profileFromFlag && os.Getenv(envProfileVar) == "" {
+			if !profileFromFlag && kbenv.Get(envProfileVar) == "" {
 				fmt.Fprintln(os.Stderr,
 					"profile: no profile selected.")
 				fmt.Fprintln(os.Stderr,
@@ -2561,7 +2574,7 @@ func newProfileListCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if profileName == "" {
-				profileName = os.Getenv(envProfileVar)
+				profileName = kbenv.Get(envProfileVar)
 			}
 			if profilesPath == "" {
 				p, err := profile.DefaultProfilesPath()
@@ -2733,6 +2746,7 @@ the proxy and what verdict each call got.`,
 //	kbounce mcp install-claude-code   — wire kbounce into Claude Code / Desktop
 //	kbounce mcp install-cursor        — wire kbounce into Cursor
 //	kbounce mcp install-codex         — wire kbounce into Codex (manual snippet)
+//	kbounce mcp install-devin         — print the Devin (cloud agent) recipe
 //	kbounce mcp show-config           — print the canonical JSON snippet
 //	kbounce mcp list-tools            — print the tool list (name + summary)
 //
@@ -2785,7 +2799,7 @@ func newMCPCmd() *cobra.Command {
 		defer st.Close()
 
 		if profileName == "" {
-			profileName = os.Getenv(envProfileVar)
+			profileName = kbenv.Get(envProfileVar)
 		}
 		resolvedProfilesPath := profilesPath
 		if resolvedProfilesPath == "" {
@@ -2860,6 +2874,7 @@ Subcommands:
   kbounce mcp install-claude-code   wire kbounce into Claude Code / Desktop
   kbounce mcp install-cursor        wire kbounce into Cursor
   kbounce mcp install-codex         print Codex TOML snippet (manual install)
+  kbounce mcp install-devin         print the Devin (cloud agent) recipe
   kbounce mcp show-config           print the canonical JSON / YAML snippet
   kbounce mcp list-tools            print the kbounce_* tool list
 
@@ -2901,6 +2916,7 @@ on stdin/stdout.`,
 	parent.AddCommand(newMCPInstallClaudeCodeCmd())
 	parent.AddCommand(newMCPInstallCursorCmd())
 	parent.AddCommand(newMCPInstallCodexCmd())
+	parent.AddCommand(newMCPInstallDevinCmd())
 	parent.AddCommand(newMCPShowConfigCmd())
 	parent.AddCommand(newMCPListToolsCmd())
 	return parent
@@ -3029,6 +3045,48 @@ the same way it does for Claude Code / Cursor.`,
 	return cmd
 }
 
+// newMCPInstallDevinCmd implements `kbounce mcp install-devin`.
+//
+// Devin is a cloud-hosted agent (Cognition's sandbox), so there is no
+// local config file to write — the command prints the wiring recipe.
+// Mirrors ibounce's `ibounce mcp install-devin`
+// (per [[cross-product-agent-parity]]). The load-bearing difference
+// from the loopback installers: kbounce must be reachable at a HOST
+// address, never 127.0.0.1, because the cloud sandbox cannot route to
+// the operator's loopback.
+func newMCPInstallDevinCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "install-devin",
+		Short: "Print the Devin (cloud agent) wiring recipe — no local config to write",
+		Long: `Devin is a cloud-hosted agent — it runs in Cognition's sandboxed
+environment, not on your machine, so there is no local config file
+for kbounce to write into. This command prints the two supported
+wiring paths instead of editing a config:
+
+  PATH A  MCP server entry in Devin's MCP settings (when Devin's MCP
+          support is enabled). Same snippet shape as
+          ` + "`kbounce mcp show-config`" + `, stamped with the "devin" agent
+          attribution.
+
+  PATH B  Transparent proxy at a HOST address (supported today): run
+          kbounce bound off-loopback with TLS and point Devin's
+          kubectl/KUBECONFIG at the proxy host:port.
+
+Load-bearing caveat: a kbounce on 127.0.0.1 is NOT visible to Devin's
+cloud sandbox — kbounce must be bound to a host the sandbox can reach
+over the network.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := mcpinstall.InstallDevin(mcpinstall.Options{
+				Out:    cmd.OutOrStdout(),
+				Stderr: cmd.ErrOrStderr(),
+			})
+			return err
+		},
+	}
+	return cmd
+}
+
 // newMCPShowConfigCmd implements `kbounce mcp show-config`.
 func newMCPShowConfigCmd() *cobra.Command {
 	var shape string
@@ -3045,7 +3103,11 @@ preserving other mcpServers entries:
 
   kbounce mcp install-claude-code
   kbounce mcp install-cursor
-  kbounce mcp install-codex`,
+  kbounce mcp install-codex
+
+For a cloud-hosted agent (no local config), see:
+
+  kbounce mcp install-devin`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return mcpinstall.ShowConfig(cmd.OutOrStdout(), mcpinstall.Shape(shape))

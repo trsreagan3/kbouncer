@@ -73,6 +73,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 	"github.com/trsreagan3/kbouncer/internal/presets"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/rules"
@@ -1269,7 +1270,7 @@ func resolveAuditLogPath(flagValue string) string {
 	if flagValue != "" {
 		return flagValue
 	}
-	return os.Getenv(envAdminAuditLogPath)
+	return kbenv.Get(envAdminAuditLogPath)
 }
 
 // ---------------------------------------------------------------------

@@ -19,30 +19,162 @@ with a one-line deprecation warning + is removed in v1.1.
 
 ## Install
 
-```sh
-# Canonical install — builds the binary fresh from source into $GOPATH/bin
-# (or $HOME/go/bin if GOPATH is unset).
-go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest
+No Go toolchain required for the paths below — they install a
+prebuilt, signed-by-release binary. `kbounce --version` should print a
+version after any of them. (Building from source is the last option,
+not the first — see [From source](#from-source-go-toolchain-required).)
 
-# Verify the binary is on your PATH:
+### Homebrew (macOS / Linux)
+
+```sh
+brew install trsreagan3/tap/kbounce
+```
+
+### Prebuilt binary (any OS)
+
+Each [GitHub Release](https://github.com/trsreagan3/kbouncer/releases)
+attaches `kbounce_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) for
+`linux`/`darwin`/`windows` × `amd64`/`arm64`. Download, extract, and
+put `kbounce` on your `PATH`:
+
+```sh
+# Example: macOS arm64. Swap in the os/arch + version for your machine.
+curl -fsSL -o kbounce.tar.gz \
+  https://github.com/trsreagan3/kbouncer/releases/latest/download/kbounce_<version>_Darwin_arm64.tar.gz
+tar -xzf kbounce.tar.gz kbounce
+sudo install kbounce /usr/local/bin/kbounce
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add trsreagan3 https://github.com/trsreagan3/scoop-bucket
+scoop install kbounce
+```
+
+### APT / RPM (Debian/Ubuntu, RHEL/Fedora)
+
+Releases attach `.deb` + `.rpm` packages (installs the binary to
+`/usr/local/bin`). They are **not** published to a public APT/RPM
+registry yet — download the package from the release and install it
+directly:
+
+```sh
+# Debian / Ubuntu
+curl -fsSL -o kbounce.deb \
+  https://github.com/trsreagan3/kbouncer/releases/latest/download/kbounce_<version>_linux_amd64.deb
+sudo dpkg -i kbounce.deb
+
+# RHEL / Fedora / Amazon Linux
+curl -fsSL -o kbounce.rpm \
+  https://github.com/trsreagan3/kbouncer/releases/latest/download/kbounce_<version>_linux_amd64.rpm
+sudo rpm -i kbounce.rpm
+```
+
+### Docker
+
+See [Docker](#docker) below for the published
+`ghcr.io/trsreagan3/kbounce` image (Claude-in-container friendly).
+
+### From source (Go toolchain required)
+
+This path builds the binary fresh from source — needs **Go ≥ 1.26**.
+Prefer one of the no-toolchain paths above unless you're iterating on
+the source.
+
+```sh
+go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest
 kbounce --version
 
 # If you get "command not found": $(go env GOPATH)/bin is not on PATH.
 # Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by
-# default. Fix once per shell:
+# default. Fix once per shell, then persist in your shell rc:
 export PATH="$PATH:$(go env GOPATH)/bin"
-
-# Persist across sessions (pick the right rc for your shell):
 echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc   # bash
 echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc    # zsh
 ```
 
-Closes #549 from UAT L1 2026-05-24 — the unmodified `go install` succeeds
-silently with the binary at `~/go/bin/kbounce` while the operator's shell
-reports "command not found", which reads as "install broken" on a fresh
-machine.
+> The `go install` PATH note closes #549 (UAT L1 2026-05-24): the
+> unmodified `go install` succeeds silently with the binary at
+> `~/go/bin/kbounce` while the shell reports "command not found", which
+> reads as "install broken" on a fresh machine.
 
-Then:
+## Add to your agent
+
+kbounce wires into any MCP-compatible coding agent two ways. Pick
+whichever fits your setup; they compose.
+
+### MCP mode — the agent introspects + self-scopes via `kbounce_*` tools
+
+One command per client merges a `kbounce` entry into the agent's MCP
+config (idempotent; other MCP servers are preserved):
+
+```sh
+kbounce mcp install-claude-code   # Claude Code / Claude Desktop
+kbounce mcp install-cursor        # Cursor
+kbounce mcp install-codex         # Codex (prints a TOML snippet to paste)
+kbounce mcp install-devin         # Devin (cloud-agent recipe; see below)
+```
+
+The agent then spawns `kbounce mcp serve` and can call `kbounce_decide`
+(dry-run a request's verdict), `kbounce_active_mode`,
+`kbounce_list_rules`, `kbounce_scope_self_for_task`, etc. Verify with
+`kbounce mcp list-tools` (the same list the agent sees). For any other
+MCP client, `kbounce mcp show-config` prints a vendor-neutral JSON/YAML
+snippet.
+
+The MCP server reads the **same** on-disk state the running proxy uses
+(`--db` + `--profiles-path`); it does **not** start a proxy listener of
+its own — run `kbounce run` separately for the gating + forwarding
+layer.
+
+### Transparent mode — point kubectl through kbounce
+
+Generate the local CA + server cert once, run the proxy with TLS, then
+point your agent's `kubectl` / `KUBECONFIG` at kbounce instead of the
+real apiserver:
+
+```sh
+# 1. One-time: generate ~/.kbouncer/tls/{ca,server}.{crt,key}.
+kbounce init-tls
+
+# 2. Run the proxy with TLS, forwarding to the real apiserver.
+kbounce run \
+  --tls-cert ~/.kbouncer/tls/server.crt \
+  --tls-key  ~/.kbouncer/tls/server.key \
+  --upstream https://<your-cluster-api>:6443 \
+  --mode transparent --profile safe-default
+```
+
+```yaml
+# 3. In the agent's kubeconfig, point the cluster's server at kbounce
+#    and trust the generated CA:
+clusters:
+  - cluster:
+      server: https://127.0.0.1:8766
+      certificate-authority: ~/.kbouncer/tls/ca.crt
+```
+
+Every API call the agent makes now traverses kbounce: parsed,
+audit-logged, ALLOWs forwarded to the real apiserver, and (transparent
+mode) out-of-profile requests denied with HTTP 403 before they reach
+the cluster.
+
+### Cloud agents (Devin) + Claude-in-container
+
+`kbounce mcp install-devin` prints a recipe rather than editing a local
+config: Devin runs in a cloud sandbox that cannot see your local
+`127.0.0.1`, so kbounce must run on a host the sandbox can reach
+(`--host 0.0.0.0 --i-know-this-binds-externally`) and the agent's
+`KUBECONFIG` points at `https://<kbounce-host>:8766`. This is an honest
+limitation, not a bug — kbounce never requires root or a transparent
+OS-level proxy.
+
+For running an agent (e.g. Claude Code) inside Docker alongside the
+bouncer, see the cross-product
+[Claude-in-Docker integration guide](../iam-roles/docs/DOCKER-CLAUDE-INTEGRATION.md).
+
+## Quickstart
 
 ### First 60 seconds with kbounce (discovery mode default)
 
@@ -108,6 +240,20 @@ overrides everything):
 4. `/var/lib/kbounce/state.db` (rootless containers with no `$HOME`)
 
 Parent directories are created `0700`.
+
+#### Environment variables (`KBOUNCER_` is canonical; `KBOUNCE_` also works)
+
+Every kbounce env var is documented with the canonical `KBOUNCER_`
+prefix (`KBOUNCER_PROFILE`, `KBOUNCER_DB`, `KBOUNCER_MODE`,
+`KBOUNCER_PROFILES_PATH`, `KBOUNCER_TLS_DIR`, `KBOUNCER_PORT`,
+`KBOUNCER_LOG_LEVEL`, `KBOUNCER_UPSTREAM_CA_BUNDLE`,
+`KBOUNCER_AUDIT_EVENTS_TOKEN`, `KBOUNCER_AUDIT_LOG_PATH`,
+`KBOUNCE_NO_VERSION_CHECK`). Because the binary is named `kbounce`, the
+shorter `KBOUNCE_` prefix is **also accepted** for every one of them
+(e.g. `KBOUNCE_PROFILE` resolves the same as `KBOUNCER_PROFILE`) — so
+dropping the trailing `R` to match the binary name is no longer a
+silent no-op. When both prefixes are set, the canonical `KBOUNCER_`
+form wins.
 
 #### Verifying a private kube CA
 
