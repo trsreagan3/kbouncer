@@ -77,6 +77,11 @@ commands — only rotated archives are eligible for purge.`,
 // exit on any inconsistency so an incident-response runbook / CI can
 // gate on it. Per [[ibounce-honest-positioning]] it surfaces EVERY
 // finding rather than stopping at the first.
+//
+// The verifier is FILE-SCOPED: when --audit-log names a specific file,
+// only that file's chain and its rotated siblings (matching the same
+// stem prefix) are inspected. Sibling JSONL files with a different stem
+// are never pulled in and cannot produce false TAMPER reports.
 func newLogsVerifyChainCmd() *cobra.Command {
 	var (
 		auditLog     string
@@ -90,7 +95,7 @@ func newLogsVerifyChainCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			dir := defaultLogDir(auditLog)
-			return runVerifyChain(cmd, dir, withManifest, publicKeyB64, asJSON)
+			return runVerifyChain(cmd, dir, auditLog, withManifest, publicKeyB64, asJSON)
 		},
 	}
 	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Path to the active audit.jsonl.")
@@ -103,7 +108,12 @@ func newLogsVerifyChainCmd() *cobra.Command {
 // runVerifyChain is the shared verify-chain implementation. Kept in
 // logs.go (per-repo CLI) but byte-for-byte identical logic across the
 // bouncers; only the package's product wiring differs.
-func runVerifyChain(cmd *cobra.Command, dir string, withManifest bool, publicKeyB64 string, asJSON bool) error {
+//
+// activeFilePath, when non-empty, scopes the chain scan to the named
+// file and its rotated siblings (via audit.VerifyChainFile) so that
+// unrelated JSONL files in the same directory never cause false TAMPER
+// reports. When empty the canonical "audit.jsonl" name is assumed.
+func runVerifyChain(cmd *cobra.Command, dir string, activeFilePath string, withManifest bool, publicKeyB64 string, asJSON bool) error {
 	out := cmd.OutOrStdout()
 	if withManifest {
 		res, err := audit.VerifyChainAndManifests(dir, publicKeyB64)
@@ -126,12 +136,21 @@ func runVerifyChain(cmd *cobra.Command, dir string, withManifest bool, publicKey
 		}
 		return nil
 	}
-	// Chain-only.
+	// Chain-only. Use file-scoped verify when an explicit path was
+	// provided; fall back to the directory-default scan otherwise.
 	stateMissing := false
 	if _, statErr := os.Stat(audit.StatePath(dir)); statErr != nil {
 		stateMissing = true
 	}
-	res, err := audit.VerifyChain(dir, stateMissing)
+	var (
+		res audit.VerifyResult
+		err error
+	)
+	if activeFilePath != "" {
+		res, err = audit.VerifyChainFile(activeFilePath, stateMissing)
+	} else {
+		res, err = audit.VerifyChain(dir, stateMissing)
+	}
 	if err != nil {
 		return err
 	}

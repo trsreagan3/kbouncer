@@ -49,6 +49,32 @@ import (
 //	low    -> 3.0 sigma  (flags only large deviations)
 //	medium -> 2.0 sigma  (the honest default)
 //	high   -> 1.5 sigma  (flags smaller deviations; noisier)
+//
+// FALSE-POSITIVE WARNING — high sensitivity + block mode:
+//
+// When IAM_JIT_ANOMALY_SENSITIVITY=high AND IAM_JIT_ANOMALY_MODE=block,
+// the 1.5-sigma threshold can DENY a brand-new agent's first few
+// benign calls before any baseline is established (cold-start period)
+// AND during legitimate-but-bursty traffic windows (e.g. a CI run
+// that issues many kubectl calls at once). This is "tighten-only-
+// correct" behaviour — the anomaly enforcer is conservative by design
+// and never loosens a deny floor — but operators choosing high+block
+// should expect false-positive denies of legitimate first-time traffic.
+//
+// The safe operational defaults (alert mode, medium sensitivity) do NOT
+// block anything; they only emit a neutral observation event. high+block
+// is appropriate only when you have a mature, stable baseline and can
+// tolerate the occasional FP denial.
+//
+// To avoid cold-start FPs:
+//   - Start with mode=alert (default) so the baseline can warm up.
+//   - Switch to mode=block only after reviewing the alert stream for a
+//     week or more and confirming the baseline is representative.
+//   - Raise IAM_JIT_ANOMALY_MIN_ACTIONS (default 50) when your traffic
+//     is low-volume to require a larger sample before the baseline is
+//     authoritative.
+//   - Use medium (default) or low sensitivity in block mode; reserve
+//     high sensitivity for alert-only (observation) deployments.
 var SensitivityPresets = map[string]float64{
 	"low":    3.0,
 	"medium": 2.0,

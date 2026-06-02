@@ -150,6 +150,17 @@ func anomalyHealthz() map[string]any {
 //	IAM_JIT_ANOMALY_MODE         = "alert" (default) | "block"
 //	IAM_JIT_ANOMALY_SENSITIVITY  = "low" | "medium" (default) | "high"
 //	IAM_JIT_ANOMALY_MIN_ACTIONS  = integer baseline floor (default 50)
+//
+// FALSE-POSITIVE WARNING — high + block:
+// IAM_JIT_ANOMALY_SENSITIVITY=high with IAM_JIT_ANOMALY_MODE=block can
+// DENY a brand-new agent's first few benign calls before the baseline is
+// warm (cold-start period) and during legitimate bursty traffic. The 1.5-
+// sigma threshold is intentionally tight. This is documented, expected
+// behaviour for the tighten-only design — NOT a bug — but operators who
+// choose high+block must expect false-positive denies of first-time or
+// bursty legitimate traffic. The startup banner surfaces this when both
+// are set so the operator sees the warning every time the proxy starts.
+// Default (alert + medium) never blocks anything.
 func AnomalyConfigFromEnv() (anomaly.Config, error) {
 	enable := os.Getenv("IAM_JIT_ANOMALY_DETECTION")
 	if enable != "1" && enable != "true" && enable != "TRUE" {

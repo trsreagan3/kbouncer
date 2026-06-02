@@ -789,6 +789,24 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				fmt.Fprintf(os.Stderr,
 					"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — surfaces a neutral signal for review, does not block by default\n",
 					acfg.Mode, acfg.Sensitivity)
+				// Fix 4: high+block FP warning. Operators who choose this
+				// combination must know the 1.5-sigma threshold WILL deny
+				// a brand-new agent's first few benign calls during the
+				// cold-start period and during bursty-but-legitimate
+				// traffic windows. Print at every startup so it is never
+				// invisible. Per [[ibounce-honest-positioning]]: surface
+				// every known operational risk clearly.
+				if acfg.Sensitivity == "high" && acfg.Mode == "block" {
+					fmt.Fprintf(os.Stderr,
+						"WARNING: anomaly detection mode=block + sensitivity=high:\n"+
+							"  The 1.5-sigma threshold will DENY brand-new agents' first benign\n"+
+							"  calls before the baseline warms up (cold-start) and during bursty\n"+
+							"  (but legitimate) traffic. This is expected tighten-only behaviour,\n"+
+							"  not a bug, but expect false-positive denies on first-time traffic.\n"+
+							"  Recommended: start with mode=alert to warm the baseline; switch to\n"+
+							"  block only after reviewing the alert stream. Use medium sensitivity\n"+
+							"  (IAM_JIT_ANOMALY_SENSITIVITY=medium) in block mode to reduce FPs.\n")
+				}
 			}
 
 			// #324b — wire the watcher's emit callback now that the
@@ -2020,6 +2038,16 @@ prints the full record for a single profile.`,
 // §A25 Phase 2. Mirrors the iam-jit Python `iam-jit profile allow`
 // shape so the cross-bouncer fan-out from iam-jit sees an
 // identical surface in kbounce. Per [[cross-product-agent-parity]].
+//
+// Safety: when --profile is omitted the command looks up the running
+// proxy's profile via KBOUNCER_PROFILE / KBOUNCE_PROFILE (the same
+// env vars the `run` command reads). When neither is set the rule
+// would silently land on "full-user" — not necessarily the profile
+// the running proxy uses. In that case a loud WARNING is printed
+// naming exactly which profile the allow was written to, so the
+// operator can verify it matches (or re-run with an explicit
+// --profile). Per [[ibounce-honest-positioning]]: never silently
+// default to an ambiguous target.
 func newProfileAllowCmd() *cobra.Command {
 	var (
 		target       string
@@ -2050,6 +2078,11 @@ namespaces. Any other target (or 'namespaces/*') is advisory-only
 metadata and the command WARNS you so the scope is never silently
 ignored.
 
+Profile resolution (--profile wins; then KBOUNCER_PROFILE / KBOUNCE_PROFILE
+env vars; then a loud mismatch warning before defaulting to 'full-user').
+Pass --profile explicitly when the running proxy uses a non-default profile
+so the allow lands on the right target.
+
 The provenance note format is:
   [easy_allow] <reason> -- by=<actor> via=cli [duration=... | expires=...]
 
@@ -2057,18 +2090,62 @@ Mirrors the iam-jit Python CLI surface 1:1 per
 [[cross-product-agent-parity]].`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Resolve the running proxy's profile from the canonical env
+			// vars so we can detect + warn on a potential mismatch.
+			// --profile flag wins; env var is the next best signal; empty
+			// means "unknown" and produces a mismatch warning below.
+			profileExplicit := cmd.Flags().Changed("profile")
+			envProfile := kbenv.Get(envProfileVar) // KBOUNCER_PROFILE / KBOUNCE_PROFILE
+
 			res, err := profileallow.AddProfileAllowRule(profileallow.Options{
-				Target:       target,
-				Actions:      actions,
-				Reason:       reason,
-				Duration:     duration,
-				ProfileName:  profileName,
-				ProfilesPath: profilesPath,
-				Source:       profileallow.SourceCLI,
+				Target:        target,
+				Actions:       actions,
+				Reason:        reason,
+				Duration:      duration,
+				ProfileName:   profileName,
+				ActiveProfile: envProfile,
+				ProfilesPath:  profilesPath,
+				Source:        profileallow.SourceCLI,
 			})
 			if err != nil {
 				return err
 			}
+
+			// --- mismatch warning (Fix 1) ---
+			// The allow landed on res.ProfileName. Warn loudly when the
+			// operator did NOT specify --profile AND either:
+			//   (a) the env var names a DIFFERENT profile from what was
+			//       written (active proxy uses safe-default but the allow
+			//       landed on full-user because the env resolution failed
+			//       to find safe-default), or
+			//   (b) no env var is set, so we can't be sure the allow
+			//       matches the running proxy at all.
+			if !profileExplicit {
+				if envProfile != "" && envProfile != res.ProfileName {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"WARNING: allow written to profile %q but the running proxy "+
+							"appears to use %q (from %s).\n"+
+							"  The allow will have NO effect on the running proxy.\n"+
+							"  Re-run with --profile %s to target the running proxy's profile,\n"+
+							"  or with --profile %s if you intended to modify %q.\n",
+						res.ProfileName, envProfile, envProfileVar,
+						envProfile, res.ProfileName, res.ProfileName)
+				} else if envProfile == "" {
+					// No profile set anywhere — rule defaulted to full-user
+					// and we have no way to know if that matches the proxy.
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"WARNING: --profile was not set and %s is unset.\n"+
+							"  Allow rule written to profile %q (the default).\n"+
+							"  If your running proxy uses a different profile (e.g. safe-default),\n"+
+							"  this allow will have NO effect on it.\n"+
+							"  Re-run with --profile <name> to target the correct profile.\n",
+						envProfileVar, res.ProfileName)
+				}
+				// If envProfile == res.ProfileName: the env var matches what
+				// was written — no warning needed, the proxy is almost
+				// certainly running with the same profile.
+			}
+
 			// Honest scope feedback: the evaluator ENFORCES --target as a
 			// namespace floor only when it cleanly names a namespace
 			// (e.g. 'namespaces/staging', 'default/foo', or a glob like
@@ -2077,7 +2154,7 @@ Mirrors the iam-jit Python CLI surface 1:1 per
 			// narrows the allow when it doesn't.
 			if !profile.TargetEnforcedAsNamespace(target) {
 				fmt.Fprintf(cmd.ErrOrStderr(),
-					"⚠ --target %q is advisory-only: it does not name a K8s "+
+					"WARNING: --target %q is advisory-only: it does not name a K8s "+
 						"namespace, so the evaluator will NOT scope this allow "+
 						"to it. Scoping comes from the action's resource half + "+
 						"a namespace-shaped target (e.g. 'namespaces/<ns>').\n",
@@ -2113,7 +2190,9 @@ Mirrors the iam-jit Python CLI surface 1:1 per
 	cmd.Flags().StringVar(&duration, "duration", "",
 		"Optional Go-style duration ('3h', '7d'); empty/'permanent' = permanent.")
 	cmd.Flags().StringVar(&profileName, "profile", "",
-		"Profile to mutate (default: active profile).")
+		"Profile to mutate. Defaults to the running proxy's profile (KBOUNCER_PROFILE / "+
+			"KBOUNCE_PROFILE env), then 'full-user'. Pass explicitly when the running proxy "+
+			"uses a non-default profile so the allow lands on the right target.")
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
 		"Path to profiles.yaml (default: ~/.kbouncer/profiles.yaml).")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Emit JSON instead of human-readable output.")
@@ -2809,6 +2888,11 @@ func newProfileShowCmd() *cobra.Command {
 // facing surface: paginated rows, live --follow, OCSF-shaped --filter
 // expressions, --summary counts, and --export {jsonl,csv,ocsf-bundle}
 // so a local operator can pipe the same data downstream tools consume.
+//
+// `audit verify` is an alias for `logs verify-chain` kept here for
+// cross-product parity ([[cross-product-agent-parity]]): gbounce and
+// dbounce expose verify-chain on both `logs` and `audit`; kbounce
+// follows the same shape.
 func newAuditCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "audit",
@@ -2821,6 +2905,54 @@ the proxy and what verdict each call got.`,
 	}
 	cmd.RunE = parentRequiresSubcommand("audit", cmd)
 	cmd.AddCommand(newAuditTailCmd())
+	// `audit verify` alias for `logs verify-chain` — cross-product
+	// parity per [[cross-product-agent-parity]]. gbounce + dbounce
+	// expose the chain verifier on both `audit verify` and
+	// `logs verify-chain`; kbounce adds `audit verify` here so the
+	// same muscle memory works across the Bounce suite.
+	cmd.AddCommand(newAuditVerifyCmd())
+	return cmd
+}
+
+// newAuditVerifyCmd wires `kbounce audit verify` as a cross-product-
+// parity alias for `kbounce logs verify-chain`. Both share the same
+// flag set and the same runVerifyChain implementation so behaviour is
+// byte-identical. The `logs verify-chain` form is the canonical name;
+// `audit verify` is the parity alias.
+func newAuditVerifyCmd() *cobra.Command {
+	var (
+		auditLog     string
+		withManifest bool
+		publicKeyB64 string
+		asJSON       bool
+	)
+	cmd := &cobra.Command{
+		Use:   "verify",
+		Short: "Verify the tamper-evident hash-chain (alias for `logs verify-chain`)",
+		Long: `Alias for ` + "`kbounce logs verify-chain`" + `.
+
+Re-hashes the audit log chain end-to-end and checks continuity. With
+--manifest it also verifies Ed25519-signed manifests + cross-checks the
+chain head (tail-truncation detection). Non-zero exit on any inconsistency.
+
+The verifier is file-scoped: pass --audit-log to name the active log
+file; only that file and its rotated siblings are inspected (sibling
+files from a different chain cannot produce false TAMPER reports).
+
+This command exists for cross-product parity per [[cross-product-agent-parity]].
+gbounce and dbounce expose the same surface as ` + "`audit verify`" + `;
+kbounce adds this alias so the same runbook works across the Bounce suite.
+The canonical name is ` + "`kbounce logs verify-chain`" + `.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			dir := defaultLogDir(auditLog)
+			return runVerifyChain(cmd, dir, auditLog, withManifest, publicKeyB64, asJSON)
+		},
+	}
+	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Path to the active audit.jsonl.")
+	cmd.Flags().BoolVar(&withManifest, "manifest", false, "Also verify Ed25519-signed manifests + cross-check the chain head (tail-truncation detection).")
+	cmd.Flags().StringVar(&publicKeyB64, "public-key", "", "Pin an out-of-band base64url Ed25519 public key instead of trusting the manifest's embedded key (only with --manifest).")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit JSON.")
 	return cmd
 }
 
