@@ -35,11 +35,5 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      # NOTE: -race is intentionally deferred. Enabling it surfaced
-      # pre-existing CI-only flakes (TestAuditExport_HotPathNeverBlocks
-      # intermittently exceeds its 2s bound under race instrumentation —
-      # see follow-up issue) that pass locally. Ship deterministic CI
-      # now; re-enable -race once those tests are hardened, to reach
-      # full parity with gbounce's validate.yml.
       - name: go test
-        run: go test ./... -count=1
+        run: go test ./... -race -count=1
