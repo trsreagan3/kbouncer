@@ -5,6 +5,37 @@ here. Versioning follows semver from v1.0.0 onward.
 
 ## Unreleased — v1.0 launch prep (2026-05)
 
+### Added
+
+- **#379 — `--upstream-ca-bundle PATH` for private kube CAs** (2026-06-02) —
+  The `run` subcommand now accepts `--upstream-ca-bundle PATH` (env
+  fallback `KBOUNCER_UPSTREAM_CA_BUNDLE`; flag wins). The PEM file is
+  loaded into an `x509.CertPool` and wired into the upstream HTTP
+  client's `tls.Config.RootCAs`, REPLACING the kubeconfig CA so an
+  operator with a private / self-signed kube CA not present in their
+  kubeconfig can verify the apiserver. A missing, unreadable, or
+  non-PEM bundle is a hard startup failure (classified via the new
+  `upstream.ErrCABundle` sentinel) — kbounce never silently falls back
+  to system roots. Supplying a CA bundle for a plain-`http` upstream is
+  also rejected rather than silently ignored.
+
+- **#380 — `KBOUNCER_AUDIT_EVENTS_TOKEN` env fallback for the
+  `/audit/events` bearer token** (2026-06-02) — `--audit-events-token`
+  now falls back to the `KBOUNCER_AUDIT_EVENTS_TOKEN` env var when the
+  flag is empty (flag wins when both are set). Prefer the env var: a
+  flag value leaks the secret into `ps` / process listings. Resolved
+  before the external-bind auth gate so it satisfies the
+  off-loopback-requires-a-token check.
+
+- **#381 — container-friendly default DB path** (2026-06-02) —
+  `store.DefaultDBPath` now resolves the default (when `--db` is not
+  set) in order: `$KBOUNCER_DB` → `$XDG_STATE_HOME/kbounce/state.db` →
+  `~/.kbouncer/state.db` (when `$HOME` is set; historical default
+  preserved exactly) → `/var/lib/kbounce/state.db` (rootless containers
+  with no `$HOME`). Parent dirs are created `0700`. An explicit
+  `--db PATH` still overrides everything. Centralized so every
+  subcommand that opens the store shares the resolution.
+
 ### Changed
 
 - **Tier rescope: v1.0 ships fully free + open source** (2026-05-23) —

@@ -443,7 +443,10 @@ curl 'http://127.0.0.1:8766/audit/events?format=ocsf-bundle&limit=100'
   --host 0.0.0.0 --audit-events-token <TOKEN>` is required. Requests
   must carry `Authorization: Bearer <TOKEN>`. Missing header → 401;
   wrong token → 403. kbounce refuses to start in external-bind mode
-  without `--audit-events-token`.
+  without a token. The token may also be supplied via the
+  `KBOUNCER_AUDIT_EVENTS_TOKEN` env var (preferred — keeps the secret
+  out of `ps` / process listings); the `--audit-events-token` flag wins
+  when both are set.
 
 ### Cross-bouncer query
 

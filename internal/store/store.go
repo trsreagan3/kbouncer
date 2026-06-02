@@ -83,18 +83,39 @@ import (
 //	    [[cross-product-agent-parity]].
 const SchemaVersion = 9
 
-// DefaultDBPath returns the path the store opens when no explicit path
-// is supplied. Honors KBOUNCER_DB for tests and CI sandboxes that
-// want a scratch location.
+// DefaultDBPath returns the path the store opens when no explicit
+// --db path is supplied. The resolution order is container-friendly so
+// kbouncer works the same whether it runs as a human-owned process
+// (HOME set) or as a non-root container user with no HOME (#381):
+//
+//  1. $KBOUNCER_DB — explicit override for tests, CI sandboxes, and
+//     operators who pin the path via env rather than the flag.
+//  2. $XDG_STATE_HOME/kbounce/state.db — the XDG Base Directory spec's
+//     location for state data (logs, history, current state). Honored
+//     before HOME so an operator who set XDG_STATE_HOME gets it even
+//     when HOME is also set.
+//  3. $HOME/.kbouncer/state.db — the historical default. Preserved
+//     EXACTLY so existing installs keep their DB on upgrade.
+//  4. /var/lib/kbounce/state.db — the FHS state dir, used as the last
+//     resort when no HOME exists (the typical rootless-container case).
+//
+// We never silently pick a path that loses an existing operator's
+// audit history: an explicit --db or $KBOUNCER_DB always wins, and the
+// HOME branch is preserved byte-for-byte. The function never returns an
+// error today (every branch yields a path), but keeps the (string,
+// error) signature so callers don't have to change and a future branch
+// can surface a failure loudly rather than silently degrading.
 func DefaultDBPath() (string, error) {
 	if override := os.Getenv("KBOUNCER_DB"); override != "" {
 		return override, nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("kbounce: resolve home dir: %w", err)
+	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "kbounce", "state.db"), nil
 	}
-	return filepath.Join(home, ".kbouncer", "state.db"), nil
+	if home := os.Getenv("HOME"); home != "" {
+		return filepath.Join(home, ".kbouncer", "state.db"), nil
+	}
+	return filepath.Join("/var", "lib", "kbounce", "state.db"), nil
 }
 
 // Store wraps a sql.DB plus the migration state. Safe for concurrent

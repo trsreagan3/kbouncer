@@ -51,11 +51,11 @@ import (
 // --i-know-this-binds-externally to acknowledge they read the threat
 // model.
 var loopbackHosts = map[string]struct{}{
-	"127.0.0.1":      {},
-	"::1":            {},
-	"localhost":      {},
-	"ip6-localhost":  {},
-	"ip6-loopback":   {},
+	"127.0.0.1":     {},
+	"::1":           {},
+	"localhost":     {},
+	"ip6-localhost": {},
+	"ip6-loopback":  {},
 }
 
 // envProfileVar is the env-var name used to select the active profile
@@ -64,6 +64,39 @@ var loopbackHosts = map[string]struct{}{
 // (rather than KBOUNCE_) so existing shell configs keep working; see
 // [[bounce-suite-rename]] decision #6.
 const envProfileVar = "KBOUNCER_PROFILE"
+
+// envUpstreamCABundleVar is the env-var fallback for --upstream-ca-bundle
+// (#379). When the flag is empty this env var is consulted; the flag
+// wins when both are set. KBOUNCER_ prefix per [[bounce-suite-rename]].
+const envUpstreamCABundleVar = "KBOUNCER_UPSTREAM_CA_BUNDLE"
+
+// envAuditEventsTokenVar is the env-var fallback for --audit-events-token
+// (#380). Passing the token as a CLI flag leaks it into `ps` /process
+// listings; the env var keeps it out of the process table. The flag
+// wins when both are set. KBOUNCER_ prefix per [[bounce-suite-rename]].
+const envAuditEventsTokenVar = "KBOUNCER_AUDIT_EVENTS_TOKEN"
+
+// dbFlagHelp documents the --db flag + the container-friendly default
+// resolution implemented in store.DefaultDBPath (#381). Shared by every
+// subcommand that opens the store so the help text never drifts.
+const dbFlagHelp = "SQLite DB path. An explicit value overrides everything. " +
+	"When unset the default resolves in order: $KBOUNCER_DB, then " +
+	"$XDG_STATE_HOME/kbounce/state.db, then ~/.kbouncer/state.db (when " +
+	"$HOME is set), else /var/lib/kbounce/state.db (rootless containers " +
+	"with no HOME). Parent dirs are created 0700."
+
+// flagOrEnv returns the flag value when it is non-empty, otherwise the
+// value of the named environment variable. This is the canonical
+// "flag wins, env is the fallback" resolution used by --audit-events-
+// token (#380) and --upstream-ca-bundle (#379). Keeping it in one
+// helper means the precedence is identical everywhere and unit-testable
+// without standing up the whole run command.
+func flagOrEnv(flagVal, envName string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv(envName)
+}
 
 // version is overridden at build time via
 // -ldflags "-X github.com/trsreagan3/kbouncer/internal/cli.version=..."
@@ -205,6 +238,7 @@ func newRunCmd() *cobra.Command {
 		upstreamURL        string
 		kubeconfigPath     string
 		insecureSkipVerify bool
+		upstreamCABundle   string
 		forceExternalBind  bool
 		forwardTimeoutSecs int
 		tlsCertPath        string
@@ -213,8 +247,8 @@ func newRunCmd() *cobra.Command {
 		// Slice 1 of #252 — security-team audit-export. Two channels
 		// (operator picks one or both); webhook flags are license-
 		// gated for Enterprise per [[security-team-audit-export]].
-		auditLogPath              string
-		auditLogFsync             bool
+		auditLogPath  string
+		auditLogFsync bool
 		// #311 / §A10 — rotation thresholds. 0 disables the trigger;
 		// negative values (sentinel for "operator didn't pass the flag")
 		// fall back to the audit-package defaults via the env-var
@@ -222,9 +256,9 @@ func newRunCmd() *cobra.Command {
 		// iam-roles/docs/LOG-RETENTION.md per [[cross-product-agent-
 		// parity]] (sibling products ship the same flag names + env-var
 		// names so a single playbook covers all four).
-		auditLogMaxSizeMB    int64
-		auditLogMaxAgeDays   int
-		auditDBRetentionDays int
+		auditLogMaxSizeMB         int64
+		auditLogMaxAgeDays        int
+		auditDBRetentionDays      int
 		auditWebhookURL           string
 		auditWebhookToken         string
 		auditWebhookBatch         int
@@ -427,6 +461,19 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				}
 			}
 
+			// #380 — env-var fallback for the /audit/events bearer token.
+			// Passing it via --audit-events-token leaks it into `ps` /
+			// process listings; KBOUNCER_AUDIT_EVENTS_TOKEN keeps it out
+			// of the process table. The flag wins when both are set; the
+			// env var only fires when the flag is empty. Resolved BEFORE
+			// the loopback/external-bind gate below so the gate sees the
+			// effective token regardless of where it came from.
+			auditEventsToken = flagOrEnv(auditEventsToken, envAuditEventsTokenVar)
+
+			// #379 — env-var fallback for the upstream CA bundle path.
+			// Flag wins; env var only fires when the flag is empty.
+			upstreamCABundle = flagOrEnv(upstreamCABundle, envUpstreamCABundleVar)
+
 			// CRIT-32-02 (mirrored from iam-jit-bouncer): refuse to bind
 			// externally without explicit operator acknowledgement.
 			// kbounce holds inbound client bearer tokens long enough to
@@ -468,10 +515,24 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				UpstreamURL:           upstreamURL,
 				KubeconfigPath:        kubeconfigPath,
 				InsecureSkipTLSVerify: insecureSkipVerify,
+				UpstreamCABundlePath:  upstreamCABundle,
 				ForwardTimeout:        time.Duration(forwardTimeoutSecs) * time.Second,
 			}
 			up, upErr := upstream.Resolve(upOpts)
 			if upErr != nil {
+				// #379 — a misconfigured --upstream-ca-bundle is an
+				// operator error that MUST fail loudly at startup, never
+				// be demoted to observation-only (silently forwarding
+				// unverified against the wrong trust anchor would be the
+				// exact silent-degradation we're guarding against). The
+				// CA-bundle path errors are distinct from the benign
+				// no-upstream case, so we only demote when the operator
+				// did NOT pin a CA bundle.
+				if upstreamCABundle != "" && errors.Is(upErr, upstream.ErrCABundle) {
+					return fmt.Errorf(
+						"kbounce: --upstream-ca-bundle is set but the upstream "+
+							"could not be resolved with it: %w", upErr)
+				}
 				// HIGH-K2-04: demote no-upstream warn to debug. New
 				// users running `kbounce run` for the first time
 				// without a kubeconfig were being scared by a WARN-
@@ -529,7 +590,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			// doesn't get a silently-ignored flag.
 			if (tlsCertPath != "") != (tlsKeyPath != "") {
 				return fmt.Errorf(
-					"kbounce: --tls-cert and --tls-key must both be set or both " +
+					"kbounce: --tls-cert and --tls-key must both be set or both "+
 						"omitted (got cert=%q key=%q)", tlsCertPath, tlsKeyPath)
 			}
 			if requireClientCert != "" && tlsCertPath == "" {
@@ -960,8 +1021,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"to the client.")
 	cmd.Flags().StringVar(&defaultPolStr, "default-policy", "deny",
 		"allow | deny. What transparent mode does when no rule matches.")
-	cmd.Flags().StringVar(&dbPath, "db", "",
-		"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env).")
+	cmd.Flags().StringVar(&dbPath, "db", "", dbFlagHelp)
 	cmd.Flags().StringVar(&profileName, "profile", "",
 		"Active environment profile. Built-in: 'full-user' (passthrough, "+
 			"default) and 'safe-default' (block mutating verbs + destructive "+
@@ -1031,6 +1091,16 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"kube-apiserver. Mirrors the kubeconfig flag of the same "+
 			"name. NEVER inferred — always explicit. Use ONLY for local "+
 			"clusters with self-signed certs that aren't in the kubeconfig.")
+	cmd.Flags().StringVar(&upstreamCABundle, "upstream-ca-bundle", "",
+		"#379 — path to a PEM file whose certificates verify the "+
+			"kube-apiserver's TLS cert. For private / self-signed kube CAs "+
+			"not present in the kubeconfig (e.g. a custom --upstream behind "+
+			"an internal CA). When set, these certs REPLACE the kubeconfig "+
+			"CA as the trust anchor. A missing / unreadable / non-PEM file "+
+			"is a HARD startup failure — kbounce NEVER falls back to system "+
+			"roots. Falls back to the "+envUpstreamCABundleVar+" env var "+
+			"when unset (the flag wins). Has no effect on a plain-http "+
+			"upstream (set one but not the other and kbounce errors).")
 	cmd.Flags().IntVar(&forwardTimeoutSecs, "forward-timeout", 30,
 		"Per-request timeout (seconds) on outbound forwards to the "+
 			"apiserver. Watch / long-poll requests bypass this; short-"+
@@ -1137,8 +1207,8 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 		"HTTPS URL of an operator-owned audit-event collector. Each decision "+
 			"event POSTed as JSON. Ships in the v1.0 free + open-source release "+
 			"(license-file plumbing #235 retained for any future paid tier per "+
-				"project_oss_only_launch_decision.md but does NOT gate this "+
-				"flag at v1.0). Bounded queue + "+
+			"project_oss_only_launch_decision.md but does NOT gate this "+
+			"flag at v1.0). Bounded queue + "+
 			"exponential backoff retry + drop-on-overflow with synthetic "+
 			"AUDIT_DROPPED marker so consumers see the gap. SSRF-gated: "+
 			"refuses RFC1918 / loopback / .internal / .local without "+
@@ -1182,9 +1252,9 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 	cmd.Flags().StringVar(&auditAlertRoutesPath, "alert-routes", "",
 		"#280 — YAML file describing "+
 			"per-org notification routing. Ships in the v1.0 free + open-source "+
-				"release (license-file plumbing #235 retained for any future "+
-				"paid tier per project_oss_only_launch_decision.md but does "+
-				"NOT gate this flag at v1.0). When set, the multi-destination "+
+			"release (license-file plumbing #235 retained for any future "+
+			"paid tier per project_oss_only_launch_decision.md but does "+
+			"NOT gate this flag at v1.0). When set, the multi-destination "+
 			"routing engine activates: each event is matched against the "+
 			"configured routes' match blocks + dispatched to the route's "+
 			"destinations (webhook / pagerduty / slack). When unset, the "+
@@ -1205,8 +1275,8 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"webhook transport as decision events (OCSF class 6003, "+
 			"activity_id 99, activity_name 'anomaly_detected'). v1.0 free + open-"+
 			"source release (license-file plumbing #235 retained for any future "+
-				"paid tier per project_oss_only_launch_decision.md but does "+
-				"NOT gate this flag at v1.0).")
+			"paid tier per project_oss_only_launch_decision.md but does "+
+			"NOT gate this flag at v1.0).")
 	// Heartbeat liveness emitter — per [[prompt-injection-disable-
 	// bouncer-threat]] + [[audit-export-failure-visibility]]. OFF
 	// by default; 30s recommended for Enterprise.
@@ -1245,7 +1315,10 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 		"Bearer token required for GET /audit/events (#271) when the "+
 			"proxy is bound externally. Empty + loopback bind = no auth "+
 			"required (the loopback bind is the trust anchor). Empty + "+
-			"external bind = kbounce refuses to start.")
+			"external bind = kbounce refuses to start. #380 — falls back "+
+			"to the "+envAuditEventsTokenVar+" env var when the flag is "+
+			"empty (the flag wins). Prefer the env var: a flag value leaks "+
+			"the token into `ps` / process listings.")
 	cmd.Flags().StringVar(&recordSessionsDir, "record-sessions-dir", "",
 		"#285 — per-session NDJSON recording directory. When set, every "+
 			"audit event is also written to {dir}/{agent.session_id}.ndjson "+
@@ -2024,8 +2097,7 @@ via 'kbounce profile allow'.
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&dbPath, "db", "",
-		"Path to kbounce SQLite store (default: ~/.kbouncer/audit.db).")
+	cmd.Flags().StringVar(&dbPath, "db", "", dbFlagHelp)
 	cmd.Flags().StringVar(&since, "since", "5m",
 		"Lower bound for `at` ('5m'/'1h'/'1d') or ISO 8601 timestamp.")
 	cmd.Flags().IntVar(&limit, "limit", 50, "Max rows to return.")
@@ -2431,11 +2503,11 @@ gate but still records the new source.`,
 					"sha256":             result.SHA256,
 				},
 				ExtraExt: map[string]any{
-					"source":            result.SourceURL,
-					"sha256":            result.SHA256,
-					"sha256_verified":   result.SHA256Verified,
-					"installed_count":   len(result.InstalledNames),
-					"profiles_path":     result.ProfilesPath,
+					"source":          result.SourceURL,
+					"sha256":          result.SHA256,
+					"sha256_verified": result.SHA256Verified,
+					"installed_count": len(result.InstalledNames),
+					"profiles_path":   result.ProfilesPath,
 				},
 			})
 
@@ -2749,9 +2821,8 @@ func newMCPCmd() *cobra.Command {
 
 	addServeFlags := func(cmd *cobra.Command) {
 		cmd.Flags().StringVar(&dbPath, "db", "",
-			"SQLite DB path (default: ~/.kbouncer/state.db, or KBOUNCER_DB env). "+
-				"MUST match the path the running proxy uses for live audit-log "+
-				"access via kbounce_tail_decisions.")
+			dbFlagHelp+" MUST match the path the running proxy uses for live "+
+				"audit-log access via kbounce_tail_decisions.")
 		cmd.Flags().StringVar(&profileName, "profile", "",
 			"Active environment profile name (mirror of `kbounce run --profile`). "+
 				"Surfaced by kbounce_active_profile.")
