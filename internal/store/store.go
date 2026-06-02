@@ -43,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 	_ "modernc.org/sqlite"
 )
 
@@ -106,7 +107,8 @@ const SchemaVersion = 9
 // error) signature so callers don't have to change and a future branch
 // can surface a failure loudly rather than silently degrading.
 func DefaultDBPath() (string, error) {
-	if override := os.Getenv("KBOUNCER_DB"); override != "" {
+	// kbenv accepts both KBOUNCER_DB and the KBOUNCE_DB alias.
+	if override := kbenv.Get("DB"); override != "" {
 		return override, nil
 	}
 	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {

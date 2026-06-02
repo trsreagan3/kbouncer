@@ -45,6 +45,7 @@ import (
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
 	"github.com/trsreagan3/kbouncer/internal/dynamicdeny"
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 	"github.com/trsreagan3/kbouncer/internal/parser"
 	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/rules"
@@ -2747,7 +2748,8 @@ func writeDiskPressurePause(w http.ResponseWriter, snap audit.DiskPressureSnapsh
 func EnsureLogger() {
 	zerolog.TimeFieldFormat = time.RFC3339
 	level := zerolog.InfoLevel
-	if v := os.Getenv("KBOUNCER_LOG_LEVEL"); v != "" {
+	// kbenv accepts both KBOUNCER_LOG_LEVEL and KBOUNCE_LOG_LEVEL.
+	if v := kbenv.Get("LOG_LEVEL"); v != "" {
 		if parsed, err := zerolog.ParseLevel(v); err == nil {
 			level = parsed
 		}

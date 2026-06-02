@@ -66,6 +66,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 	"gopkg.in/yaml.v3"
 )
 
@@ -974,10 +975,11 @@ func containsFold(list []string, s string) bool {
 }
 
 // DefaultProfilesPath returns ~/.kbouncer/profiles.yaml or honors
-// KBOUNCER_PROFILES_PATH if set. Test sandboxes can point KBOUNCER_PROFILES_PATH
-// at a tempdir so they don't write to a developer's home directory.
+// KBOUNCER_PROFILES_PATH (or the KBOUNCE_PROFILES_PATH alias) if set.
+// Test sandboxes can point KBOUNCER_PROFILES_PATH at a tempdir so they
+// don't write to a developer's home directory.
 func DefaultProfilesPath() (string, error) {
-	if override := os.Getenv("KBOUNCER_PROFILES_PATH"); override != "" {
+	if override := kbenv.Get("PROFILES_PATH"); override != "" {
 		return override, nil
 	}
 	home, err := os.UserHomeDir()

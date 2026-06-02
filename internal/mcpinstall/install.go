@@ -92,6 +92,7 @@ const AgentSessionIDEnvVar = "KBOUNCE_AGENT_SESSION_ID"
 //	claude-code  → "claude-code"
 //	cursor       → "cursor"
 //	codex        → "openai-codex"
+//	devin        → "devin"
 //	anything else → DefaultAgentName ("claude-code")
 //
 // Exposed (lowercase) for the cli wrapper; the JSON-merge path uses
@@ -104,6 +105,8 @@ func agentNameForClient(clientName string) string {
 		return "cursor"
 	case "codex":
 		return "openai-codex"
+	case "devin":
+		return "devin"
 	default:
 		return DefaultAgentName
 	}
@@ -362,6 +365,84 @@ func InstallCodex(opts Options) (*InstallResult, error) {
 	return res, nil
 }
 
+// DefaultProxyPort is the loopback port kbounce listens on by default.
+// Mirrors posture.DefaultPort + the proxy's --port default; duplicated
+// here (rather than imported) to keep mcpinstall free of a proxy/posture
+// import for one integer.
+const DefaultProxyPort = 8766
+
+// InstallDevin prints the Devin bouncer-wiring recipe. There is NO local
+// config to write — Devin is a cloud-hosted agent (it runs in
+// Cognition's sandboxed environment, not on the operator's laptop), so
+// kbounce surfaces the wiring clearly rather than silently degrading
+// (per [[ibounce-honest-positioning]]). Mirrors ibounce's
+// `ibounce mcp install-devin`.
+//
+// The load-bearing difference from the loopback installers: a cloud
+// agent CANNOT reach a bouncer on 127.0.0.1. kbounce must be bound to a
+// HOST address Devin's sandbox can route to (--host 0.0.0.0 +
+// --i-know-this-binds-externally), and the kubeconfig / KUBECONFIG the
+// agent uses must point at that host:port — NOT loopback.
+//
+// Always returns Manual=true with the recipe captured in Snippet so a
+// caller / test can assert the host-address guidance is present.
+func InstallDevin(opts Options) (*InstallResult, error) {
+	opts.defaults()
+
+	// Build the MCP entry stamped with the "devin" agent attribution so
+	// the snippet matches the auto-install paths' shape.
+	entry := ServerEntryForAgent(agentNameForClient("devin"))
+	cfg := map[string]any{"mcpServers": map[string]any{ServerName: entry}}
+	snippetBytes, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	snippet := string(snippetBytes)
+
+	res := &InstallResult{
+		Manual:  true,
+		Snippet: snippet,
+		Reason: "Devin is a cloud-hosted agent — it runs in Cognition's " +
+			"sandbox, not on your machine, so there is no local config " +
+			"for kbounce to write. Wire kbounce via Devin's MCP settings " +
+			"(PATH A) or by pointing Devin's kubectl/KUBECONFIG at a " +
+			"host-reachable kbounce (PATH B). A kbounce on 127.0.0.1 is " +
+			"NOT visible to Devin's sandbox.",
+	}
+
+	w := opts.Out
+	fmt.Fprintln(w, "kbounce mcp install-devin: Devin is a cloud-hosted agent — no local config to write.")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "PATH A: MCP server (when Devin's MCP support is enabled)")
+	fmt.Fprintln(w, "  1. In the Devin UI, go to Settings > MCP Servers.")
+	fmt.Fprintln(w, "  2. Add this entry (same shape as `kbounce mcp show-config`):")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, snippet)
+	fmt.Fprintln(w, "")
+	fmt.Fprintf(w, "  Note: Devin's MCP host must be able to spawn `%s` — bundle the\n", ServerCommand)
+	fmt.Fprintln(w, "  binary into the Devin environment, or use PATH B for the transparent proxy.")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "PATH B: Transparent proxy at a HOST address (supported today)")
+	fmt.Fprintln(w, "  1. Generate TLS material whose server cert covers the host Devin")
+	fmt.Fprintln(w, "     reaches (add it as a SAN — loopback alone is not enough):")
+	fmt.Fprintln(w, "       kbounce init-tls --additional-san <kbounce-host>")
+	fmt.Fprintln(w, "  2. On that host, run kbounce bound off-loopback (loopback is")
+	fmt.Fprintln(w, "     invisible to the cloud sandbox) with TLS:")
+	fmt.Fprintf(w, "       kbounce run --host 0.0.0.0 --port %d --i-know-this-binds-externally \\\n", DefaultProxyPort)
+	fmt.Fprintln(w, "         --tls-cert ~/.kbouncer/tls/server.crt --tls-key ~/.kbouncer/tls/server.key \\")
+	fmt.Fprintln(w, "         --upstream https://<your-cluster-api>:6443 \\")
+	fmt.Fprintln(w, "         --audit-events-token <secret>   # required when binding off-loopback")
+	fmt.Fprintln(w, "  3. In Devin's task environment, point kubectl at the proxy host:port")
+	fmt.Fprintln(w, "     (NOT 127.0.0.1) and trust the generated CA:")
+	fmt.Fprintf(w, "       server: https://<kbounce-host>:%d\n", DefaultProxyPort)
+	fmt.Fprintln(w, "       certificate-authority: ~/.kbouncer/tls/ca.crt")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Limitation: Devin runs in Cognition's cloud sandbox; kbounce must be on")
+	fmt.Fprintln(w, "a host Devin can reach over the network. A kbounce on 127.0.0.1 is NOT")
+	fmt.Fprintln(w, "visible to Devin's sandbox.")
+	return res, nil
+}
+
 // ---------------------------------------------------------------------
 // Shared JSON-merge install.
 // ---------------------------------------------------------------------
@@ -605,6 +686,7 @@ func ShowConfig(w io.Writer, shape Shape) error {
 		"#   kbounce mcp install-claude-code\n" +
 		"#   kbounce mcp install-cursor\n" +
 		"#   kbounce mcp install-codex\n" +
+		"#   kbounce mcp install-devin       (cloud agent; prints recipe)\n" +
 		"#\n" +
 		"# Agent attribution (#375 / §A35b): the " + AgentNameEnvVar + " +\n" +
 		"# " + AgentSessionIDEnvVar + " env vars wire the agent's\n" +

@@ -83,6 +83,27 @@ func TestMCP_InstallCodex_TOMLPrintsSnippetWithoutWriting(t *testing.T) {
 	assert.True(t, os.IsNotExist(err))
 }
 
+func TestMCP_InstallDevin_PrintsRecipeWithoutWriting(t *testing.T) {
+	root := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"mcp", "install-devin"})
+	require.NoError(t, root.Execute())
+
+	s := stdout.String()
+	// Devin is a cloud agent — recipe, not a written config.
+	assert.Contains(t, s, "no local config to write")
+	assert.Contains(t, s, "PATH A")
+	assert.Contains(t, s, "PATH B")
+	// Load-bearing cloud caveat: bouncer at a HOST address, not loopback.
+	assert.Contains(t, s, "127.0.0.1 is NOT")
+	assert.Contains(t, s, "<kbounce-host>")
+	// Snippet shape lines up with show-config (mcp serve).
+	assert.Contains(t, s, "mcp")
+	assert.Contains(t, s, "serve")
+}
+
 func TestMCP_ShowConfig_JSONShapeMatchesInstallSnippet(t *testing.T) {
 	root := newRootCmd()
 	var stdout bytes.Buffer

@@ -19,6 +19,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 )
 
 // SchemaVersion pins the shape of the JSON output. Bump on breaking
@@ -107,8 +109,11 @@ func Capture() Block {
 	return block
 }
 
+// envOrUnknown resolves a kbounce env var (accepting both the
+// KBOUNCER_ and KBOUNCE_ prefixes via kbenv) and returns "unknown"
+// when neither is set.
 func envOrUnknown(name string) string {
-	v := strings.TrimSpace(os.Getenv(name))
+	v := strings.TrimSpace(kbenv.Get(name))
 	if v == "" {
 		return "unknown"
 	}

@@ -32,12 +32,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/trsreagan3/kbouncer/internal/kbenv"
 )
 
 // versionCheckEnvVar is the kill-switch env var. Setting it to any
@@ -184,11 +185,12 @@ func runVersionCheck(ctx context.Context, stdout, stderr io.Writer) error {
 }
 
 // envDisabledVersionCheck returns true when the operator has opted
-// out via KBOUNCE_NO_VERSION_CHECK. Accepts any non-empty value
+// out via KBOUNCE_NO_VERSION_CHECK (or the KBOUNCER_NO_VERSION_CHECK
+// alias — kbenv accepts both prefixes). Accepts any non-empty value
 // except the literal strings "0" / "false" (case-insensitive) so a
 // shell rc that exports KBOUNCE_NO_VERSION_CHECK=0 is not a footgun.
 func envDisabledVersionCheck() bool {
-	v := strings.TrimSpace(os.Getenv(versionCheckEnvVar))
+	v := strings.TrimSpace(kbenv.Get(versionCheckEnvVar))
 	if v == "" {
 		return false
 	}
