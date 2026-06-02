@@ -349,12 +349,15 @@ type generatorRule struct {
 // Per [[creates-never-mutates]] operator-authored canonical profiles
 // continue to parse identically.
 func (p *Profile) UnmarshalYAML(node *yaml.Node) error {
+	// Decode directly into *p through a type alias (rawProfile drops
+	// Profile's UnmarshalYAML method, so this doesn't recurse). Decoding
+	// into the pointer — rather than into a temp and copying it back —
+	// avoids copying the embedded compileOnce sync.Once, which go vet's
+	// copylocks check (correctly) rejects.
 	type rawProfile Profile
-	var canonical rawProfile
-	if err := node.Decode(&canonical); err != nil {
+	if err := node.Decode((*rawProfile)(p)); err != nil {
 		return err
 	}
-	*p = Profile(canonical)
 
 	var shim generatorProfileShim
 	if err := node.Decode(&shim); err != nil {
