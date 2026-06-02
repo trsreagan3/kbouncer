@@ -9,10 +9,10 @@
 // protocol signals are:
 //
 //   - action        = the K8s verb (get / list / create / delete /
-//                     exec / ...) — falls back to the HTTP method.
+//     exec / ...) — falls back to the HTTP method.
 //   - resource      = "<namespace>/<resource>" (or the resource alone
-//                     for cluster-scoped) — canonicalised by the core
-//                     into a privacy-safe k8s:<env> bucket.
+//     for cluster-scoped) — canonicalised by the core
+//     into a privacy-safe k8s:<env> bucket.
 //   - agentIdentity = the resolved agent name (or "anonymous").
 //
 // DEFAULT = ALERT, NOT BLOCK per [[safety-mode-lean-permissive]].
@@ -26,6 +26,7 @@ import (
 	"os"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/trsreagan3/kbouncer/internal/anomaly"
 )
@@ -74,12 +75,21 @@ func observeAnomaly(action, resource, agentIdentity, floorVerdict string) {
 	if floorVerdict == "DENY" || floorVerdict == "deny" {
 		floor = "deny"
 	}
+	// FEED THE REAL DEVIATION SIGNALS (#718 finding HIGH): derive the
+	// current hour-of-day from the clock and the recent-window observed
+	// action rate for this (agent, action, resource_pattern) from the
+	// baseline store, so the hour_of_day + action_frequency dimensions
+	// actually contribute. Computed BEFORE Run records this event so the
+	// rate reflects the burst arriving so far; Run adds the current one.
+	// Privacy preserved: we pass only structural shapes + counts.
+	observedHour := time.Now().UTC().Hour()
+	observedRate := d.Store().RecentRate(agentIdentity, action, resource, 0)
 	d.Run(anomaly.RunInput{
 		Action:              action,
 		AgentIdentity:       agentIdentity,
 		Resource:            resource,
-		ObservedHour:        -1,
-		ObservedActionCount: -1,
+		ObservedHour:        observedHour,
+		ObservedActionCount: observedRate,
 		FloorDecision:       floor,
 		RecordObservation:   true,
 	})

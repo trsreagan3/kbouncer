@@ -57,10 +57,14 @@ func TestAnomalyHealthzUnwired(t *testing.T) {
 	}
 }
 
-// TestObserveAnomalyAlertsNotBlocks asserts the tap surfaces a neutral
-// event after a baseline-then-deviation sequence but never changes the
-// request decision in the default alert mode.
-func TestObserveAnomalyEmitsAfterBaseline(t *testing.T) {
+// TestObserveAnomalyEmitsThroughWire is the GENUINE wire test (#718
+// finding LOW): it drives a volume-spike burst entirely THROUGH
+// observeAnomaly (never d.Run directly) and asserts a neutral event is
+// emitted. This FAILS against the old sentinel wire (ObservedHour=-1,
+// ObservedActionCount=-1 meant no deviation dimension ever contributed,
+// so behavioral detection was dead) and PASSES once observeAnomaly
+// feeds the real hour-of-day + recent-window rate.
+func TestObserveAnomalyEmitsThroughWire(t *testing.T) {
 	cfg := anomaly.DefaultConfig()
 	cfg.Enabled = true
 	cfg.Mode = "alert"
@@ -69,32 +73,44 @@ func TestObserveAnomalyEmitsAfterBaseline(t *testing.T) {
 	SetAnomalyDetector(d)
 	t.Cleanup(func() { SetAnomalyDetector(nil) })
 
-	// Establish a baseline of normal traffic via the tap.
-	for i := 0; i < 40; i++ {
+	// A sharp burst for one (agent, verb, namespace/resource): the
+	// recent-window rate climbs far above the learned per-hour baseline
+	// mean, so the action_frequency dimension trips — all THROUGH
+	// observeAnomaly.
+	for i := 0; i < 200; i++ {
 		observeAnomaly("get", "default/pods", "agent-k", "ALLOW")
 	}
-	before := d.Status()["alerts_emitted"].(int64)
-	// A run with a sharp volume spike should flag — drive through the
-	// detector directly with the spike signal (the tap always passes
-	// the single-event sentinels, so we exercise the scoring path here).
-	out := d.Run(anomaly.RunInput{
-		Action:              "get",
-		AgentIdentity:       "agent-k",
-		Resource:            "default/pods",
-		ObservedHour:        -1,
-		ObservedActionCount: 100000,
-		FloorDecision:       "allow",
-		RecordObservation:   true,
-	})
-	if out.Decision != "allow" {
-		t.Fatalf("alert mode must not block; got %q", out.Decision)
+	if got := d.Status()["alerts_emitted"].(int64); got < 1 {
+		t.Fatalf("expected the wire to flag the volume spike (alerts_emitted=%d); "+
+			"behavioral detection is dead if this is 0", got)
 	}
-	after := d.Status()["alerts_emitted"].(int64)
-	if after <= before {
-		t.Fatalf("expected an alert to be emitted on the spike (before=%d after=%d)", before, after)
+	if scored := d.Status()["events_scored"].(int64); scored < 1 {
+		t.Fatalf("expected the wire to score events through observeAnomaly; got %d", scored)
 	}
 	h := anomalyHealthz()
 	if h["enabled"].(bool) != true {
 		t.Fatalf("healthz should report enabled detector")
+	}
+	if h["recent_count"].(int) < 1 {
+		t.Fatalf("expected recent ring to hold the emitted event")
+	}
+}
+
+// TestObserveAnomalyNormalTrafficQuietThroughWire asserts the wire does
+// NOT cry wolf: a handful of calls below the baseline floor stay normal.
+func TestObserveAnomalyNormalTrafficQuietThroughWire(t *testing.T) {
+	cfg := anomaly.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Mode = "alert"
+	cfg.MinActionsForBaseline = 5
+	d := NewAnomalyDetector(cfg)
+	SetAnomalyDetector(d)
+	t.Cleanup(func() { SetAnomalyDetector(nil) })
+
+	for i := 0; i < 3; i++ {
+		observeAnomaly("get", "default/pods", "agent-quiet", "ALLOW")
+	}
+	if got := d.Status()["alerts_emitted"].(int64); got != 0 {
+		t.Fatalf("steady low-rate traffic must not be flagged; alerts_emitted=%d", got)
 	}
 }
