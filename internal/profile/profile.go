@@ -210,10 +210,11 @@ type ParsedRequest struct {
 // across all products.
 //
 // The kbouncer evaluator consumes Pattern directly (see Profile.Evaluate
-// + allowRuleMatches). The ArnScope / RegionScope fields are AWS-shaped
-// round-trip fields; the K8s evaluator ignores them (K8s scope lives in
-// the Pattern's resource half + the proxy's namespace/global rule engine,
-// not on the profile allow rule).
+// + allowRuleMatches). It ALSO enforces ArnScope as a namespace floor when
+// the scope cleanly names a K8s namespace (see allowRuleNamespaceScope) so
+// a namespace-scoped allow does NOT leak to other namespaces — parity with
+// gbounce's enforced --target host scope. RegionScope stays an AWS-shaped
+// round-trip field the K8s evaluator ignores.
 type ProfileAllowRule struct {
 	// Pattern is a `resource:verb_glob` pattern — the SAME shape
 	// kbouncer's global + task rules use (see rules.ParsePattern), so an
@@ -238,9 +239,14 @@ type ProfileAllowRule struct {
 	Pattern string `yaml:"pattern"`
 
 	// ArnScope (Python-side) / cluster or namespace scope (K8s-side).
-	// Kept named after the AWS shape so profile YAML round-trips;
-	// ignored by the K8s evaluator. A future K-Slice may add a K8s-native
-	// scope field with a YAML alias.
+	// Kept named after the AWS shape so profile YAML round-trips. On the
+	// K8s side the evaluator ENFORCES it as a namespace floor when it
+	// cleanly names a namespace (e.g. "namespaces/default", "default/foo",
+	// or a glob like "staging-*"); see allowRuleNamespaceScope +
+	// allowRuleScopeMatches. A scope that can't be mapped to a namespace
+	// (or "*") is advisory-only and imposes no constraint — the CLI warns
+	// at add-time. A future K-Slice may add a K8s-native scope field with
+	// a YAML alias.
 	ArnScope string `yaml:"arn_scope,omitempty"`
 
 	// RegionScope is the AWS-side region scope; harmless on the K8s
@@ -876,10 +882,19 @@ func (p *Profile) MatchAllowRule(req *ParsedRequest) (bool, string) {
 // matches the parsed request (matched=true + its Pattern). Empty /
 // whitespace-only patterns are skipped. Mirrors dbounce's matcher of the
 // same name.
+//
+// In addition to the Pattern's resource:verb match, the rule's ArnScope
+// is ENFORCED as a namespace floor when it cleanly names a K8s namespace
+// (see allowRuleNamespaceScope) — a namespace-scoped allow does NOT leak
+// to other namespaces. This keeps `profile allow --target` honest +
+// parity with gbounce, which enforces its `--target` host scope.
 func matchAnyAllowRule(allowRules []ProfileAllowRule, req *ParsedRequest) (bool, string) {
 	for _, ar := range allowRules {
 		pattern := strings.TrimSpace(ar.Pattern)
 		if pattern == "" {
+			continue
+		}
+		if !allowRuleScopeMatches(ar.ArnScope, req) {
 			continue
 		}
 		if allowRuleMatches(pattern, req) {
@@ -887,6 +902,73 @@ func matchAnyAllowRule(allowRules []ProfileAllowRule, req *ParsedRequest) (bool,
 		}
 	}
 	return false, ""
+}
+
+// TargetEnforcedAsNamespace reports whether a `profile allow --target`
+// value will be ENFORCED as a namespace scope by the evaluator (true) or
+// is advisory-only metadata (false). The CLI consults this at add-time so
+// it can WARN the operator when a target won't be enforced. Exported so
+// the cmd + mcp layers don't re-derive the mapping rule.
+func TargetEnforcedAsNamespace(target string) bool {
+	_, ok := allowRuleNamespaceScope(target)
+	return ok
+}
+
+// allowRuleScopeMatches enforces a ProfileAllowRule's ArnScope (set from
+// `profile allow --target`) against the request's namespace. When the
+// scope cleanly names a namespace (see allowRuleNamespaceScope) the rule
+// only matches requests in that namespace (the scope may be a glob, e.g.
+// "staging-*"). When the scope is empty or cannot be mapped to a K8s
+// namespace it is advisory-only — the CLI warns about this at add-time —
+// and imposes no constraint here.
+func allowRuleScopeMatches(arnScope string, req *ParsedRequest) bool {
+	ns, ok := allowRuleNamespaceScope(arnScope)
+	if !ok {
+		// Scope is empty or not namespace-shaped → advisory, no floor.
+		return true
+	}
+	// A namespace-scoped allow must NOT match cluster-scoped requests
+	// (empty namespace) — fail closed.
+	if req.Namespace == "" {
+		return false
+	}
+	return globMatch(strings.ToLower(req.Namespace), strings.ToLower(ns))
+}
+
+// allowRuleNamespaceScope extracts the namespace component from a
+// `--target` value, returning ok=false when the target cannot be cleanly
+// mapped to a single K8s namespace (in which case the target is advisory
+// metadata only). Recognized shapes:
+//
+//	"namespaces/<ns>"   → "<ns>"   (the canonical denies-suggested form)
+//	"<ns>/<name...>"    → "<ns>"   (resource path form; first segment)
+//	"<ns>"              → "<ns>"   (bare namespace token, no slash)
+//
+// The namespace token may itself be a glob (e.g. "staging-*"); the caller
+// glob-matches it. A target whose namespace half is "*" (any namespace)
+// returns ok=false so it imposes no floor — that is what the operator
+// asked for and matches the "advisory / no constraint" path.
+func allowRuleNamespaceScope(target string) (string, bool) {
+	t := strings.TrimSpace(target)
+	if t == "" {
+		return "", false
+	}
+	var ns string
+	if rest, ok := strings.CutPrefix(t, "namespaces/"); ok {
+		ns = rest
+	} else {
+		ns = t
+	}
+	// Take the first path segment as the namespace; later segments name
+	// the object within the namespace and don't change the ns floor.
+	if i := strings.IndexByte(ns, '/'); i >= 0 {
+		ns = ns[:i]
+	}
+	ns = strings.TrimSpace(ns)
+	if ns == "" || ns == "*" {
+		return "", false
+	}
+	return ns, true
 }
 
 // allowRuleMatches is the local matcher for a ProfileAllowRule Pattern.

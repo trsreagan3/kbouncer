@@ -951,6 +951,70 @@ func TestEvaluate_AllowRule_KeywordDenyStillWins(t *testing.T) {
 	assert.Equal(t, SourceProfile, v.Source)
 }
 
+// TestEvaluate_AllowRule_ArnScopeEnforcedAsNamespace is the load-bearing
+// honesty test for the MED finding: a `--target`-scoped allow (stored in
+// ArnScope) must NOT leak to other namespaces. A `configmaps:get` allow
+// scoped to `namespaces/default` allows the GET in default but abstains
+// (does NOT allow) the same GET in kube-system.
+func TestEvaluate_AllowRule_ArnScopeEnforcedAsNamespace(t *testing.T) {
+	cases := []struct {
+		name      string
+		arnScope  string
+		reqNS     string
+		wantAllow bool
+	}{
+		{"in-scope namespace allowed", "namespaces/default", "default", true},
+		{"out-of-scope namespace not allowed", "namespaces/default", "kube-system", false},
+		{"resource-path form scopes namespace", "default/some-cm", "default", true},
+		{"resource-path form blocks other ns", "default/some-cm", "kube-system", false},
+		{"bare namespace token enforced", "default", "default", true},
+		{"bare namespace token blocks other ns", "default", "kube-system", false},
+		{"glob namespace scope matches", "namespaces/staging-*", "staging-a", true},
+		{"glob namespace scope blocks non-match", "namespaces/staging-*", "prod-a", false},
+		{"namespace-scoped does not match cluster-scoped req", "namespaces/default", "", false},
+		{"empty scope imposes no floor (advisory)", "", "kube-system", true},
+		{"star namespace half is advisory (no floor)", "namespaces/*", "kube-system", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Profile{
+				Name: "scoped-allow",
+				AllowRules: []ProfileAllowRule{
+					{Pattern: "configmaps:get", ArnScope: tc.arnScope},
+				},
+			}
+			v := p.Evaluate(&ParsedRequest{
+				Verb: "get", Resource: "configmaps", Namespace: tc.reqNS,
+			})
+			assert.Equal(t, tc.wantAllow, v.Allowed,
+				"scope %q vs request ns %q", tc.arnScope, tc.reqNS)
+			if tc.wantAllow {
+				assert.Equal(t, SourceProfileAllow, v.Source)
+			} else {
+				// Out-of-scope must NOT produce a profile-allow; the
+				// profile abstains (defers to later layers).
+				assert.False(t, v.Allowed)
+			}
+		})
+	}
+}
+
+// TestTargetEnforcedAsNamespace pins the CLI-facing predicate that drives
+// the advisory-only warning: namespace-shaped targets are enforced; bare
+// non-namespace/glob-only targets + "*" are advisory.
+func TestTargetEnforcedAsNamespace(t *testing.T) {
+	enforced := []string{
+		"namespaces/default", "default/cm", "default", "namespaces/staging-*",
+	}
+	for _, tgt := range enforced {
+		assert.True(t, TargetEnforcedAsNamespace(tgt), "expected %q enforced", tgt)
+	}
+	advisory := []string{"", "*", "namespaces/*"}
+	for _, tgt := range advisory {
+		assert.False(t, TargetEnforcedAsNamespace(tgt), "expected %q advisory", tgt)
+	}
+}
+
 // TestMatchAllowRule_Helper covers the exported MatchAllowRule helper's
 // nil / sentinel / empty guards + a positive match.
 func TestMatchAllowRule_Helper(t *testing.T) {

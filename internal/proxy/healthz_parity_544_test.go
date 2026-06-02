@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/trsreagan3/kbouncer/internal/audit"
+	"github.com/trsreagan3/kbouncer/internal/profile"
 )
 
 // healthz_parity_544_test.go — #544 / MRR-5 M2 + M3 cross-bouncer
@@ -106,6 +107,35 @@ func TestHealthz_ChainInitializedFalseWhenNoChain(t *testing.T) {
 		body["chain_initialized"], body["chain_initialized"])
 	assert.False(t, got,
 		"chain_initialized = true; want false when AuditEmitter is nil")
+}
+
+// TestHealthz_HasProfileAllowCounts — MED finding — kbouncer's main
+// /healthz must surface a profile allow-rule count + a lifetime
+// total-allows counter for parity with gbounce's
+// mitm_allow_rules_count + total_mitm_allows. allow_rules_in_active_profile
+// must equal len(active profile's AllowRules); total_profile_allows must
+// be present (and a number) on the bare probe.
+func TestHealthz_HasProfileAllowCounts(t *testing.T) {
+	st := freshStore(t)
+	s := NewServer(Config{Mode: ModeCooperative, DefaultPolicy: DefaultPolicyAllow}, st)
+	s.SetActiveProfile(&profile.Profile{
+		Name: "scoped",
+		AllowRules: []profile.ProfileAllowRule{
+			{Pattern: "configmaps:get", ArnScope: "namespaces/default"},
+			{Pattern: "pods:list"},
+		},
+	})
+	ts := httptest.NewServer(s.http.Handler)
+	t.Cleanup(ts.Close)
+	body := fetchHealthzBody(t, ts.URL+"/healthz")
+
+	cnt, ok := body["allow_rules_in_active_profile"].(float64)
+	require.True(t, ok, "allow_rules_in_active_profile missing/not numeric: %#v", body["allow_rules_in_active_profile"])
+	assert.Equal(t, float64(2), cnt,
+		"allow_rules_in_active_profile should equal the active profile's allow-rule count")
+
+	_, ok = body["total_profile_allows"].(float64)
+	assert.True(t, ok, "/healthz missing total_profile_allows counter: %#v", body["total_profile_allows"])
 }
 
 // TestHealthz_HasLlmBudget — #544 — /healthz must include the

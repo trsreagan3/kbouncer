@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/trsreagan3/kbouncer/internal/profile"
 	"github.com/trsreagan3/kbouncer/internal/profileallow"
 )
 
@@ -86,6 +87,12 @@ func (s *Server) toolProfileAllow(args map[string]any) (map[string]any, error) {
 		"actor":            res.Actor,
 		"source":           res.Source,
 		"rule_count_after": res.RuleCountAfter,
+		// target_scope_advisory is true when --target does NOT name a
+		// K8s namespace, so the evaluator will NOT scope the allow to it
+		// (scoping then comes only from the action's resource half).
+		// Lets the agent know the target is metadata-only — mirrors the
+		// CLI's add-time warning. Honest per [[ibounce-honest-positioning]].
+		"target_scope_advisory": !profile.TargetEnforcedAsNamespace(target),
 	}
 	if res.PendingEntry != nil {
 		out["pending_entry"] = res.PendingEntry
