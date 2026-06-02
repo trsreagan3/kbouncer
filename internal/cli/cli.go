@@ -258,6 +258,7 @@ func newRunCmd() *cobra.Command {
 		// gated for Enterprise per [[security-team-audit-export]].
 		auditLogPath  string
 		auditLogFsync bool
+		noAuditChain  bool
 		// #311 / §A10 — rotation thresholds. 0 disables the trigger;
 		// negative values (sentinel for "operator didn't pass the flag")
 		// fall back to the audit-package defaults via the env-var
@@ -667,6 +668,7 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				auditObjectStorageRotationMinutes,
 				auditObjectStorageMaxSizeMB,
 				auditObjectStorageInstanceID,
+				noAuditChain,
 			)
 			if auditErr != nil {
 				return auditErr
@@ -1156,6 +1158,10 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 			"(buffered writes are durable to a crash but not a power loss). "+
 			"Opt in for compliance-grade durability at the cost of ~10x "+
 			"per-line write latency.")
+	cmd.Flags().BoolVar(&noAuditChain, "no-audit-chain", false,
+		"Disable the tamper-evident hash-chain + Ed25519-signed manifests on "+
+			"the audit-log JSONL (ADOPT-10/#734; on by default when "+
+			"--audit-log-path is set).")
 	// #311 / §A10 — rotation thresholds. Sentinel value -1 = "operator
 	// didn't pass the flag → use the audit package default (100 MB / 7
 	// days / 30 days)." 0 = "operator explicitly disabled this trigger."
@@ -1514,6 +1520,7 @@ func buildAuditManager(
 	auditObjectStorageRotationMinutes int,
 	auditObjectStorageMaxSizeMB int,
 	auditObjectStorageInstanceID string,
+	noAuditChain bool,
 ) (audit.Emitter, func() bool, func(), error) {
 	noop := func() {}
 	// #258 — Security Lake parse-time validation. Bucket without region
@@ -1636,11 +1643,45 @@ func buildAuditManager(
 		// the resolved value at startup but don't fail-fast on it here
 		// (the writer doesn't sweep the DB).
 		_ = dbRetentionDays
+		// ADOPT-10 / #734 — tamper-evident hash-chain + signed manifests,
+		// ON BY DEFAULT when audit logging is on (cheap + safe per
+		// [[v1-scope-bar]]). --no-audit-chain disables. Chain state lives
+		// alongside the JSONL; the Ed25519 keypair lives in
+		// ~/.kbouncer/audit-keys (override via KBOUNCER_AUDIT_KEYS_DIR).
+		// The private key is never logged or committed.
+		var chain *audit.ChainState
+		var signer *audit.ManifestSigner
+		logDir := audit.ResolveLogDir(logPath)
+		if !noAuditChain && logDir != "" {
+			chain = audit.LoadChainState(logDir, 0)
+			keysDir := os.Getenv("KBOUNCER_AUDIT_KEYS_DIR")
+			if keysDir == "" {
+				if home, herr := os.UserHomeDir(); herr == nil {
+					keysDir = filepath.Join(home, ".kbouncer", "audit-keys")
+				}
+			}
+			if keysDir != "" {
+				s, serr := audit.NewManifestSigner(
+					logDir, "kbouncer",
+					audit.DefaultManifestIntervalEvents,
+					keysDir, audit.DefaultKeypairName,
+				)
+				if serr != nil {
+					fmt.Fprintf(os.Stderr,
+						"kbouncer: warn: audit-manifest keypair init failed: %v "+
+							"(hash-chain still active; no signed manifests)\n", serr)
+				} else {
+					signer = s
+				}
+			}
+		}
 		lw, err := audit.NewLogWriter(ctx, audit.LogWriterOptions{
 			Path:       logPath,
 			Fsync:      logFsync,
 			MaxSizeMB:  effSize,
 			MaxAgeDays: effAge,
+			Chain:      chain,
+			Signer:     signer,
 		})
 		if err != nil {
 			return nil, nil, noop, err

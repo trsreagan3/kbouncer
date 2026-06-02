@@ -2674,6 +2674,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		// [[cross-product-agent-parity]] all four bouncers surface the
 		// same field for SRE composite monitors.
 		ChainInitialized bool             `json:"chain_initialized"`
+		AuditChain       map[string]any   `json:"audit_chain"`
 		LlmBudget        HealthzLlmBudget `json:"llm_budget"`
 	}{
 		Status:                      "ok",
@@ -2688,9 +2689,34 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyMatches:     s.totalDynamicDenyMatches.Load(),
 		TotalDynamicDenyReloads:     s.totalDynamicDenyReloads.Load(),
 		TotalDynamicDenyParseErrors: s.totalDynamicDenyParseErrors.Load(),
-		ChainInitialized:            s.cfg.AuditEmitter != nil,
 		LlmBudget:                   HealthzLlmBudget{Enabled: false},
 		TotalProfileAllows:          s.totalProfileAllows.Load(),
+	}
+	// ADOPT-10 / #734 — chain_initialized now reports whether the
+	// tamper-evident hash-chain is ACTUALLY stamping rows (honest
+	// forensic posture), not merely that an audit emitter is wired. The
+	// audit_chain block surfaces the real head seq/hash + manifest
+	// signature presence for SOC analysts / composite monitors.
+	if s.cfg.AuditEmitter != nil {
+		est := s.cfg.AuditEmitter.Status()
+		payload.ChainInitialized = est.ChainEnabled
+		if est.ChainEnabled {
+			payload.AuditChain = map[string]any{
+				"enabled":   true,
+				"head_seq":  est.ChainHeadSeq,
+				"head_hash": est.ChainHeadHash,
+				"manifest": map[string]any{
+					"configured":        est.ManifestConfigured,
+					"manifests_emitted": est.ManifestsEmitted,
+					"manifests_failed":  est.ManifestsFailed,
+					"public_key_b64":    est.ManifestPublicKeyB64,
+				},
+			}
+		} else {
+			payload.AuditChain = map[string]any{"enabled": false}
+		}
+	} else {
+		payload.AuditChain = map[string]any{"enabled": false}
 	}
 	if ap := s.ActiveProfile(); ap != nil {
 		payload.ActiveProfile = ap.Name

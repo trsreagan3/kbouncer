@@ -33,7 +33,13 @@ type nopParityEmitter struct {
 }
 
 func (e *nopParityEmitter) Emit(_ context.Context, _ audit.Event) {}
-func (e *nopParityEmitter) Status() audit.Status                  { return audit.Status{} }
+
+// Status reports a live hash-chain so chain_initialized is honest per
+// ADOPT-10 / #734 (the field now tracks whether the chain is actually
+// stamping rows, not merely that an emitter object exists).
+func (e *nopParityEmitter) Status() audit.Status {
+	return audit.Status{ChainEnabled: true, ChainHeadSeq: 0, ChainHeadHash: "deadbeef"}
+}
 
 // startHealthzTestServer is a small wrapper that builds a Server with
 // the given Config + optional AuditEmitter, spins up an httptest
