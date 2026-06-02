@@ -63,6 +63,7 @@ func TestAuditWebhook_NoLicenseShipsFree(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	// The webhook MAY fail downstream (DNS / SSRF / network) but it
 	// must NEVER fail with the license sentinel — the calibration
@@ -103,6 +104,7 @@ func TestAuditWebhook_NoLicenseShipsFree_HTTPSRejected(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "https://",
@@ -127,6 +129,7 @@ func TestAuditLog_NoWebhookNoLicenseGate(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	require.NoError(t, err, "JSONL log alone should not require an Enterprise license")
 	require.NotNil(t, mgr)
@@ -154,6 +157,7 @@ func TestAudit_NoFlagsNoManager(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, mgr, "no flags → no Manager constructed")
@@ -204,6 +208,7 @@ func TestAuditRoutes_NoLicenseShipsFree(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	require.NoError(t, err,
 		"--alert-routes ships FREE at v1.0 per [[oss-only-launch-decision]]")
@@ -243,6 +248,7 @@ func TestAuditAlerts_NoLicenseShipsFree(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	require.NoError(t, err,
 		"--alert-rules ships FREE at v1.0 per [[oss-only-launch-decision]]")
@@ -275,6 +281,7 @@ func TestAuditHeartbeat_OnEnabledWiresHealthCheckAndEmits(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	require.NoError(t, err)
 	defer closer()
@@ -309,6 +316,7 @@ func TestAuditHeartbeat_TooSmallIntervalRejected(t *testing.T) {
 		"", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
 		false,
+		0,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "heartbeat-interval",
