@@ -439,6 +439,11 @@ const (
 	// verdict. Profile denies are a hard floor: a permissive task scope
 	// cannot override them.
 	SourceProfile = "profile"
+	// SourceProfileAllow means a profile allow_rule (composition Order 7)
+	// explicitly allowed the request. Mirrors profile.SourceProfileAllow;
+	// fires only after every profile deny layer + the dynamic-deny floor
+	// abstained, and short-circuits before task + global rules.
+	SourceProfileAllow = "profile.allow"
 	// SourceTask means the active per-task scope (K-Slice 3) fired.
 	SourceTask = "task"
 	// SourceGlobal means a global rule (K-Slice 3) fired.
@@ -770,7 +775,11 @@ func EvaluateRequestFull(
 	// Composition order step 1: profile rules. Profile denies are a hard
 	// floor — a permissive task scope or global rule cannot override
 	// them. Short-circuit on a profile deny so the audit row + response
-	// header surface SourceProfile.
+	// header surface SourceProfile. A profile allow_rule match is recorded
+	// in profileAllow and applied after the dynamic-deny floor (deny
+	// always wins over a profile-allow).
+	var profileAllow bool
+	var profileAllowReason string
 	if activeProfile != nil {
 		pv := activeProfile.Evaluate(&profile.ParsedRequest{
 			Verb:             parsed.Verb,
@@ -795,6 +804,13 @@ func EvaluateRequestFull(
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
+		// Profile allow_rule match (composition Order 7) is recorded here
+		// but NOT short-circuited yet: the dynamic-deny layer below is a
+		// "deny always wins over allow" floor (see its comment) so a
+		// dynamic-deny must beat a profile-allow. We therefore defer the
+		// profile-allow short-circuit until AFTER the dynamic-deny check.
+		profileAllow = pv.Allowed
+		profileAllowReason = pv.Reason
 	}
 
 	// #301: meta / discovery short-circuit. kubectl + client-go bootstrap
@@ -862,6 +878,25 @@ func EvaluateRequestFull(
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
+	}
+
+	// Composition order step 1.6: profile allow_rule match. Deferred from
+	// the profile-rules block so the dynamic-deny floor above ("deny always
+	// wins over allow") gets first refusal. An allow_rule could not have
+	// co-occurred with a profile DENY (the evaluator only consults
+	// allow_rules after every profile deny layer abstains), so reaching
+	// here with profileAllow=true means the operator explicitly blessed
+	// this request shape. Short-circuit to ALLOW before task + global
+	// rules, mirroring dbounce's Order-4 allow layer.
+	if profileAllow {
+		obs.DecisionVerdict = VerdictAllow
+		obs.DecisionReason = profileAllowReason
+		obs.DecisionSource = SourceProfileAllow
+		obs.Enforced = false
+		decisionID := writeDecision(st, obs, activePause, agentInfo)
+		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
+		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+		return obs
 	}
 
 	// K-Slice 3: build the request view the rule + task engines consume.

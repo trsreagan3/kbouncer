@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -320,21 +321,27 @@ func appendPromptToProfile(p *store.PromptRow, target, profilesPath string) (str
 			ExitCode: 2,
 		}
 	}
-	// Build the new allow rule. The "pattern" string is opaque to
-	// kbouncer K-Slice 7 (deny-only evaluator) and round-trips through
-	// YAML — K-Slice 3's rule engine will consume it. Storing
-	// "verb resource" (e.g. "get pods") matches the convention used in
-	// install_test.go's AllowRules fixtures.
-	pattern := p.Verb
-	if p.Resource != "" {
-		if pattern != "" {
-			pattern += " " + p.Resource
-		} else {
-			pattern = p.Resource
-		}
-	}
-	if pattern == "" {
-		pattern = fmt.Sprintf("decision #%d", p.DecisionID)
+	// Build the new allow rule in the canonical `resource:verb_glob`
+	// shape the profile evaluator consumes (ProfileAllowRule.Pattern;
+	// same shape as global/task rules). A rule written here is ENFORCED
+	// on the next decision (composition Order 7) — it is not inert. When
+	// either half is unknown we substitute "*" so the pattern stays
+	// well-formed (a missing resource → "*:verb"; a missing verb →
+	// "resource:*"); a fully-unknown prompt records a no-op note pattern
+	// that never matches (better than a malformed rule that silently
+	// never fires).
+	resource := strings.TrimSpace(p.Resource)
+	verb := strings.TrimSpace(p.Verb)
+	var pattern string
+	switch {
+	case resource != "" && verb != "":
+		pattern = resource + ":" + verb
+	case resource != "":
+		pattern = resource + ":*"
+	case verb != "":
+		pattern = "*:" + verb
+	default:
+		pattern = fmt.Sprintf("decision-%d:*", p.DecisionID)
 	}
 	newRule := profile.ProfileAllowRule{
 		Pattern: pattern,

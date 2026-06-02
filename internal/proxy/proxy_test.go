@@ -1003,3 +1003,58 @@ func TestProxy_AgentIdentity_AnonRequestLeavesColumnsEmpty(t *testing.T) {
 		"empty agent name MUST round-trip as empty (column underneath is NULL)")
 	assert.Empty(t, rows[0].AgentSessionID)
 }
+
+// TestEvaluateRequest_ProfileAllowRule_FlipsDefaultDenyToAllow is the
+// end-to-end proof for feat/profile-allow-enforcement: under
+// default-policy DENY (so an unmatched request would be denied), a
+// profile allow_rule matching the request flips the verdict to ALLOW
+// with DecisionSource=profile.allow. Before this slice the allow_rule
+// was inert and the request was denied by default policy.
+func TestEvaluateRequest_ProfileAllowRule_FlipsDefaultDenyToAllow(t *testing.T) {
+	st := freshStore(t)
+
+	// Named-object GET → parser verb "get" (collection GET is "list");
+	// the allow_rule matches the K8s-canonical verb the parser emits.
+	//
+	// Without the allow_rule: under default-DENY the empty profile
+	// abstains, no rules match → DENY by default policy.
+	empty := &profile.Profile{Name: "empty"}
+	req := parser.MustParseTestURL(http.MethodGet, "/api/v1/namespaces/default/configmaps/ci-config")
+	before := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyDeny, empty, "")
+	require.NotNil(t, before)
+	assert.Equal(t, VerdictDeny, before.DecisionVerdict,
+		"baseline: default-DENY denies an unmatched read")
+	assert.Equal(t, SourceDefault, before.DecisionSource)
+
+	// With an allow_rule for configmaps:get: ALLOW, sourced profile.allow.
+	allowing := &profile.Profile{
+		Name:       "ci-runner",
+		AllowRules: []profile.ProfileAllowRule{{Pattern: "configmaps:get"}},
+	}
+	after := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyDeny, allowing, "")
+	require.NotNil(t, after)
+	assert.Equal(t, VerdictAllow, after.DecisionVerdict,
+		"allow_rule must flip default-DENY → ALLOW")
+	assert.Equal(t, SourceProfileAllow, after.DecisionSource)
+	assert.False(t, after.Enforced, "an allow is never enforced as a block")
+}
+
+// TestEvaluateRequest_ProfileAllowRule_CannotOverrideSafeDefaultFloor is
+// the end-to-end safety proof: an allow_rule on a safe-default-floored
+// shape (delete) does NOT lift the floor — the profile deny short-
+// circuits before allow_rules are consulted.
+func TestEvaluateRequest_ProfileAllowRule_CannotOverrideSafeDefaultFloor(t *testing.T) {
+	st := freshStore(t)
+	profiles, err := profile.LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := profiles.Active(profile.SafeDefaultProfileName)
+	require.NoError(t, err)
+	sd.AllowRules = append(sd.AllowRules, profile.ProfileAllowRule{Pattern: "pods:delete"})
+
+	req := parser.MustParseTestURL(http.MethodDelete, "/api/v1/namespaces/default/pods/victim")
+	obs := EvaluateRequestWithProfile(req, st, ModeTransparent, DefaultPolicyAllow, sd, "")
+	require.NotNil(t, obs)
+	assert.Equal(t, VerdictDeny, obs.DecisionVerdict,
+		"safe-default delete floor MUST win over an allow_rule end-to-end")
+	assert.Equal(t, SourceProfile, obs.DecisionSource)
+}
