@@ -288,6 +288,13 @@ type Options struct {
 	Force  bool
 	Out    io.Writer
 	Stderr io.Writer
+
+	// DevinHost overrides the placeholder host:port in the
+	// install-devin recipe (kubectl server address + kubeconfig
+	// server field). Empty emits the <kbounce-host> placeholder +
+	// a substitute note. Unused by the JSON-merge installers.
+	// Mirrors gbounce + ibounce + dbounce per [[cross-product-agent-parity]].
+	DevinHost string
 }
 
 func (o *Options) defaults() {
@@ -376,7 +383,8 @@ const DefaultProxyPort = 8766
 // Cognition's sandboxed environment, not on the operator's laptop), so
 // kbounce surfaces the wiring clearly rather than silently degrading
 // (per [[ibounce-honest-positioning]]). Mirrors ibounce's
-// `ibounce mcp install-devin`.
+// `ibounce mcp install-devin` + gbounce's `gbounce mcp install-devin`
+// per [[cross-product-agent-parity]].
 //
 // The load-bearing difference from the loopback installers: a cloud
 // agent CANNOT reach a bouncer on 127.0.0.1. kbounce must be bound to a
@@ -384,10 +392,21 @@ const DefaultProxyPort = 8766
 // --i-know-this-binds-externally), and the kubeconfig / KUBECONFIG the
 // agent uses must point at that host:port — NOT loopback.
 //
+// DevinHost overrides the <kbounce-host> placeholder in the recipe so
+// an operator can bake in a concrete reachable address; --devin-host
+// is the corresponding CLI flag.
+//
 // Always returns Manual=true with the recipe captured in Snippet so a
 // caller / test can assert the host-address guidance is present.
 func InstallDevin(opts Options) (*InstallResult, error) {
 	opts.defaults()
+
+	kbounceHost := opts.DevinHost
+	noteSubstitute := false
+	if kbounceHost == "" {
+		kbounceHost = "<kbounce-host>"
+		noteSubstitute = true
+	}
 
 	// Build the MCP entry stamped with the "devin" agent attribution so
 	// the snippet matches the auto-install paths' shape.
@@ -425,7 +444,7 @@ func InstallDevin(opts Options) (*InstallResult, error) {
 	fmt.Fprintln(w, "PATH B: Transparent proxy at a HOST address (supported today)")
 	fmt.Fprintln(w, "  1. Generate TLS material whose server cert covers the host Devin")
 	fmt.Fprintln(w, "     reaches (add it as a SAN — loopback alone is not enough):")
-	fmt.Fprintln(w, "       kbounce init-tls --additional-san <kbounce-host>")
+	fmt.Fprintf(w, "       kbounce init-tls --additional-san %s\n", kbounceHost)
 	fmt.Fprintln(w, "  2. On that host, run kbounce bound off-loopback (loopback is")
 	fmt.Fprintln(w, "     invisible to the cloud sandbox) with TLS:")
 	fmt.Fprintf(w, "       kbounce run --host 0.0.0.0 --port %d --i-know-this-binds-externally \\\n", DefaultProxyPort)
@@ -434,12 +453,17 @@ func InstallDevin(opts Options) (*InstallResult, error) {
 	fmt.Fprintln(w, "         --audit-events-token <secret>   # required when binding off-loopback")
 	fmt.Fprintln(w, "  3. In Devin's task environment, point kubectl at the proxy host:port")
 	fmt.Fprintln(w, "     (NOT 127.0.0.1) and trust the generated CA:")
-	fmt.Fprintf(w, "       server: https://<kbounce-host>:%d\n", DefaultProxyPort)
+	fmt.Fprintf(w, "       server: https://%s:%d\n", kbounceHost, DefaultProxyPort)
 	fmt.Fprintln(w, "       certificate-authority: ~/.kbouncer/tls/ca.crt")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Limitation: Devin runs in Cognition's cloud sandbox; kbounce must be on")
 	fmt.Fprintln(w, "a host Devin can reach over the network. A kbounce on 127.0.0.1 is NOT")
 	fmt.Fprintln(w, "visible to Devin's sandbox.")
+	if noteSubstitute {
+		fmt.Fprintln(opts.Stderr,
+			"  [note] substitute <kbounce-host> above with the host Devin can "+
+				"reach (pass --devin-host HOST to bake it in).")
+	}
 	return res, nil
 }
 

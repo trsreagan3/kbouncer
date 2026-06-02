@@ -102,6 +102,29 @@ func TestMCP_InstallDevin_PrintsRecipeWithoutWriting(t *testing.T) {
 	// Snippet shape lines up with show-config (mcp serve).
 	assert.Contains(t, s, "mcp")
 	assert.Contains(t, s, "serve")
+	// Substitute note on stderr when no --devin-host supplied.
+	assert.Contains(t, stderr.String(), "--devin-host",
+		"stderr must hint at --devin-host when placeholder is used")
+}
+
+// TestMCP_InstallDevin_DevinHostFlag verifies --devin-host is wired at
+// the cobra level + bakes the concrete host into the recipe output.
+func TestMCP_InstallDevin_DevinHostFlag(t *testing.T) {
+	root := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"mcp", "install-devin", "--devin-host", "10.0.1.99"})
+	require.NoError(t, root.Execute())
+
+	s := stdout.String()
+	assert.Contains(t, s, "10.0.1.99",
+		"--devin-host value must appear in the recipe output")
+	assert.NotContains(t, s, "<kbounce-host>",
+		"placeholder must not appear when --devin-host is given")
+	// No substitute note on stderr when a concrete host is given.
+	assert.NotContains(t, stderr.String(), "--devin-host",
+		"no substitute note when a concrete host is given")
 }
 
 func TestMCP_ShowConfig_JSONShapeMatchesInstallSnippet(t *testing.T) {

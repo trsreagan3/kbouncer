@@ -144,7 +144,8 @@ func TestInstallCodex_TOMLSnippet_ContainsAgentEnv(t *testing.T) {
 // Mirrors ibounce's install-devin test.
 func TestInstallDevin_PrintsCloudRecipe_WritesNoFile(t *testing.T) {
 	out := &bytes.Buffer{}
-	res, err := InstallDevin(Options{Out: out})
+	errOut := &bytes.Buffer{}
+	res, err := InstallDevin(Options{Out: out, Stderr: errOut})
 	require.NoError(t, err)
 	require.True(t, res.Manual, "Devin install must be manual (no local config)")
 	require.Empty(t, res.Path, "Devin install must not resolve a local config path")
@@ -161,6 +162,30 @@ func TestInstallDevin_PrintsCloudRecipe_WritesNoFile(t *testing.T) {
 	assert.Contains(t, res.Snippet, AgentNameEnvVar)
 	assert.Contains(t, res.Snippet, "devin")
 	assert.Contains(t, res.Snippet, ServerCommand)
+	// Substitute note on stderr when no --devin-host supplied.
+	assert.Contains(t, errOut.String(), "--devin-host",
+		"stderr must hint at --devin-host when placeholder is used")
+}
+
+// TestInstallDevin_HonorsDevinHost — --devin-host bakes a concrete
+// reachable address into the recipe + suppresses the substitute note.
+// Mirrors gbounce's TestInstallDevin_HonorsDevinHost.
+func TestInstallDevin_HonorsDevinHost(t *testing.T) {
+	out := &bytes.Buffer{}
+	errOut := &bytes.Buffer{}
+	res, err := InstallDevin(Options{DevinHost: "10.0.0.5", Out: out, Stderr: errOut})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	body := out.String()
+	assert.Contains(t, body, "10.0.0.5",
+		"concrete host must appear in the kubectl server + kubeconfig lines")
+	assert.NotContains(t, body, "<kbounce-host>",
+		"placeholder must not appear when a concrete host is given")
+	assert.NotContains(t, errOut.String(), "--devin-host",
+		"no substitute note when a concrete host is given")
+	// MCP snippet still carries the "devin" agent attribution.
+	assert.Contains(t, res.Snippet, "devin")
 }
 
 // TestShowConfig_YAML_ContainsEnvBlock asserts the YAML branch of
