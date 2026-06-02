@@ -1230,6 +1230,13 @@ func emitAuditEvent(opts EvalOptions, agent audit.AgentInfo, obs *RequestObserva
 	}
 	ev := audit.FromDecision(in)
 	opts.AuditEmitter.Emit(context.Background(), ev)
+	// #718 ADOPT-4 — Phase H behavioral-deviation tap. Observes the
+	// decision into the per-agent baseline + scores it; an anomalous
+	// verdict surfaces a NEUTRAL anomaly_detected signal. Fail-soft +
+	// no-op when the detector is unwired. ALERT by default; never
+	// blocks the request per [[safety-mode-lean-permissive]].
+	action, resource := k8sAnomalySignals(in.ParsedVerb, in.ParsedNamespace, in.ParsedResource, in.Method)
+	observeAnomaly(action, resource, agent.Name, obs.DecisionVerdict)
 }
 
 // resolveAgentInfo derives the per-request AgentInfo from (in
@@ -2676,6 +2683,12 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		ChainInitialized bool             `json:"chain_initialized"`
 		AuditChain       map[string]any   `json:"audit_chain"`
 		LlmBudget        HealthzLlmBudget `json:"llm_budget"`
+		// #718 ADOPT-4 — Phase H behavioral-deviation / anomaly detector
+		// status. Always present (enabled:false when unwired) so the
+		// composite monitor key set stays stable per
+		// [[cross-product-agent-parity]]. Visibility surface only; ALERT
+		// by default, never an enforcement signal.
+		Anomaly map[string]any `json:"anomaly"`
 	}{
 		Status:                      "ok",
 		Mode:                        string(s.cfg.Mode),
@@ -2691,6 +2704,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyParseErrors: s.totalDynamicDenyParseErrors.Load(),
 		LlmBudget:                   HealthzLlmBudget{Enabled: false},
 		TotalProfileAllows:          s.totalProfileAllows.Load(),
+		Anomaly:                     anomalyHealthz(),
 	}
 	// ADOPT-10 / #734 — chain_initialized now reports whether the
 	// tamper-evident hash-chain is ACTUALLY stamping rows (honest
