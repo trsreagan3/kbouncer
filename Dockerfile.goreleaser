@@ -1,0 +1,20 @@
+# Dockerfile.goreleaser — minimal runtime image for goreleaser Docker builds.
+#
+# goreleaser builds the binary externally (cross-compiled for the target
+# platform) and then runs this Dockerfile with the binary already copied
+# into the build context. We use distroless/static (same base as the
+# multi-stage Dockerfile) so the runtime surface is identical.
+#
+# Unlike Dockerfile, this does NOT have a builder stage — goreleaser owns
+# the build step. Only the runtime stage lives here.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# OCI labels are injected via --label flags in .goreleaser.yaml build_flag_templates.
+COPY kbounce /usr/local/bin/kbounce
+
+EXPOSE 8766
+
+HEALTHCHECK NONE
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/kbounce"]
+CMD ["--help"]
