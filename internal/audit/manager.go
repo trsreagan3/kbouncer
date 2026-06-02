@@ -119,6 +119,20 @@ type Status struct {
 	AlertsFiredCount int64  `json:"alerts_fired_count"`
 	LastAlertPattern string `json:"last_alert_pattern,omitempty"`
 
+	// ADOPT-10 / #734 — tamper-evident hash-chain + signed-manifest
+	// state. ChainEnabled is true when the JSONL writer is stamping the
+	// forensic hash-chain; ChainHeadSeq / ChainHeadHash report the
+	// current chain head so a SOC analyst sees the real forensic posture
+	// from /healthz. Manifest* report the Ed25519 signed-checkpoint
+	// signer (ManifestPublicKeyB64 is the verifier's pinning key).
+	ChainEnabled          bool   `json:"chain_enabled"`
+	ChainHeadSeq          int64  `json:"chain_head_seq"`
+	ChainHeadHash         string `json:"chain_head_hash,omitempty"`
+	ManifestConfigured    bool   `json:"manifest_configured"`
+	ManifestsEmitted      int64  `json:"manifests_emitted"`
+	ManifestsFailed       int64  `json:"manifests_failed"`
+	ManifestPublicKeyB64  string `json:"manifest_public_key_b64,omitempty"`
+
 	// Heartbeat watchdog state (per [[prompt-injection-disable-bouncer
 	// -threat]] + [[audit-export-failure-visibility]]). HeartbeatEnabled
 	// reports whether a Heartbeater is wired with a non-zero interval
@@ -279,6 +293,24 @@ func (m *Manager) Status() Status {
 		s.LogConsecutiveFailures = m.log.ConsecutiveFailures()
 		if last := m.log.LastSuccess(); !last.IsZero() {
 			s.LogLastSuccessUnixMilli = last.UnixMilli()
+		}
+		// ADOPT-10 / #734 — honest chain + manifest state.
+		if m.log.ChainEnabled() {
+			s.ChainEnabled = true
+			s.ChainHeadSeq = m.log.ChainHeadSeq()
+			s.ChainHeadHash = m.log.ChainHeadHash()
+			if ms := m.log.ManifestStatus(); ms != nil {
+				s.ManifestConfigured = true
+				if v, ok := ms["manifests_emitted"].(int64); ok {
+					s.ManifestsEmitted = v
+				}
+				if v, ok := ms["manifests_failed"].(int64); ok {
+					s.ManifestsFailed = v
+				}
+				if v, ok := ms["public_key_b64"].(string); ok {
+					s.ManifestPublicKeyB64 = v
+				}
+			}
 		}
 	}
 	if m.webhook != nil {

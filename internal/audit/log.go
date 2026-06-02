@@ -65,6 +65,15 @@ type LogWriter struct {
 	onRotation         func(archive string)
 	onRotationFailure  func(reason string)
 	onRecovery         func(bytes int64)
+
+	// chain + signer are the ADOPT-10 / #734 tamper-evident audit
+	// primitives. When set, every event written to the JSONL is stamped
+	// with a forensic hash-chain block (chain) and a periodic
+	// Ed25519-signed manifest checkpoint is emitted (signer). Both are
+	// owned exclusively by the single writer goroutine so stamping is
+	// serialized without extra hot-path locking. nil = disabled.
+	chain  *ChainState
+	signer *ManifestSigner
 }
 
 // LogWriterOptions configures a LogWriter. Path must be non-empty
@@ -90,6 +99,15 @@ type LogWriterOptions struct {
 	OnRotation        func(archive string)
 	OnRotationFailure func(reason string)
 	OnRecovery        func(bytes int64)
+
+	// Chain, when non-nil, enables the ADOPT-10 / #734 tamper-evident
+	// hash-chain: every written event is stamped with a chain block and
+	// the on-disk JSONL becomes verifiable via VerifyChain. Construct
+	// via LoadChainState(logDir, 0). nil = disabled.
+	Chain *ChainState
+	// Signer, when non-nil, emits periodic Ed25519-signed manifest
+	// checkpoints anchoring the chain head. nil = no manifests.
+	Signer *ManifestSigner
 }
 
 // NewLogWriter constructs + starts a LogWriter. The worker goroutine
@@ -126,6 +144,8 @@ func NewLogWriter(ctx context.Context, opts LogWriterOptions) (*LogWriter, error
 		onRotation:        opts.OnRotation,
 		onRotationFailure: opts.OnRotationFailure,
 		onRecovery:        opts.OnRecovery,
+		chain:             opts.Chain,
+		signer:            opts.Signer,
 	}
 	lw.lastErr.Store("")
 	lw.lastRotationPath.Store("")
@@ -269,6 +289,49 @@ func (lw *LogWriter) drainRemaining(f *os.File, enc *json.Encoder) {
 // retry (the file path is local + retry on disk-full just delays
 // the inevitable).
 func (lw *LogWriter) writeOne(f *os.File, enc *json.Encoder, ev Event) {
+	if lw.chain != nil {
+		// ADOPT-10 / #734 — stamp the forensic hash-chain block + write
+		// the canonical (key-sorted, compact, ASCII-escaped) row the
+		// chain hash covers, so the JSONL is verifiable via VerifyChain.
+		raw, merr := json.Marshal(ev)
+		if merr != nil {
+			lw.lastErr.Store(fmt.Sprintf("marshal event id=%d: %v", ev.DecisionID, merr))
+			lw.writesOK.Store(false)
+			lw.consecFailures.Add(1)
+			return
+		}
+		stamped, serr := lw.chain.StampJSON(raw)
+		if serr != nil {
+			lw.lastErr.Store(fmt.Sprintf("chain-stamp event id=%d: %v", ev.DecisionID, serr))
+			lw.writesOK.Store(false)
+			lw.consecFailures.Add(1)
+			return
+		}
+		stamped = append(stamped, '\n')
+		if _, werr := f.Write(stamped); werr != nil {
+			lw.lastErr.Store(fmt.Sprintf("write event id=%d: %v", ev.DecisionID, werr))
+			lw.writesOK.Store(false)
+			lw.consecFailures.Add(1)
+			return
+		}
+		if lw.fsync {
+			if err := f.Sync(); err != nil {
+				lw.lastErr.Store(fmt.Sprintf("fsync: %v", err))
+				lw.writesOK.Store(false)
+				lw.consecFailures.Add(1)
+				return
+			}
+		}
+		lw.total.Add(1)
+		lw.lastErr.Store("")
+		lw.writesOK.Store(true)
+		lw.consecFailures.Store(0)
+		lw.lastSuccessUnixNano.Store(time.Now().UTC().UnixNano())
+		if lw.signer != nil && lw.signer.ShouldEmit(lw.chain) {
+			_, _ = lw.signer.Emit(lw.chain)
+		}
+		return
+	}
 	if err := enc.Encode(ev); err != nil {
 		lw.lastErr.Store(fmt.Sprintf("encode event id=%d: %v", ev.DecisionID, err))
 		lw.writesOK.Store(false)
@@ -304,7 +367,51 @@ func (lw *LogWriter) Close() {
 	lw.closeOnce.Do(func() {
 		close(lw.done)
 		lw.wg.Wait()
+		if lw.chain != nil {
+			_ = lw.chain.Save()
+		}
 	})
+}
+
+// ChainEnabled reports whether the tamper-evident hash-chain is wired.
+func (lw *LogWriter) ChainEnabled() bool {
+	return lw != nil && lw.chain != nil
+}
+
+// ChainHeadHash returns the current chain head hash (hex), or "".
+func (lw *LogWriter) ChainHeadHash() string {
+	if lw == nil || lw.chain == nil {
+		return ""
+	}
+	return lw.chain.HeadHash()
+}
+
+// ChainHeadSeq returns the seq of the last stamped event, or -1.
+func (lw *LogWriter) ChainHeadSeq() int64 {
+	if lw == nil || lw.chain == nil {
+		return -1
+	}
+	return lw.chain.HeadSeq()
+}
+
+// ManifestStatus returns a /healthz snapshot of the manifest signer, or
+// nil when no signer is configured.
+func (lw *LogWriter) ManifestStatus() map[string]any {
+	if lw == nil || lw.signer == nil {
+		return nil
+	}
+	var lastEmitted any
+	if lw.signer.LastEmittedSeq != nil {
+		lastEmitted = *lw.signer.LastEmittedSeq
+	}
+	return map[string]any{
+		"configured":        true,
+		"public_key_b64":    lw.signer.PublicKeyB64(),
+		"manifests_emitted": lw.signer.ManifestsEmitted,
+		"manifests_failed":  lw.signer.ManifestsFailed,
+		"last_emitted_seq":  lastEmitted,
+		"manifest_dir":      lw.signer.ManifestDir(),
+	}
 }
 
 // Total returns the cumulative count of events successfully written.
