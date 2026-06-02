@@ -776,6 +776,21 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 
 			s := proxy.NewServer(cfg, st)
 
+			// #718 ADOPT-4 — wire the Phase H behavioral-deviation /
+			// anomaly detector when the operator opted in via env
+			// (IAM_JIT_ANOMALY_DETECTION=1 / mode / sensitivity).
+			// Frictionless per [[lightweight-frictionless-principle]];
+			// DISABLED by default + ALERT (never block) when enabled per
+			// [[safety-mode-lean-permissive]].
+			if acfg, aerr := proxy.AnomalyConfigFromEnv(); aerr != nil {
+				return fmt.Errorf("anomaly_detection config: %w", aerr)
+			} else if acfg.Enabled {
+				proxy.SetAnomalyDetector(proxy.NewAnomalyDetector(acfg))
+				fmt.Fprintf(os.Stderr,
+					"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — surfaces a neutral signal for review, does not block by default\n",
+					acfg.Mode, acfg.Sensitivity)
+			}
+
 			// #324b — wire the watcher's emit callback now that the
 			// Server exists. Each reload bumps the matching counter +
 			// tees an OCSF admin-action event into the audit log so a
