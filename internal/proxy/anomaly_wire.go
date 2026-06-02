@@ -64,6 +64,14 @@ func loadAnomalyDetector() *anomaly.Detector {
 	return d
 }
 
+// anomalyDetectorWired reports whether an enabled detector is installed.
+// The live handler uses it to skip the per-request anomaly work entirely
+// when the channel is off (default), so a disabled bouncer pays nothing.
+func anomalyDetectorWired() bool {
+	d := loadAnomalyDetector()
+	return d != nil && d.Enabled()
+}
+
 // observeAnomaly observes one decision into the behavioral baseline +
 // scores it. Fail-soft + no-op when the detector is unwired/disabled.
 func observeAnomaly(action, resource, agentIdentity, floorVerdict string) {
@@ -175,4 +183,45 @@ func k8sAnomalySignals(verb, namespace, resource, method string) (string, string
 		res = namespace + "/" + resource
 	}
 	return action, res
+}
+
+// anomalyDenySource is the canonical DecisionSource stamped on an
+// observation when mode=block tightens an anomalous request (iam-jit#59).
+const anomalyDenySource = "anomaly_block"
+
+// decideAnomalyTighten is the PRE-DECISION enforcement check (iam-jit#59)
+// for kbouncer. It is consulted in the live handler ONLY on a non-deny
+// floor verdict, BEFORE the response is served. In mode=block an
+// anomalous verbal/resource/volume deviation TIGHTENS allow->deny: it
+// returns true, the high-severity OCSF event having already been emitted
+// by the core Decide via the bound emitter. The caller then mutates the
+// observation to a deny + enforces it.
+//
+// TIGHTEN-ONLY: the core Detector.Decide refuses to loosen a deny floor
+// and only mode=block (not detection-only) tightens. FAIL-SOFT: a
+// nil/disabled detector returns false; any non-block mode returns false.
+// The core never panics; a scoring hiccup degrades to the floor (allow),
+// so this can never spuriously deny or break the request path.
+func decideAnomalyTighten(verb, namespace, resource, method, agentIdentity string) (tightened bool) {
+	d := loadAnomalyDetector()
+	if d == nil || !d.Enabled() {
+		return false
+	}
+	// DEFENSIVE RECOVER: if the core scoring path panics, degrade to the
+	// FLOOR decision (allow stays allow). A panic must never crash the
+	// hot path or spuriously deny a K8s request. tightened is false by
+	// default; the named return ensures the caller sees "not tightened".
+	defer func() {
+		if recover() != nil {
+			tightened = false
+		}
+	}()
+	action, res := k8sAnomalySignals(verb, namespace, resource, method)
+	out := d.Decide(anomaly.DecideInput{
+		Action:        action,
+		AgentIdentity: agentIdentity,
+		Resource:      res,
+		FloorDecision: "allow", // only consulted on the non-deny branch
+	})
+	return out.Tightened && out.Decision == "deny"
 }

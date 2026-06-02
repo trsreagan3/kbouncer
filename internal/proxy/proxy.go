@@ -1230,13 +1230,6 @@ func emitAuditEvent(opts EvalOptions, agent audit.AgentInfo, obs *RequestObserva
 	}
 	ev := audit.FromDecision(in)
 	opts.AuditEmitter.Emit(context.Background(), ev)
-	// #718 ADOPT-4 — Phase H behavioral-deviation tap. Observes the
-	// decision into the per-agent baseline + scores it; an anomalous
-	// verdict surfaces a NEUTRAL anomaly_detected signal. Fail-soft +
-	// no-op when the detector is unwired. ALERT by default; never
-	// blocks the request per [[safety-mode-lean-permissive]].
-	action, resource := k8sAnomalySignals(in.ParsedVerb, in.ParsedNamespace, in.ParsedResource, in.Method)
-	observeAnomaly(action, resource, agent.Name, obs.DecisionVerdict)
 }
 
 // resolveAgentInfo derives the per-request AgentInfo from (in
@@ -2278,34 +2271,63 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if activeProfile != nil {
 		profileSource = activeProfile.Source
 	}
+	evalOpts := EvalOptions{
+		PromptOnDeny:              s.cfg.PromptOnDeny,
+		SyncPromptOnDeny:          syncPromptActive,
+		TaskOwner:                 s.cfg.TaskOwner,
+		StreamKind:                string(streamKind),
+		AuditEmitter:              s.cfg.AuditEmitter,
+		AuditHost:                 net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
+		AuditUpstream:             upstreamLabel,
+		AuditProfileSource:        profileSource,
+		AgentRegistry:             s.cfg.AgentRegistry,
+		BurstDetector:             s.burstDetector,
+		OnPauseLookup:             s.observePauseTransition,
+		RecordRejectedAgentHeader: s.recordRejectedAgentHeader,
+		// #324b — dynamic-deny snapshot for the evaluator. nil-safe;
+		// snapshot is read under the watcher's RWMutex so the hot
+		// path sees a coherent view even mid-reload.
+		DynamicDenies: s.DynamicDenySnapshot(),
+		OnDynamicDenyMatch: func(_ *dynamicdeny.Pattern) {
+			s.BumpDynamicDenyMatch()
+		},
+		OnProfileAllowMatch: func() {
+			s.totalProfileAllows.Add(1)
+		},
+	}
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
-		activeProfile, s.cfg.Cluster,
-		EvalOptions{
-			PromptOnDeny:              s.cfg.PromptOnDeny,
-			SyncPromptOnDeny:          syncPromptActive,
-			TaskOwner:                 s.cfg.TaskOwner,
-			StreamKind:                string(streamKind),
-			AuditEmitter:              s.cfg.AuditEmitter,
-			AuditHost:                 net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port)),
-			AuditUpstream:             upstreamLabel,
-			AuditProfileSource:        profileSource,
-			AgentRegistry:             s.cfg.AgentRegistry,
-			BurstDetector:             s.burstDetector,
-			OnPauseLookup:             s.observePauseTransition,
-			RecordRejectedAgentHeader: s.recordRejectedAgentHeader,
-			// #324b — dynamic-deny snapshot for the evaluator. nil-safe;
-			// snapshot is read under the watcher's RWMutex so the hot
-			// path sees a coherent view even mid-reload.
-			DynamicDenies: s.DynamicDenySnapshot(),
-			OnDynamicDenyMatch: func(_ *dynamicdeny.Pattern) {
-				s.BumpDynamicDenyMatch()
-			},
-			OnProfileAllowMatch: func() {
-				s.totalProfileAllows.Add(1)
-			},
-		},
+		activeProfile, s.cfg.Cluster, evalOpts,
 	)
+
+	// #59 — Phase H anomaly enforcement. Two steps share the live path:
+	//
+	//  1. PRE-DECISION SCORE (tighten-only): on a non-deny floor verdict,
+	//     score the request BEFORE serving so a block-mode anomaly can
+	//     actually DENY. On a tighten we mutate the observation to an
+	//     ENFORCED deny so the transparent-deny branch below serves the
+	//     K8s 403. A deterministic deny is never consulted (never
+	//     loosened). Fail-soft + no-op in alert / detection-only /
+	//     disabled.
+	//  2. POST-DECISION OBSERVE (learning): record the FINAL verdict into
+	//     the per-agent baseline + (in alert mode) emit the neutral alert.
+	//     Runs for every request — independent of the audit emitter — so
+	//     the baseline builds even with no SIEM export configured.
+	//
+	// agentForAnomaly mirrors the audit-path agent resolution so the
+	// observe + score use the same per-agent baseline key.
+	if anomalyDetectorWired() {
+		agentForAnomaly := resolveAgentInfo(evalOpts, r)
+		action, resource := k8sAnomalySignals(obs.ParsedVerb, obs.ParsedNamespace, obs.ParsedResource, obs.Method)
+		if obs.DecisionVerdict != VerdictDeny &&
+			decideAnomalyTighten(obs.ParsedVerb, obs.ParsedNamespace, obs.ParsedResource, obs.Method, agentForAnomaly.Name) {
+			obs.DecisionVerdict = VerdictDeny
+			obs.Enforced = true // mode=block is an explicit enforce opt-in
+			obs.DecisionSource = anomalyDenySource
+			obs.DecisionReason = "anomaly_detection mode=block flagged a behavioral deviation (signal for review, not proof of a problem)"
+		}
+		observeAnomaly(action, resource, agentForAnomaly.Name, obs.DecisionVerdict)
+	}
 
 	// Set the decision-source header BEFORE WriteHeader (Go HTTP
 	// requires headers go in before the first WriteHeader / Write).
