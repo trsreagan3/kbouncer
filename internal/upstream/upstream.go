@@ -53,6 +53,15 @@ import (
 var ErrNoUpstream = errors.New("kbounce: no upstream apiserver URL resolved " +
 	"(pass --upstream or set KUBECONFIG / ~/.kube/config)")
 
+// ErrCABundle wraps every failure that originates from an explicit
+// --upstream-ca-bundle / KBOUNCER_UPSTREAM_CA_BUNDLE (#379): a missing
+// or unreadable file, a file with no valid PEM certs, or a CA bundle
+// supplied for a plain-http upstream. The CLI uses errors.Is against
+// this sentinel to decide a CA-bundle problem must fail startup loudly
+// rather than be demoted to observation-only mode (which would silently
+// degrade upstream TLS verification).
+var ErrCABundle = errors.New("kbounce: invalid --upstream-ca-bundle")
+
 // Options carries the inputs Resolve consumes. Built from CLI flags so
 // the resolver can be tested without a real env / filesystem.
 type Options struct {
@@ -72,6 +81,20 @@ type Options struct {
 	// The flag must be explicit — never inferred from the apiserver URL
 	// scheme or the CA bundle's absence.
 	InsecureSkipTLSVerify bool
+
+	// UpstreamCABundlePath, when non-empty, points at a PEM file whose
+	// certificates verify the kube-apiserver's TLS cert (#379). This is
+	// for operators running a private / self-signed kube CA that isn't
+	// in the kubeconfig's certificate-authority-data — e.g. a custom
+	// --upstream URL fronted by an internal CA. When set, the certs in
+	// this file REPLACE the kubeconfig's CA pool (rather than augmenting
+	// system roots): an operator who explicitly pins a CA bundle wants
+	// THAT bundle to be the trust anchor. If the file is missing,
+	// unreadable, or contains no valid PEM certs, Resolve returns an
+	// error so kbouncer fails loudly at startup — it MUST NOT silently
+	// fall back to system roots (that would be a silent-degradation
+	// security regression). Has no effect on a plain-http upstream.
+	UpstreamCABundlePath string
 
 	// ForwardTimeout caps how long the proxy waits for an apiserver
 	// response. Watch / long-poll requests bypass this (K-Slice 5);
@@ -180,7 +203,7 @@ func Resolve(opts Options) (*Upstream, error) {
 		return nil, fmt.Errorf("kbounce: upstream URL scheme %q not supported (want http or https)", parsed.Scheme)
 	}
 
-	tlsCfg, err := buildTLSConfig(restCfg, opts.InsecureSkipTLSVerify, parsed)
+	tlsCfg, err := buildTLSConfig(restCfg, opts.InsecureSkipTLSVerify, opts.UpstreamCABundlePath, parsed)
 	if err != nil {
 		return nil, err
 	}
@@ -271,26 +294,42 @@ func loadKubeconfig(explicitPath string) (*rest.Config, string, error) {
 }
 
 // buildTLSConfig produces the outbound TLS config from the rest.Config
-// (if any) and the operator's --insecure-skip-tls-verify flag.
+// (if any), the operator's --insecure-skip-tls-verify flag, and an
+// optional explicit --upstream-ca-bundle PEM path (#379).
 //
 // Order of operations:
 //
-//  1. Start from system roots (safe default).
-//  2. If rest.Config has CAData / CAFile, parse and pool it.
+//  1. If the upstream is plain HTTP, there's no TLS to configure. An
+//     explicit --upstream-ca-bundle in this case is a misconfiguration
+//     (the operator asked for upstream verification but the upstream
+//     speaks cleartext) — we error rather than silently ignore it.
+//  2. ServerName defaults to the URL's host so SNI / cert-CN match.
 //  3. If --insecure-skip-tls-verify is set OR the kubeconfig requested
 //     it, flip InsecureSkipVerify on. Either path is operator-explicit.
-//  4. ServerName defaults to the URL's host so SNI / cert-CN match.
+//  4. RootCAs: if an explicit --upstream-ca-bundle was given, it is the
+//     trust anchor (it REPLACES the kubeconfig CA — an operator who
+//     pins a CA wants exactly that one). A missing / unreadable / no-
+//     valid-certs file is a HARD startup failure: we never fall back to
+//     system roots, because that silent degradation would mean
+//     verifying the apiserver against the wrong trust anchor. Otherwise
+//     fall back to the kubeconfig's CAData / CAFile as before.
 //
 // Returns nil tls.Config only when the upstream is plain HTTP — Go's
 // transport ignores tls.Config in that case anyway, but we keep it
 // explicit to avoid surprising tooling that inspects the field.
-func buildTLSConfig(restCfg *rest.Config, insecure bool, parsed *url.URL) (*tls.Config, error) {
+func buildTLSConfig(restCfg *rest.Config, insecure bool, caBundlePath string, parsed *url.URL) (*tls.Config, error) {
 	if strings.ToLower(parsed.Scheme) == "http" {
 		// Plain HTTP: no TLS config needed. The proxy will refuse to
 		// honor an http:// upstream in any environment where the kube-
 		// config's standard ssl-only path applies, so callers who hit
 		// this branch did so intentionally (e.g. local kind cluster
 		// with HTTP envoy in front).
+		if caBundlePath != "" {
+			return nil, fmt.Errorf("%w: %q was set but the upstream %q is "+
+				"plain HTTP — a CA bundle only verifies a TLS (https://) "+
+				"upstream. Remove the CA bundle or use an https:// upstream URL.",
+				ErrCABundle, caBundlePath, parsed.String())
+		}
 		return nil, nil
 	}
 
@@ -305,6 +344,25 @@ func buildTLSConfig(restCfg *rest.Config, insecure bool, parsed *url.URL) (*tls.
 	}
 	if insecure {
 		tlsCfg.InsecureSkipVerify = true
+	}
+
+	// #379 — explicit operator-supplied CA bundle wins over the
+	// kubeconfig CA. Fail loudly on any problem; NEVER fall back to
+	// system roots (silent degradation == verifying against the wrong
+	// anchor == a security regression).
+	if caBundlePath != "" {
+		caBytes, err := os.ReadFile(caBundlePath)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read %q: %w",
+				ErrCABundle, caBundlePath, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caBytes) {
+			return nil, fmt.Errorf("%w: %q contains no valid PEM certificates",
+				ErrCABundle, caBundlePath)
+		}
+		tlsCfg.RootCAs = pool
+		return tlsCfg, nil
 	}
 
 	// Load CA bundle. Prefer CAData (inline base64); fall back to CAFile.

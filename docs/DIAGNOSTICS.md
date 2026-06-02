@@ -90,7 +90,7 @@ inside).
 | `--out PATH`             | `./kbounce-diagnostics-{ISO8601-UTC}.zip`     | Override output path. Parent dirs created `0o700`; file `0o600`. |
 | `--include-audit-tail N` | `200`                                         | How many audit-log lines to include in `04-audit-tail.jsonl`.  |
 | `--no-audit`             | off                                           | Suppress the audit-tail section entirely.                      |
-| `--db PATH`              | `~/.kbouncer/state.db` (or `KBOUNCER_DB`)     | SQLite store path (read-only access).                          |
+| `--db PATH`              | `$KBOUNCER_DB` → `$XDG_STATE_HOME/kbounce/state.db` → `~/.kbouncer/state.db` → `/var/lib/kbounce/state.db` | SQLite store path (read-only access). |
 | `--profiles PATH`        | `~/.kbouncer/profiles.yaml`                   | Profiles YAML path.                                            |
 | `--healthz-url URL`      | `http://127.0.0.1:8766/healthz`               | Local `/healthz` to probe. Failure is recorded, not fatal.     |
 | `--insecure-skip-verify` | off                                           | Skip TLS verify on the `/healthz` GET (dev certs).             |

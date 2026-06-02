@@ -97,7 +97,47 @@ fresh source via `go install ...@latest` and get an up-to-date build
 every time. Closes #306 / #307 + KNOWN-CAVEATS §A8.
 
 Default port: `8766` (distinct from `bounce`'s `8767` so the two
-products can coexist on the same laptop). Default audit DB: `~/.kbouncer/state.db`.
+products can coexist on the same laptop).
+
+Default audit DB path resolves in this order (an explicit `--db PATH`
+overrides everything):
+
+1. `$KBOUNCER_DB`
+2. `$XDG_STATE_HOME/kbounce/state.db`
+3. `~/.kbouncer/state.db` (when `$HOME` is set — the historical default)
+4. `/var/lib/kbounce/state.db` (rootless containers with no `$HOME`)
+
+Parent directories are created `0700`.
+
+#### Verifying a private kube CA
+
+If your kube-apiserver uses a private / self-signed CA that isn't in
+your kubeconfig, point kbounce at the PEM bundle so it can verify the
+upstream TLS cert:
+
+```sh
+kbounce run --upstream https://apiserver.internal:6443 \
+  --upstream-ca-bundle /etc/kube/ca.pem
+# or, to keep the path out of `ps`:
+KBOUNCER_UPSTREAM_CA_BUNDLE=/etc/kube/ca.pem kbounce run --upstream https://apiserver.internal:6443
+```
+
+The flag wins over the env var. A missing / unreadable / non-PEM bundle
+is a hard startup failure — kbounce never silently falls back to system
+roots.
+
+#### Keeping the audit-events token out of `ps`
+
+When binding off-loopback you must set a bearer token for
+`GET /audit/events`. Prefer the env var so the secret never appears in
+process listings:
+
+```sh
+KBOUNCER_AUDIT_EVENTS_TOKEN=<secret> kbounce run --host 0.0.0.0 --i-know-this-binds-externally
+```
+
+`--audit-events-token` still works and wins over the env var when both
+are set.
 
 ### Docker
 

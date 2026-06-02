@@ -30,17 +30,17 @@ func TestRecordDecision_RoundTrip(t *testing.T) {
 	s := freshDB(t)
 	at := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	id, err := s.RecordDecision(DecisionRow{
-		At:               at,
-		Method:           "GET",
-		Path:             "/api/v1/namespaces/default/pods/my-pod",
-		ParsedVerb:       "get",
-		ParsedVersion:    "v1",
-		ParsedResource:   "pods",
-		ParsedNamespace:  "default",
-		ParsedName:       "my-pod",
-		DecisionVerdict:  "allow",
-		DecisionReason:   "default policy: allow",
-		ModeAtDecision:   "cooperative",
+		At:              at,
+		Method:          "GET",
+		Path:            "/api/v1/namespaces/default/pods/my-pod",
+		ParsedVerb:      "get",
+		ParsedVersion:   "v1",
+		ParsedResource:  "pods",
+		ParsedNamespace: "default",
+		ParsedName:      "my-pod",
+		DecisionVerdict: "allow",
+		DecisionReason:  "default policy: allow",
+		ModeAtDecision:  "cooperative",
 	})
 	require.NoError(t, err)
 	assert.Positive(t, id, "INSERT should return a positive row id")
@@ -69,19 +69,19 @@ func TestRecordDecision_PreservesNullables(t *testing.T) {
 	s := freshDB(t)
 	id := int64(42)
 	_, err := s.RecordDecision(DecisionRow{
-		Method:          "POST",
-		Path:            "/api/v1/namespaces/default/pods/p/exec",
-		ParsedVerb:      "exec",
-		ParsedResource:  "pods",
-		ParsedNamespace: "default",
-		ParsedName:      "p",
+		Method:            "POST",
+		Path:              "/api/v1/namespaces/default/pods/p/exec",
+		ParsedVerb:        "exec",
+		ParsedResource:    "pods",
+		ParsedNamespace:   "default",
+		ParsedName:        "p",
 		ParsedSubresource: "exec",
-		DecisionVerdict: "deny",
-		DecisionReason:  "test",
-		ModeAtDecision:  "transparent",
-		Enforced:        true,
-		MatchedRuleID:   &id,
-		TaskID:          "task-abc",
+		DecisionVerdict:   "deny",
+		DecisionReason:    "test",
+		ModeAtDecision:    "transparent",
+		Enforced:          true,
+		MatchedRuleID:     &id,
+		TaskID:            "task-abc",
 	})
 	require.NoError(t, err)
 }
@@ -91,6 +91,71 @@ func TestDefaultDBPath_HonorsEnvOverride(t *testing.T) {
 	p, err := DefaultDBPath()
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/kbouncer-override.db", p)
+}
+
+// TestDefaultDBPath_ResolutionOrder covers the #381 container-friendly
+// default-path resolution: KBOUNCER_DB > XDG_STATE_HOME > HOME >
+// /var/lib fallback. Each case sets/unsets the relevant env vars via
+// t.Setenv so the precedence is exercised in isolation.
+func TestDefaultDBPath_ResolutionOrder(t *testing.T) {
+	cases := []struct {
+		name       string
+		kbouncerDB string // "" => unset
+		xdgState   string // "" => unset
+		home       string // "" => unset
+		want       string
+		setHome    bool // distinguishes "set to empty" from "unset"
+		setXDG     bool
+		setKB      bool
+	}{
+		{
+			name:  "KBOUNCER_DB wins over everything",
+			setKB: true, kbouncerDB: "/custom/db.sqlite",
+			setXDG: true, xdgState: "/xdg/state",
+			setHome: true, home: "/home/alice",
+			want: "/custom/db.sqlite",
+		},
+		{
+			name:   "XDG_STATE_HOME used when KBOUNCER_DB unset (even with HOME set)",
+			setXDG: true, xdgState: "/xdg/state",
+			setHome: true, home: "/home/alice",
+			want: filepath.Join("/xdg/state", "kbounce", "state.db"),
+		},
+		{
+			name:    "HOME used when KBOUNCER_DB + XDG unset (historical default preserved)",
+			setHome: true, home: "/home/alice",
+			want: filepath.Join("/home/alice", ".kbouncer", "state.db"),
+		},
+		{
+			name: "var-lib fallback when nothing set (rootless container, no HOME)",
+			want: filepath.Join("/var", "lib", "kbounce", "state.db"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Always neutralize the three inputs first; t.Setenv restores
+			// after the subtest. Setting to "" then conditionally to the
+			// case value gives us "unset" semantics for the empty case
+			// (DefaultDBPath treats "" as unset for all three).
+			t.Setenv("KBOUNCER_DB", "")
+			t.Setenv("XDG_STATE_HOME", "")
+			t.Setenv("HOME", "")
+			if tc.setKB {
+				t.Setenv("KBOUNCER_DB", tc.kbouncerDB)
+			}
+			if tc.setXDG {
+				t.Setenv("XDG_STATE_HOME", tc.xdgState)
+			}
+			if tc.setHome {
+				t.Setenv("HOME", tc.home)
+			}
+
+			got, err := DefaultDBPath()
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }
 
 func TestRecentDecisions_EmptyDBReturnsEmpty(t *testing.T) {
@@ -135,7 +200,7 @@ func TestRecentDecisions_NewestFirstWithCapAndDefault(t *testing.T) {
 	// limit=99999 → clamped to 1000
 	rows, err = s.RecentDecisions(99999)
 	require.NoError(t, err)
-	require.Len(t, rows, 5)  // only 5 exist, but no error from clamp
+	require.Len(t, rows, 5) // only 5 exist, but no error from clamp
 }
 
 func TestRecentDecisions_PreservesProfileNameAndRuleID(t *testing.T) {
