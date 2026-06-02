@@ -202,11 +202,20 @@ const anomalyDenySource = "anomaly_block"
 // nil/disabled detector returns false; any non-block mode returns false.
 // The core never panics; a scoring hiccup degrades to the floor (allow),
 // so this can never spuriously deny or break the request path.
-func decideAnomalyTighten(verb, namespace, resource, method, agentIdentity string) bool {
+func decideAnomalyTighten(verb, namespace, resource, method, agentIdentity string) (tightened bool) {
 	d := loadAnomalyDetector()
 	if d == nil || !d.Enabled() {
 		return false
 	}
+	// DEFENSIVE RECOVER: if the core scoring path panics, degrade to the
+	// FLOOR decision (allow stays allow). A panic must never crash the
+	// hot path or spuriously deny a K8s request. tightened is false by
+	// default; the named return ensures the caller sees "not tightened".
+	defer func() {
+		if recover() != nil {
+			tightened = false
+		}
+	}()
 	action, res := k8sAnomalySignals(verb, namespace, resource, method)
 	out := d.Decide(anomaly.DecideInput{
 		Action:        action,

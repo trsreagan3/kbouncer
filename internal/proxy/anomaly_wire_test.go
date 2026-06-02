@@ -96,6 +96,36 @@ func TestObserveAnomalyEmitsThroughWire(t *testing.T) {
 	}
 }
 
+// TestDecideAnomalyTightenPanicDegradesToFloor verifies the defensive
+// recover in decideAnomalyTighten: a panicking emitter in the core Decide
+// path must not crash the hot path and must degrade to the FLOOR decision
+// (allow stays allow, i.e. returns false/"not tightened").
+//
+// Mechanism: install a block-mode detector with a panicking emitter, then
+// trigger the cold-start adversarial backstop via verb "delete" + resource
+// "production/pods". Decide flags it as anomalous, calls the emitter
+// (panic), and the defer/recover catches it — returning false (floor=allow).
+func TestDecideAnomalyTightenPanicDegradesToFloor(t *testing.T) {
+	cfg := anomaly.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Mode = "block"
+	cfg.MinActionsForBaseline = 50 // force cold-start so backstop can fire
+	panicEmitter := func(_ map[string]any) {
+		panic("simulated scorer panic for recover test")
+	}
+	anomaly.SetProduct("kbounce")
+	d := anomaly.NewDetector(cfg, panicEmitter, false)
+	SetAnomalyDetector(d)
+	t.Cleanup(func() { SetAnomalyDetector(nil) })
+
+	// "deletecluster" is in the adversarial backstop catalog; verb="delete"
+	// + resource with namespace exercises the backstop on cold-start.
+	got := decideAnomalyTighten("deletecluster", "production", "pods", "DELETE", "agent-test")
+	if got {
+		t.Fatalf("decideAnomalyTighten must return false (floor=allow) on a scorer panic, got true")
+	}
+}
+
 // TestObserveAnomalyNormalTrafficQuietThroughWire asserts the wire does
 // NOT cry wolf: a handful of calls below the baseline floor stay normal.
 func TestObserveAnomalyNormalTrafficQuietThroughWire(t *testing.T) {
