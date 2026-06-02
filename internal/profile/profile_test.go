@@ -819,3 +819,247 @@ func TestSafeDefault_SubresourceLongTail_ReadVerbsPass(t *testing.T) {
 	assert.False(t, v.Denied,
 		"GET on subresource is read-only; long-tail must not fire")
 }
+
+// ---------------------------------------------------------------------
+// Profile allow_rules enforcement (feat/profile-allow-enforcement).
+//
+// Before this slice, allow_rules were parsed + round-tripped but the
+// evaluator never consulted them — "allowing" traffic had zero runtime
+// effect, violating [[ibounce-honest-positioning]]. These tests pin the
+// dbounce-mirrored semantics: an allow_rule flips a would-be deferral
+// into an explicit ALLOW (composition Order 7) but CANNOT override a
+// safe-default hard-floor deny (those deny layers return first).
+// ---------------------------------------------------------------------
+
+// TestEvaluate_AllowRule_FlipsDeferToAllow proves an allow_rule produces
+// an explicit profile-level ALLOW (Allowed=true, source=profile.allow)
+// for a request no profile-deny caught. The Pattern uses the canonical
+// `resource:verb_glob` shape — identical to global/task rules.
+func TestEvaluate_AllowRule_FlipsDeferToAllow(t *testing.T) {
+	p := &Profile{
+		Name: "explicit-allow",
+		AllowRules: []ProfileAllowRule{
+			{Pattern: "configmaps:get"},
+		},
+	}
+	// Sanity: without the allow_rule this profile abstains (both false).
+	abstain := (&Profile{Name: "noop"}).Evaluate(&ParsedRequest{
+		Verb: "get", Resource: "configmaps", Namespace: "default",
+	})
+	assert.False(t, abstain.Denied)
+	assert.False(t, abstain.Allowed,
+		"a profile with no allow_rules must abstain, not allow")
+
+	// With the allow_rule: explicit ALLOW.
+	v := p.Evaluate(&ParsedRequest{
+		Verb: "get", Resource: "configmaps", Namespace: "default",
+	})
+	assert.True(t, v.Allowed, "allow_rule must flip defer→allow")
+	assert.False(t, v.Denied)
+	assert.Equal(t, SourceProfileAllow, v.Source)
+	assert.Equal(t, "explicit-allow", v.ProfileName)
+	assert.Contains(t, v.Reason, "configmaps:get")
+}
+
+// TestEvaluate_AllowRule_VerbGlobAndWildcards exercises the glob /
+// wildcard surface of the resource:verb_glob convention.
+func TestEvaluate_AllowRule_VerbGlobAndWildcards(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		req     ParsedRequest
+		allow   bool
+	}{
+		{"verb glob *", "configmaps:*", ParsedRequest{Verb: "list", Resource: "configmaps"}, true},
+		{"resource wildcard", "*:get", ParsedRequest{Verb: "get", Resource: "pods"}, true},
+		{"bare star", "*", ParsedRequest{Verb: "delete", Resource: "pods"}, true},
+		{"verb mismatch", "configmaps:get", ParsedRequest{Verb: "delete", Resource: "configmaps"}, false},
+		{"resource mismatch", "configmaps:get", ParsedRequest{Verb: "get", Resource: "secrets"}, false},
+		{"prefix glob verb", "pods:get*", ParsedRequest{Verb: "getlogs", Resource: "pods"}, true},
+		{"empty resource vs concrete rule", "pods:get", ParsedRequest{Verb: "get", Resource: ""}, false},
+		{"malformed pattern never allows", "pods", ParsedRequest{Verb: "get", Resource: "pods"}, false},
+		{"partial resource wildcard rejected", "pod*:get", ParsedRequest{Verb: "get", Resource: "pods"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Profile{Name: "p", AllowRules: []ProfileAllowRule{{Pattern: tc.pattern}}}
+			v := p.Evaluate(&tc.req)
+			assert.Equal(t, tc.allow, v.Allowed, "pattern %q vs %+v", tc.pattern, tc.req)
+			if tc.allow {
+				assert.Equal(t, SourceProfileAllow, v.Source)
+			}
+		})
+	}
+}
+
+// TestEvaluate_AllowRule_CannotOverrideSafeDefaultFloor is the
+// load-bearing safety test: an allow_rule that names exactly the
+// hard-floor-denied shape MUST NOT flip the deny to an allow. The deny
+// layer (deny_verbs / impersonation / etc.) short-circuits before
+// allow_rules are ever consulted. Mirrors dbounce's DCL-floor regression.
+func TestEvaluate_AllowRule_CannotOverrideSafeDefaultFloor(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+
+	// Inject an allow_rule that would, if consulted, bless `pods:delete`.
+	// safe-default denies the `delete` verb at Order 5 — which returns
+	// BEFORE Order 7 allow_rules. The allow_rule must therefore have NO
+	// effect on the floor.
+	sd.AllowRules = append(sd.AllowRules, ProfileAllowRule{Pattern: "pods:delete"})
+
+	v := sd.Evaluate(&ParsedRequest{
+		Verb: "delete", Method: "DELETE", Resource: "pods", ResourceName: "victim",
+	})
+	assert.True(t, v.Denied,
+		"safe-default deny_verbs floor MUST win over a profile allow_rule")
+	assert.False(t, v.Allowed)
+	assert.Equal(t, SourceProfile, v.Source)
+}
+
+// TestEvaluate_AllowRule_AllowsNonFlooredVerbUnderSafeDefault confirms
+// the allow_rule still does useful work under safe-default: a verb the
+// floor does NOT deny but that an operator wants explicitly blessed (so
+// it short-circuits before task/global rules) is allowed.
+func TestEvaluate_AllowRule_AllowsNonFlooredVerbUnderSafeDefault(t *testing.T) {
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+	// get is a read verb safe-default does not deny.
+	sd.AllowRules = append(sd.AllowRules, ProfileAllowRule{Pattern: "configmaps:get"})
+	v := sd.Evaluate(&ParsedRequest{Verb: "get", Resource: "configmaps", Namespace: "default"})
+	assert.True(t, v.Allowed)
+	assert.False(t, v.Denied)
+	assert.Equal(t, SourceProfileAllow, v.Source)
+}
+
+// TestEvaluate_AllowRule_KeywordDenyStillWins pins that a deny_keywords
+// match (Order 3) beats an allow_rule (Order 7) for the same request.
+func TestEvaluate_AllowRule_KeywordDenyStillWins(t *testing.T) {
+	p := &Profile{
+		Name:         "kw-vs-allow",
+		DenyKeywords: []string{"prod"},
+		AllowRules:   []ProfileAllowRule{{Pattern: "configmaps:get"}},
+	}
+	v := p.Evaluate(&ParsedRequest{
+		Verb: "get", Resource: "configmaps", Namespace: "prod-app",
+	})
+	assert.True(t, v.Denied, "deny_keywords must win over a later allow_rule")
+	assert.False(t, v.Allowed)
+	assert.Equal(t, SourceProfile, v.Source)
+}
+
+// TestEvaluate_AllowRule_ArnScopeEnforcedAsNamespace is the load-bearing
+// honesty test for the MED finding: a `--target`-scoped allow (stored in
+// ArnScope) must NOT leak to other namespaces. A `configmaps:get` allow
+// scoped to `namespaces/default` allows the GET in default but abstains
+// (does NOT allow) the same GET in kube-system.
+func TestEvaluate_AllowRule_ArnScopeEnforcedAsNamespace(t *testing.T) {
+	cases := []struct {
+		name      string
+		arnScope  string
+		reqNS     string
+		wantAllow bool
+	}{
+		{"in-scope namespace allowed", "namespaces/default", "default", true},
+		{"out-of-scope namespace not allowed", "namespaces/default", "kube-system", false},
+		{"resource-path form scopes namespace", "default/some-cm", "default", true},
+		{"resource-path form blocks other ns", "default/some-cm", "kube-system", false},
+		{"bare namespace token enforced", "default", "default", true},
+		{"bare namespace token blocks other ns", "default", "kube-system", false},
+		{"glob namespace scope matches", "namespaces/staging-*", "staging-a", true},
+		{"glob namespace scope blocks non-match", "namespaces/staging-*", "prod-a", false},
+		{"namespace-scoped does not match cluster-scoped req", "namespaces/default", "", false},
+		{"empty scope imposes no floor (advisory)", "", "kube-system", true},
+		{"star namespace half is advisory (no floor)", "namespaces/*", "kube-system", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Profile{
+				Name: "scoped-allow",
+				AllowRules: []ProfileAllowRule{
+					{Pattern: "configmaps:get", ArnScope: tc.arnScope},
+				},
+			}
+			v := p.Evaluate(&ParsedRequest{
+				Verb: "get", Resource: "configmaps", Namespace: tc.reqNS,
+			})
+			assert.Equal(t, tc.wantAllow, v.Allowed,
+				"scope %q vs request ns %q", tc.arnScope, tc.reqNS)
+			if tc.wantAllow {
+				assert.Equal(t, SourceProfileAllow, v.Source)
+			} else {
+				// Out-of-scope must NOT produce a profile-allow; the
+				// profile abstains (defers to later layers).
+				assert.False(t, v.Allowed)
+			}
+		})
+	}
+}
+
+// TestTargetEnforcedAsNamespace pins the CLI-facing predicate that drives
+// the advisory-only warning: namespace-shaped targets are enforced; bare
+// non-namespace/glob-only targets + "*" are advisory.
+func TestTargetEnforcedAsNamespace(t *testing.T) {
+	enforced := []string{
+		"namespaces/default", "default/cm", "default", "namespaces/staging-*",
+	}
+	for _, tgt := range enforced {
+		assert.True(t, TargetEnforcedAsNamespace(tgt), "expected %q enforced", tgt)
+	}
+	advisory := []string{"", "*", "namespaces/*"}
+	for _, tgt := range advisory {
+		assert.False(t, TargetEnforcedAsNamespace(tgt), "expected %q advisory", tgt)
+	}
+}
+
+// TestMatchAllowRule_Helper covers the exported MatchAllowRule helper's
+// nil / sentinel / empty guards + a positive match.
+func TestMatchAllowRule_Helper(t *testing.T) {
+	var nilP *Profile
+	ok, pat := nilP.MatchAllowRule(&ParsedRequest{Verb: "get", Resource: "pods"})
+	assert.False(t, ok)
+	assert.Empty(t, pat)
+
+	full := &Profile{Name: FullUserProfileName, AllowRules: []ProfileAllowRule{{Pattern: "*"}}}
+	ok, _ = full.MatchAllowRule(&ParsedRequest{Verb: "get", Resource: "pods"})
+	assert.False(t, ok, "full-user sentinel never matches")
+
+	p := &Profile{Name: "p", AllowRules: []ProfileAllowRule{{Pattern: "pods:get"}}}
+	ok, _ = p.MatchAllowRule(nil)
+	assert.False(t, ok, "nil request never matches")
+	ok, pat = p.MatchAllowRule(&ParsedRequest{Verb: "get", Resource: "pods"})
+	assert.True(t, ok)
+	assert.Equal(t, "pods:get", pat)
+}
+
+// TestAllowRule_RoundTrips confirms the AllowRules field still survives a
+// YAML round-trip (the original round-trip invariant) AND now drives
+// enforcement after re-load.
+func TestAllowRule_RoundTrips(t *testing.T) {
+	yamlIn := []byte(`profiles:
+  ci-runner:
+    description: "CI namespace bot"
+    deny_verbs: [delete]
+    allow_rules:
+      - pattern: "configmaps:get"
+        note: "CI reads its own config"
+`)
+	ps, err := parseProfiles(yamlIn, "")
+	require.NoError(t, err)
+	p, err := ps.Active("ci-runner")
+	require.NoError(t, err)
+	require.Len(t, p.AllowRules, 1)
+	assert.Equal(t, "configmaps:get", p.AllowRules[0].Pattern)
+	assert.Equal(t, "CI reads its own config", p.AllowRules[0].Note)
+
+	// Enforcement after load: allow_rule allows the get.
+	v := p.Evaluate(&ParsedRequest{Verb: "get", Resource: "configmaps"})
+	assert.True(t, v.Allowed)
+	// But the deny_verbs floor still wins for delete.
+	v = p.Evaluate(&ParsedRequest{Verb: "delete", Resource: "configmaps"})
+	assert.True(t, v.Denied)
+	assert.False(t, v.Allowed)
+}

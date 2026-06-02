@@ -122,10 +122,12 @@ type Options struct {
 
 	// Actions is the list of "verb:resource" strings to allow.
 	// For kbouncer the canonical shape mirrors ibounce's
-	// "service:Action" so the cross-product CLI is symmetric;
-	// the profile.ProfileAllowRule.Pattern field is opaque to
-	// the kbouncer evaluator (round-trip storage only in
-	// K-Slice 7) so the value lands verbatim.
+	// "service:Action" so the cross-product CLI is symmetric.
+	// Each action lands verbatim in a profile.ProfileAllowRule
+	// Pattern, which the kbouncer evaluator now consumes
+	// (Profile.Evaluate + matchAnyAllowRule); the rule's ArnScope
+	// (from Target) is enforced as a namespace floor when it names
+	// a namespace.
 	Actions []string
 
 	// Reason is the operator/agent-supplied explanation;

@@ -1976,6 +1976,13 @@ Refuses --target '*' (force operator specificity) + actions without a
 ':' separator. Refuses to mutate org-distributed profiles
 (operators create a local override profile to layer on top).
 
+--target is ENFORCED as a namespace floor when it names a K8s namespace
+('namespaces/<ns>', '<ns>/<name>', a bare '<ns>', or a glob like
+'staging-*') — a namespace-scoped allow does NOT leak to other
+namespaces. Any other target (or 'namespaces/*') is advisory-only
+metadata and the command WARNS you so the scope is never silently
+ignored.
+
 The provenance note format is:
   [easy_allow] <reason> -- by=<actor> via=cli [duration=... | expires=...]
 
@@ -1994,6 +2001,20 @@ Mirrors the iam-jit Python CLI surface 1:1 per
 			})
 			if err != nil {
 				return err
+			}
+			// Honest scope feedback: the evaluator ENFORCES --target as a
+			// namespace floor only when it cleanly names a namespace
+			// (e.g. 'namespaces/staging', 'default/foo', or a glob like
+			// 'staging-*'). Any other target is advisory-only metadata —
+			// warn so the operator doesn't believe a non-namespace target
+			// narrows the allow when it doesn't.
+			if !profile.TargetEnforcedAsNamespace(target) {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"⚠ --target %q is advisory-only: it does not name a K8s "+
+						"namespace, so the evaluator will NOT scope this allow "+
+						"to it. Scoping comes from the action's resource half + "+
+						"a namespace-shaped target (e.g. 'namespaces/<ns>').\n",
+					target)
 			}
 			if jsonOut {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(res)
@@ -2016,7 +2037,8 @@ Mirrors the iam-jit Python CLI surface 1:1 per
 		},
 	}
 	cmd.Flags().StringVar(&target, "target", "",
-		"Target pattern to allow (e.g. 'namespaces/staging'). '*' is refused.")
+		"Target to allow (e.g. 'namespaces/staging'); enforced as a namespace "+
+			"floor when namespace-shaped, else advisory (warns). '*' is refused.")
 	cmd.Flags().StringSliceVar(&actions, "action", nil,
 		"One or more 'verb:resource' strings (repeat to pass multiple).")
 	cmd.Flags().StringVar(&reason, "reason", "",

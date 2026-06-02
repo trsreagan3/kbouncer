@@ -896,6 +896,13 @@ func (s *Server) toolDecide(args map[string]any) (map[string]any, error) {
 				"reason":          pv.Reason,
 			}, nil
 		}
+		if pv.Allowed {
+			return map[string]any{
+				"verdict":         "allow",
+				"decision_source": profile.SourceProfileAllow,
+				"reason":          pv.Reason,
+			}, nil
+		}
 	}
 	if s.cfg.Store == nil {
 		// No store → can't consult rules. Return default policy as the

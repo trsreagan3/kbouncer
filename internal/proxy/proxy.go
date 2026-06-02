@@ -439,6 +439,11 @@ const (
 	// verdict. Profile denies are a hard floor: a permissive task scope
 	// cannot override them.
 	SourceProfile = "profile"
+	// SourceProfileAllow means a profile allow_rule (composition Order 7)
+	// explicitly allowed the request. Mirrors profile.SourceProfileAllow;
+	// fires only after every profile deny layer + the dynamic-deny floor
+	// abstained, and short-circuits before task + global rules.
+	SourceProfileAllow = "profile.allow"
 	// SourceTask means the active per-task scope (K-Slice 3) fired.
 	SourceTask = "task"
 	// SourceGlobal means a global rule (K-Slice 3) fired.
@@ -613,6 +618,13 @@ type EvalOptions struct {
 	// nil = silent (the verdict still applies + the audit event still
 	// carries the deny_source / dynamic_deny_rule_id fields).
 	OnDynamicDenyMatch func(rule *dynamicdeny.Pattern)
+
+	// OnProfileAllowMatch, when non-nil, is invoked exactly once per
+	// profile allow_rule match (composition Order 7 ALLOW) so the Server
+	// can bump the total_profile_allows /healthz counter without the
+	// evaluator owning the counter wiring. nil = silent (the ALLOW
+	// verdict still applies). Mirrors OnDynamicDenyMatch.
+	OnProfileAllowMatch func()
 }
 
 // SessionHeaderName is the inbound HTTP header an MCP-aware client can
@@ -770,7 +782,11 @@ func EvaluateRequestFull(
 	// Composition order step 1: profile rules. Profile denies are a hard
 	// floor — a permissive task scope or global rule cannot override
 	// them. Short-circuit on a profile deny so the audit row + response
-	// header surface SourceProfile.
+	// header surface SourceProfile. A profile allow_rule match is recorded
+	// in profileAllow and applied after the dynamic-deny floor (deny
+	// always wins over a profile-allow).
+	var profileAllow bool
+	var profileAllowReason string
 	if activeProfile != nil {
 		pv := activeProfile.Evaluate(&profile.ParsedRequest{
 			Verb:             parsed.Verb,
@@ -795,6 +811,13 @@ func EvaluateRequestFull(
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
+		// Profile allow_rule match (composition Order 7) is recorded here
+		// but NOT short-circuited yet: the dynamic-deny layer below is a
+		// "deny always wins over allow" floor (see its comment) so a
+		// dynamic-deny must beat a profile-allow. We therefore defer the
+		// profile-allow short-circuit until AFTER the dynamic-deny check.
+		profileAllow = pv.Allowed
+		profileAllowReason = pv.Reason
 	}
 
 	// #301: meta / discovery short-circuit. kubectl + client-go bootstrap
@@ -862,6 +885,28 @@ func EvaluateRequestFull(
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 			return obs
 		}
+	}
+
+	// Composition order step 1.6: profile allow_rule match. Deferred from
+	// the profile-rules block so the dynamic-deny floor above ("deny always
+	// wins over allow") gets first refusal. An allow_rule could not have
+	// co-occurred with a profile DENY (the evaluator only consults
+	// allow_rules after every profile deny layer abstains), so reaching
+	// here with profileAllow=true means the operator explicitly blessed
+	// this request shape. Short-circuit to ALLOW before task + global
+	// rules, mirroring dbounce's Order-4 allow layer.
+	if profileAllow {
+		if opts.OnProfileAllowMatch != nil {
+			opts.OnProfileAllowMatch()
+		}
+		obs.DecisionVerdict = VerdictAllow
+		obs.DecisionReason = profileAllowReason
+		obs.DecisionSource = SourceProfileAllow
+		obs.Enforced = false
+		decisionID := writeDecision(st, obs, activePause, agentInfo)
+		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
+		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
+		return obs
 	}
 
 	// K-Slice 3: build the request view the rule + task engines consume.
@@ -1616,6 +1661,12 @@ type Server struct {
 	// reaching into the watcher's private fields.
 	totalDynamicDenyReloads     atomic.Int64
 	totalDynamicDenyParseErrors atomic.Int64
+
+	// totalProfileAllows counts profile allow_rule matches (composition
+	// Order 7 ALLOWs, source=profile.allow) across the proxy's lifetime.
+	// Surfaced via /healthz as total_profile_allows for parity with
+	// gbounce's total_mitm_allows counter.
+	totalProfileAllows atomic.Int64
 }
 
 // recordRejectedAgentHeader bumps the per-Server rejection counter +
@@ -2243,6 +2294,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			OnDynamicDenyMatch: func(_ *dynamicdeny.Pattern) {
 				s.BumpDynamicDenyMatch()
 			},
+			OnProfileAllowMatch: func() {
+				s.totalProfileAllows.Add(1)
+			},
 		},
 	)
 
@@ -2596,6 +2650,8 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Mode                        string                       `json:"mode"`
 		DefaultPolicy               string                       `json:"default_policy"`
 		ActiveProfile               string                       `json:"active_profile"`
+		AllowRulesInActiveProfile   int                          `json:"allow_rules_in_active_profile"`
+		TotalProfileAllows          int64                        `json:"total_profile_allows"`
 		DecisionsCount              int64                        `json:"decisions_count"`
 		LookupErrorsCounter         int64                        `json:"lookup_errors_counter"`
 		AuditExportHealthy          bool                         `json:"audit_export_healthy"`
@@ -2634,9 +2690,11 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyParseErrors: s.totalDynamicDenyParseErrors.Load(),
 		ChainInitialized:            s.cfg.AuditEmitter != nil,
 		LlmBudget:                   HealthzLlmBudget{Enabled: false},
+		TotalProfileAllows:          s.totalProfileAllows.Load(),
 	}
 	if ap := s.ActiveProfile(); ap != nil {
 		payload.ActiveProfile = ap.Name
+		payload.AllowRulesInActiveProfile = len(ap.AllowRules)
 	}
 	if s.store != nil {
 		if n, err := s.store.CountDecisions(); err == nil {

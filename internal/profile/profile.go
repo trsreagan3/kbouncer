@@ -21,13 +21,25 @@
 //  4. Profile only_clusters mismatch                       → DENY (source=profile)
 //  5. Profile deny_verbs match (less exempt_resources)     → DENY (source=profile)
 //  6. Profile deny_subresource_writes long-tail net        → DENY (source=profile)
-//  7. Active task-scope deny                               → DENY (source=task)
-//  8. Active task-scope allow                              → ALLOW (source=task)
-//  9. Global rules                                         → standard match flow
+//  7. Profile allow_rules match                            → ALLOW (source=profile.allow)
+//  8. Active task-scope deny                               → DENY (source=task)
+//  9. Active task-scope allow                              → ALLOW (source=task)
+// 10. Global rules                                         → standard match flow
 //
 // Profile rules fire BEFORE task / global rules. A permissive task scope
 // CANNOT override a profile deny. See [[safety-mode-two-modes]] and
 // [[safety-mode-lean-permissive]] in the product memory.
+//
+// allow_rules (Order 7) are a profile-level ALLOW layer that fires only
+// AFTER every profile deny layer (Orders 2-6) has abstained. An
+// allow_rule therefore CANNOT override a safe-default hard-floor deny —
+// the deny short-circuits before allow_rules are consulted, mirroring
+// dbounce's Order 4 allow layer (see dbounce internal/profile.Evaluate).
+// What an allow_rule DOES do: flip a request that no profile-deny caught
+// from "defer to task/global rules" to an explicit profile-level ALLOW,
+// short-circuiting before task + global evaluation. See
+// [[ibounce-honest-positioning]] — "allowing" traffic must have runtime
+// effect, not just round-trip through YAML.
 //
 // Embedded default profiles (only two, intentionally):
 //
@@ -189,27 +201,56 @@ type ParsedRequest struct {
 }
 
 // ProfileAllowRule is one allow rule embedded in a profile. Profile-
-// scoped allow rules are merged into the rule engine ALONGSIDE global
-// rules when the profile is active; they do NOT short-circuit profile
-// deny layers above. Shape mirrors the iam-jit-bouncer Python
-// ProfileAllowRule so YAML profiles round-trip across both products.
+// scoped allow rules are an ALLOW layer that fires AFTER every profile
+// deny layer abstains and BEFORE task / global rules (composition Order
+// 7). They do NOT short-circuit the profile deny layers above — a
+// safe-default hard-floor deny still wins because it returns first. This
+// matches dbounce's Profile.Evaluate Order-4 allow layer. Shape mirrors
+// the iam-jit-bouncer Python ProfileAllowRule so YAML profiles round-trip
+// across all products.
 //
-// kbouncer does not yet consume AllowRules in the evaluator (K-Slice 7
-// is deny-only); the field is parsed + serialized so YAML written by
-// the Python bouncer (or a future kbouncer slice) survives the round
-// trip. Adding the field now keeps the on-disk shape stable.
+// The kbouncer evaluator consumes Pattern directly (see Profile.Evaluate
+// + allowRuleMatches). It ALSO enforces ArnScope as a namespace floor when
+// the scope cleanly names a K8s namespace (see allowRuleNamespaceScope) so
+// a namespace-scoped allow does NOT leak to other namespaces — parity with
+// gbounce's enforced --target host scope. RegionScope stays an AWS-shaped
+// round-trip field the K8s evaluator ignores.
 type ProfileAllowRule struct {
-	// Pattern is the verb/resource pattern (kbouncer convention TBD;
-	// kept opaque for now so symmetric YAML loads cleanly).
+	// Pattern is a `resource:verb_glob` pattern — the SAME shape
+	// kbouncer's global + task rules use (see rules.ParsePattern), so an
+	// operator who already wrote a global rule writes an allow_rule
+	// identically. Examples:
+	//
+	//   "pods:get"        — allow GET on pods (any namespace/name)
+	//   "configmaps:*"    — allow any verb on configmaps
+	//   "*:get"           — allow GET on any resource
+	//   "*"               — allow anything (normalizes to "*:*")
+	//
+	// Matching: the resource half is compared case-insensitively against
+	// the request's plural resource (or "*" for any); the verb half is an
+	// AWS-IAM-style glob (`*` and `?` are the only metacharacters) matched
+	// against the request's K8s-canonical verb (which is the subresource
+	// name for subresource calls, mirroring how rules.ProxyRule.Matches
+	// treats verbs). A non-wildcard resource never matches a request whose
+	// resource is empty. This convention was chosen over a free-form
+	// verb/namespace tuple specifically so allow_rules stay symmetric with
+	// the global rule engine and with dbounce's `statement_type:table_glob`
+	// allow_rule shape — one mental model across the suite.
 	Pattern string `yaml:"pattern"`
 
 	// ArnScope (Python-side) / cluster or namespace scope (K8s-side).
-	// Kept named after the AWS shape so profile YAML round-trips; a
-	// future K-Slice may rename for K8s semantics with a YAML alias.
+	// Kept named after the AWS shape so profile YAML round-trips. On the
+	// K8s side the evaluator ENFORCES it as a namespace floor when it
+	// cleanly names a namespace (e.g. "namespaces/default", "default/foo",
+	// or a glob like "staging-*"); see allowRuleNamespaceScope +
+	// allowRuleScopeMatches. A scope that can't be mapped to a namespace
+	// (or "*") is advisory-only and imposes no constraint — the CLI warns
+	// at add-time. A future K-Slice may add a K8s-native scope field with
+	// a YAML alias.
 	ArnScope string `yaml:"arn_scope,omitempty"`
 
 	// RegionScope is the AWS-side region scope; harmless on the K8s
-	// side, preserved for round-trip.
+	// side, preserved for round-trip. Ignored by the K8s evaluator.
 	RegionScope string `yaml:"region_scope,omitempty"`
 
 	// Note is an operator-readable description of why this rule exists.
@@ -287,9 +328,14 @@ type Profile struct {
 	// deny is suppressed (only_clusters / deny_verbs are NOT suppressed).
 	Exceptions []string `yaml:"exceptions,omitempty"`
 
-	// AllowRules are profile-scoped allow rules. Parsed + serialized for
-	// round-trip with the Python bouncer's profile shape. Not yet
-	// consumed by the kbouncer evaluator (K-Slice 7 is deny-only).
+	// AllowRules are profile-scoped allow rules. The kbouncer evaluator
+	// consumes them as an ALLOW layer that fires AFTER the profile deny
+	// layers abstain (composition Order 7) and BEFORE task / global rules.
+	// A matched allow_rule short-circuits to an explicit ALLOW with
+	// source=profile.allow; it CANNOT override a safe-default hard-floor
+	// deny because those denies return first. Mirrors dbounce's Order-4
+	// allow layer + the Python bouncer's profile shape (YAML round-trips
+	// across all products).
 	AllowRules []ProfileAllowRule `yaml:"allow_rules,omitempty"`
 
 	// Source records provenance. Empty or "local" → user-edited.
@@ -438,19 +484,28 @@ type Profiles struct {
 
 // Verdict is what Evaluate returns. When Denied is true, the proxy
 // short-circuits to a 403 with Source / Reason carried into the audit log.
+// When Allowed is true, the proxy short-circuits to an ALLOW (a profile
+// allow_rule matched). When both are false, the profile abstains and the
+// caller falls through to task / global rules.
 type Verdict struct {
-	// Denied is true when the profile blocks the request. False does
-	// NOT mean "allow" — it means "profile abstains; defer to the rest
-	// of the rule engine".
+	// Denied is true when the profile blocks the request. Mutually
+	// exclusive with Allowed. Denied=false && Allowed=false means the
+	// profile abstains; defer to the rest of the rule engine.
 	Denied bool
+
+	// Allowed is true when a profile allow_rule explicitly allows the
+	// request (composition Order 7). Mutually exclusive with Denied —
+	// allow_rules are consulted only AFTER every profile deny layer has
+	// abstained, so an allow_rule can never co-occur with a profile deny.
+	Allowed bool
 
 	// Reason is a one-line audit-log-ready description, e.g.
 	// "profile staging-work: namespace 'prod-app' matched keyword 'prod'".
 	Reason string
 
-	// Source is the rule layer that produced the verdict. Always "profile"
-	// when this package returns Denied=true. Kept on the verdict so the
-	// proxy's decision_source column stays self-describing.
+	// Source is the rule layer that produced the verdict: "profile" for a
+	// deny, "profile.allow" for an allow_rule allow. Kept on the verdict
+	// so the proxy's decision_source column stays self-describing.
 	Source string
 
 	// ProfileName is the name of the profile that fired, useful for
@@ -462,6 +517,12 @@ type Verdict struct {
 // profile deny fires. Exported so the proxy package can compare without
 // repeating the string literal.
 const SourceProfile = "profile"
+
+// SourceProfileAllow is the decision_source value the proxy records when
+// a profile allow_rule fires (composition Order 7). Mirrors dbounce's
+// constant of the same name so the audit-log decision_source vocabulary
+// is identical across the suite.
+const SourceProfileAllow = "profile.allow"
 
 // FullUserProfileName is the reserved profile name that disables profile
 // rules entirely. Always present in Profiles.All. Renamed from "none"
@@ -778,8 +839,213 @@ func (p *Profile) Evaluate(req *ParsedRequest) Verdict {
 		}
 	}
 
+	// Order 7: profile-scoped allow_rules. Reached only when every profile
+	// deny layer above abstained, so an allow_rule can NEVER override a
+	// safe-default hard-floor deny (the deny short-circuited already). A
+	// match flips a would-be deferral into an explicit profile-level ALLOW
+	// that short-circuits before task + global rules. Mirrors dbounce's
+	// Order-4 allow layer. Per [[ibounce-honest-positioning]]: "allowing"
+	// traffic now has real runtime effect.
+	if len(p.AllowRules) > 0 {
+		if matched, pattern := matchAnyAllowRule(p.AllowRules, req); matched {
+			return Verdict{
+				Allowed:     true,
+				Reason:      fmt.Sprintf("profile %q: allow_rule pattern %q matched", p.Name, pattern),
+				Source:      SourceProfileAllow,
+				ProfileName: p.Name,
+			}
+		}
+	}
+
 	// No profile rule fired; defer to the next layer.
 	return Verdict{}
+}
+
+// MatchAllowRule reports whether any of the profile's allow_rules matches
+// the given parsed request. Exposed so external decision helpers can
+// consult the profile's allow-rule layer WITHOUT re-running the deny half
+// of the profile (which Profile.Evaluate owns). Nil receiver, the
+// full-user sentinel, a nil request, or zero allow_rules returns
+// matched=false + empty pattern. Pure + concurrency-safe. Mirrors
+// dbounce's Profile.MatchAllowRule.
+func (p *Profile) MatchAllowRule(req *ParsedRequest) (bool, string) {
+	if p == nil || p.Name == FullUserProfileName || req == nil {
+		return false, ""
+	}
+	if len(p.AllowRules) == 0 {
+		return false, ""
+	}
+	return matchAnyAllowRule(p.AllowRules, req)
+}
+
+// matchAnyAllowRule returns the first profile-scoped allow rule that
+// matches the parsed request (matched=true + its Pattern). Empty /
+// whitespace-only patterns are skipped. Mirrors dbounce's matcher of the
+// same name.
+//
+// In addition to the Pattern's resource:verb match, the rule's ArnScope
+// is ENFORCED as a namespace floor when it cleanly names a K8s namespace
+// (see allowRuleNamespaceScope) — a namespace-scoped allow does NOT leak
+// to other namespaces. This keeps `profile allow --target` honest +
+// parity with gbounce, which enforces its `--target` host scope.
+func matchAnyAllowRule(allowRules []ProfileAllowRule, req *ParsedRequest) (bool, string) {
+	for _, ar := range allowRules {
+		pattern := strings.TrimSpace(ar.Pattern)
+		if pattern == "" {
+			continue
+		}
+		if !allowRuleScopeMatches(ar.ArnScope, req) {
+			continue
+		}
+		if allowRuleMatches(pattern, req) {
+			return true, pattern
+		}
+	}
+	return false, ""
+}
+
+// TargetEnforcedAsNamespace reports whether a `profile allow --target`
+// value will be ENFORCED as a namespace scope by the evaluator (true) or
+// is advisory-only metadata (false). The CLI consults this at add-time so
+// it can WARN the operator when a target won't be enforced. Exported so
+// the cmd + mcp layers don't re-derive the mapping rule.
+func TargetEnforcedAsNamespace(target string) bool {
+	_, ok := allowRuleNamespaceScope(target)
+	return ok
+}
+
+// allowRuleScopeMatches enforces a ProfileAllowRule's ArnScope (set from
+// `profile allow --target`) against the request's namespace. When the
+// scope cleanly names a namespace (see allowRuleNamespaceScope) the rule
+// only matches requests in that namespace (the scope may be a glob, e.g.
+// "staging-*"). When the scope is empty or cannot be mapped to a K8s
+// namespace it is advisory-only — the CLI warns about this at add-time —
+// and imposes no constraint here.
+func allowRuleScopeMatches(arnScope string, req *ParsedRequest) bool {
+	ns, ok := allowRuleNamespaceScope(arnScope)
+	if !ok {
+		// Scope is empty or not namespace-shaped → advisory, no floor.
+		return true
+	}
+	// A namespace-scoped allow must NOT match cluster-scoped requests
+	// (empty namespace) — fail closed.
+	if req.Namespace == "" {
+		return false
+	}
+	return globMatch(strings.ToLower(req.Namespace), strings.ToLower(ns))
+}
+
+// allowRuleNamespaceScope extracts the namespace component from a
+// `--target` value, returning ok=false when the target cannot be cleanly
+// mapped to a single K8s namespace (in which case the target is advisory
+// metadata only). Recognized shapes:
+//
+//	"namespaces/<ns>"   → "<ns>"   (the canonical denies-suggested form)
+//	"<ns>/<name...>"    → "<ns>"   (resource path form; first segment)
+//	"<ns>"              → "<ns>"   (bare namespace token, no slash)
+//
+// The namespace token may itself be a glob (e.g. "staging-*"); the caller
+// glob-matches it. A target whose namespace half is "*" (any namespace)
+// returns ok=false so it imposes no floor — that is what the operator
+// asked for and matches the "advisory / no constraint" path.
+func allowRuleNamespaceScope(target string) (string, bool) {
+	t := strings.TrimSpace(target)
+	if t == "" {
+		return "", false
+	}
+	var ns string
+	if rest, ok := strings.CutPrefix(t, "namespaces/"); ok {
+		ns = rest
+	} else {
+		ns = t
+	}
+	// Take the first path segment as the namespace; later segments name
+	// the object within the namespace and don't change the ns floor.
+	if i := strings.IndexByte(ns, '/'); i >= 0 {
+		ns = ns[:i]
+	}
+	ns = strings.TrimSpace(ns)
+	if ns == "" || ns == "*" {
+		return "", false
+	}
+	return ns, true
+}
+
+// allowRuleMatches is the local matcher for a ProfileAllowRule Pattern.
+// It accepts the SAME `resource:verb_glob` shape as kbouncer's global +
+// task rules (rules.ParsePattern / rules.ProxyRule.Matches), plus the
+// bare "*" wildcard. We re-implement the match here (rather than import
+// the rules package) to keep the profile package free of a rules
+// dependency — symmetric to dbounce's local allowRuleMatches.
+//
+//   - resource half: case-insensitive equality against the request's
+//     plural resource, or "*" for any. A non-wildcard resource never
+//     matches a request with an empty resource (fail-closed).
+//   - verb half: AWS-IAM-style glob (`*` / `?` meta) matched against the
+//     request's K8s-canonical Verb (the subresource name for subresource
+//     calls, matching rules.ProxyRule.Matches).
+func allowRuleMatches(pattern string, req *ParsedRequest) bool {
+	resource, verbGlob, ok := splitAllowRulePattern(pattern)
+	if !ok {
+		return false
+	}
+	if resource != "*" {
+		if req.Resource == "" || resource != strings.ToLower(req.Resource) {
+			return false
+		}
+	}
+	return globMatch(req.Verb, verbGlob)
+}
+
+// splitAllowRulePattern parses the `resource:verb_glob` form. The bare
+// "*" wildcard normalizes to "*:*". Returns ok=false on a malformed
+// pattern (wrong arity, empty half, or a partial-wildcard resource —
+// rejected for the same reason rules.ParsePattern rejects them: K8s
+// resource plurals are flat strings, not globs).
+func splitAllowRulePattern(pattern string) (string, string, bool) {
+	token := strings.TrimSpace(pattern)
+	if token == "" {
+		return "", "", false
+	}
+	if token == "*" {
+		return "*", "*", true
+	}
+	parts := strings.Split(token, ":")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	resource := parts[0]
+	if resource != "*" && strings.Contains(resource, "*") {
+		// Partial wildcard in the resource half is rejected (parity with
+		// rules.ParsePattern). Use "*" for any resource.
+		return "", "", false
+	}
+	return strings.ToLower(resource), parts[1], true
+}
+
+// globMatch translates an AWS-IAM-style glob (only `*` and `?` are meta)
+// into a regex + reports whether value matches. A malformed glob never
+// matches. Mirrors rules.globMatch / dbounce's compileGlob so allow_rule
+// verb globs behave identically to global-rule verb globs.
+func globMatch(value, pattern string) bool {
+	var b strings.Builder
+	b.WriteString(`\A`)
+	for _, ch := range pattern {
+		switch ch {
+		case '*':
+			b.WriteString(`.*`)
+		case '?':
+			b.WriteString(`.`)
+		default:
+			b.WriteString(regexp.QuoteMeta(string(ch)))
+		}
+	}
+	b.WriteString(`\z`)
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return false
+	}
+	return re.MatchString(value)
 }
 
 // isExemptResourceForVerb returns true when the request's (verb,
