@@ -19,40 +19,78 @@ with a one-line deprecation warning + is removed in v1.1.
 
 ## Install
 
-No Go toolchain required for the paths below — they install a
-prebuilt, signed-by-release binary. `kbounce --version` should print a
-version after any of them. (Building from source is the last option,
-not the first — see [From source](#from-source-go-toolchain-required).)
+### go install (works today — needs Go ≥ 1.26)
 
-### Homebrew (macOS / Linux)
+```sh
+go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest
+kbounce --version
+
+# If you get "command not found": $(go env GOPATH)/bin is not on PATH.
+# Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by default.
+export PATH="$PATH:$(go env GOPATH)/bin"
+# Persist: echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc
+```
+
+**Toolchain note:** `go.mod` specifies `go 1.26.0`. With `GOTOOLCHAIN=auto`
+(the default), Go downloads Go 1.26.x on first use. Air-gapped machines
+that pin `GOTOOLCHAIN=local` must have Go 1.26+ pre-installed.
+
+**Version stamp note:** `go install` does not carry ldflags, so
+`kbounce --version` will report `commit none, built unknown`. This is
+expected and does not affect functionality. Stamped binaries come from
+the tagged release artifacts.
+
+> The `go install` PATH note closes #549 (UAT L1 2026-05-24): the
+> unmodified `go install` succeeds silently with the binary at
+> `~/go/bin/kbounce` while the shell reports "command not found", which
+> reads as "install broken" on a fresh machine.
+
+### From source (git clone + go build)
+
+```sh
+git clone https://github.com/trsreagan3/kbouncer.git
+cd kbouncer
+go build -o bin/kbounce ./cmd/kbounce
+./bin/kbounce --version
+# or: make build   (drops the binary into ./bin/kbounce)
+```
+
+### Available at launch (first tagged release)
+
+> The following paths require a tagged GitHub release with prebuilt
+> artifacts. They are configured but dormant — no tag has been pushed yet.
+> Run `goreleaser build --snapshot --clean` in the repo to validate the
+> build matrix locally.
+
+#### Homebrew (macOS / Linux)
 
 ```sh
 brew install trsreagan3/tap/kbounce
 ```
 
-### Prebuilt binary (any OS)
+#### Prebuilt binary (any OS)
 
 Each [GitHub Release](https://github.com/trsreagan3/kbouncer/releases)
-attaches `kbounce_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) for
-`linux`/`darwin`/`windows` × `amd64`/`arm64`. Download, extract, and
+attaches `kbounce_<version>_<os>_<arch>.tar.gz` for
+`linux`/`darwin` × `amd64`/`arm64`. Download, extract, and
 put `kbounce` on your `PATH`:
 
 ```sh
 # Example: macOS arm64. Swap in the os/arch + version for your machine.
 curl -fsSL -o kbounce.tar.gz \
-  https://github.com/trsreagan3/kbouncer/releases/latest/download/kbounce_<version>_Darwin_arm64.tar.gz
+  https://github.com/trsreagan3/kbouncer/releases/latest/download/kbounce_<version>_darwin_arm64.tar.gz
 tar -xzf kbounce.tar.gz kbounce
 sudo install kbounce /usr/local/bin/kbounce
 ```
 
-### Scoop (Windows)
+#### Scoop (Windows)
 
 ```powershell
 scoop bucket add trsreagan3 https://github.com/trsreagan3/scoop-bucket
 scoop install kbounce
 ```
 
-### APT / RPM (Debian/Ubuntu, RHEL/Fedora)
+#### APT / RPM (Debian/Ubuntu, RHEL/Fedora)
 
 Releases attach `.deb` + `.rpm` packages (installs the binary to
 `/usr/local/bin`). They are **not** published to a public APT/RPM
@@ -71,33 +109,10 @@ curl -fsSL -o kbounce.rpm \
 sudo rpm -i kbounce.rpm
 ```
 
-### Docker
+#### Docker
 
 See [Docker](#docker) below for the published
 `ghcr.io/trsreagan3/kbounce` image (Claude-in-container friendly).
-
-### From source (Go toolchain required)
-
-This path builds the binary fresh from source — needs **Go ≥ 1.26**.
-Prefer one of the no-toolchain paths above unless you're iterating on
-the source.
-
-```sh
-go install github.com/trsreagan3/kbouncer/cmd/kbounce@latest
-kbounce --version
-
-# If you get "command not found": $(go env GOPATH)/bin is not on PATH.
-# Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by
-# default. Fix once per shell, then persist in your shell rc:
-export PATH="$PATH:$(go env GOPATH)/bin"
-echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc   # bash
-echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc    # zsh
-```
-
-> The `go install` PATH note closes #549 (UAT L1 2026-05-24): the
-> unmodified `go install` succeeds silently with the binary at
-> `~/go/bin/kbounce` while the shell reports "command not found", which
-> reads as "install broken" on a fresh machine.
 
 ## Add to your agent
 

@@ -1,16 +1,32 @@
-# .goreleaser.yml — kbouncer pre-built binary release pipeline
+# .goreleaser.yml — kbounce release pipeline
 #
-# Triggered by: push of a v* tag (see .github/workflows/release.yml)
-# Produces: .deb + .rpm + .tar.gz + .zip for linux/amd64 + linux/arm64 + darwin + windows
-# Artifacts uploaded to the GitHub Release created by the tag push.
+# Triggered on: push of a v* tag (see .github/workflows/release.yml).
+# Snapshot validation: goreleaser release --snapshot --clean (no publish).
+# Config check:       goreleaser check
 #
-# NOTE: "published to public APT/RPM registries" is follow-up work (post-v1.0).
-# This config: builds artifacts + attaches them to GitHub Releases.
-# Users install via `curl | dpkg -i` or `curl | rpm -i` per docs/INSTALL-APT.md
-# and docs/INSTALL-RPM.md.
+# Note: canonical binary = `kbounce`; module path = github.com/trsreagan3/kbouncer
+# (unchanged for v1.0 per [[bounce-suite-rename]]). The `kbouncer` shim binary
+# is bundled alongside `kbounce` in the archive for v1.0; removed in v1.1.
 #
-# Per [[vendor-integration-claim-qualifier]]: artifacts are built + smoke-tested
-# locally in CI containers; NOT published to public deb/rpm package registry.
+# Produces per tagged release:
+#   .tar.gz / .zip  → linux/darwin/windows, amd64/arm64
+#   .deb / .rpm     → linux amd64 + arm64
+#   docker          → ghcr.io/trsreagan3/kbounce linux/amd64 + linux/arm64
+#   brew            → trsreagan3/homebrew-tap Formula/kbounce.rb
+#   scoop           → trsreagan3/scoop-bucket bucket/kbounce.json
+#
+# NOTE: deb/rpm artifacts are attached to GitHub Releases; NOT published to a
+# public APT/RPM registry (follow-up post-v1.0 work).
+# Per [[vendor-integration-claim-qualifier]]: built + smoke-tested in CI;
+# NOT published to public deb/rpm package registry.
+#
+# PREREQUISITES before the first real tagged release:
+#   1. Create https://github.com/trsreagan3/homebrew-tap (public repo,
+#      stub Formula/ dir). Secret: HOMEBREW_TAP_TOKEN (repo scope PAT).
+#   2. Create https://github.com/trsreagan3/scoop-bucket (public repo,
+#      stub bucket/ dir). Secret: SCOOP_BUCKET_TOKEN (repo scope PAT).
+#   3. Confirm ghcr.io/trsreagan3/kbounce package visibility on GitHub.
+#   4. DO NOT push a v* tag until launch readiness is confirmed.
 
 version: 2
 
@@ -20,6 +36,7 @@ before:
   hooks:
     - go mod tidy
 
+# ── Builds ────────────────────────────────────────────────────────────────────
 builds:
   - id: kbounce
     binary: kbounce
@@ -29,19 +46,23 @@ builds:
     flags:
       - -trimpath
     ldflags:
+      # Stamp the three vars declared in internal/cli/cli.go.
+      # Use .ShortCommit (7-char SHA) to match what the Makefile + Dockerfile emit.
       - -s -w
       - -X github.com/trsreagan3/kbouncer/internal/cli.version={{.Version}}
-      - -X github.com/trsreagan3/kbouncer/internal/cli.commit={{.Commit}}
+      - -X github.com/trsreagan3/kbouncer/internal/cli.commit={{.ShortCommit}}
       - -X github.com/trsreagan3/kbouncer/internal/cli.buildTime={{.Date}}
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
+    # windows: syscall.Statfs_t in internal/audit/rotation.go is unix-only;
+    # windows builds require adding a build-tag guard first. Tracked as
+    # follow-up work — add back once rotation.go has a //go:build !windows stub.
 
-  # Deprecation shim: ships alongside the main binary for v1.0 only.
+  # Deprecation shim: ships alongside kbounce for v1.0 only.
   # Removed in v1.1 per [[bounce-suite-rename]].
   - id: kbouncer-shim
     binary: kbouncer
@@ -53,35 +74,37 @@ builds:
     ldflags:
       - -s -w
       - -X github.com/trsreagan3/kbouncer/internal/cli.version={{.Version}}
-      - -X github.com/trsreagan3/kbouncer/internal/cli.commit={{.Commit}}
+      - -X github.com/trsreagan3/kbouncer/internal/cli.commit={{.ShortCommit}}
       - -X github.com/trsreagan3/kbouncer/internal/cli.buildTime={{.Date}}
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
 
+# ── Archives ──────────────────────────────────────────────────────────────────
 archives:
   - id: kbounce-archive
-    builds:
+    ids:
       - kbounce
       - kbouncer-shim
     name_template: "kbounce_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
     files:
       - LICENSE
       - README.md
       - CHANGELOG.md
 
+# ── Checksums ─────────────────────────────────────────────────────────────────
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# ── Native packages (deb + rpm) ───────────────────────────────────────────────
 nfpms:
   - id: kbounce-deb-rpm
     package_name: kbounce
-    builds:
+    ids:
       - kbounce
     vendor: trsreagan3
     homepage: https://github.com/trsreagan3/kbouncer
@@ -101,17 +124,21 @@ nfpms:
         dst: /usr/share/doc/kbounce/copyright
       - src: README.md
         dst: /usr/share/doc/kbounce/README.md
-    # Post-install: remind user of the canonical way to confirm install
     scripts:
       postinstall: scripts/nfpm/postinstall.sh
 
+# ── Homebrew tap ──────────────────────────────────────────────────────────────
+# Writes Formula/kbounce.rb to trsreagan3/homebrew-tap on release.
+# Requires HOMEBREW_TAP_TOKEN secret. Tap repo must exist first.
+# NOTE: goreleaser free tier uses `brews` (goreleaser Pro uses `homebrew`).
+# `brews` is deprecated upstream but remains the only non-Pro stanza in v2.
 brews:
   - name: kbounce
     repository:
       owner: trsreagan3
       name: homebrew-tap
       branch: "bump-kbounce-{{.Version}}"
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
       pull_request:
         enabled: true
         base:
@@ -121,7 +148,6 @@ brews:
     homepage: https://github.com/trsreagan3/kbouncer
     description: "Kubernetes API-call gating proxy for AI agents and dev workflows"
     license: Apache-2.0
-    # install block mirrors Formula/kbounce.rb — kept in sync with tap
     install: |
       ldflags = %W[
         -s -w
@@ -135,12 +161,15 @@ brews:
       assert_match version.to_s, shell_output("#{bin}/kbounce --version")
       assert_match "kbounce", shell_output("#{bin}/kbounce --help")
 
+# ── Scoop bucket ──────────────────────────────────────────────────────────────
+# Writes bucket/kbounce.json to trsreagan3/scoop-bucket on release.
+# Requires SCOOP_BUCKET_TOKEN secret. Bucket repo must exist first.
 scoops:
   - repository:
       owner: trsreagan3
       name: scoop-bucket
       branch: "bump-kbounce-{{.Version}}"
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      token: "{{ .Env.SCOOP_BUCKET_TOKEN }}"
       pull_request:
         enabled: true
         base:
@@ -152,10 +181,57 @@ scoops:
     description: "Kubernetes API-call gating proxy for AI agents and dev workflows"
     license: Apache-2.0
 
-checksum:
-  name_template: "checksums.txt"
-  algorithm: sha256
+# ── Docker images ─────────────────────────────────────────────────────────────
+# Uses Dockerfile.goreleaser (distroless; goreleaser copies the binary in).
+# KEEP PRIVATE: visibility is controlled on GHCR, not here.
+# Images will NOT be pushed until a real tag triggers the release workflow.
+dockers:
+  - id: kbounce-linux-amd64
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/trsreagan3/kbounce:{{ .Version }}-amd64"
+      - "ghcr.io/trsreagan3/kbounce:latest-amd64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.source=https://github.com/trsreagan3/kbouncer"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+      - "--label=org.opencontainers.image.title=kbounce"
+      - "--label=org.opencontainers.image.description=Local Kubernetes API-call gating proxy"
 
+  - id: kbounce-linux-arm64
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/trsreagan3/kbounce:{{ .Version }}-arm64"
+      - "ghcr.io/trsreagan3/kbounce:latest-arm64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.source=https://github.com/trsreagan3/kbouncer"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+      - "--label=org.opencontainers.image.title=kbounce"
+      - "--label=org.opencontainers.image.description=Local Kubernetes API-call gating proxy"
+
+docker_manifests:
+  - name_template: "ghcr.io/trsreagan3/kbounce:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/trsreagan3/kbounce:{{ .Version }}-amd64"
+      - "ghcr.io/trsreagan3/kbounce:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/trsreagan3/kbounce:latest"
+    image_templates:
+      - "ghcr.io/trsreagan3/kbounce:latest-amd64"
+      - "ghcr.io/trsreagan3/kbounce:latest-arm64"
+
+# ── Release ───────────────────────────────────────────────────────────────────
 release:
   github:
     owner: trsreagan3
@@ -164,6 +240,7 @@ release:
   draft: false
   prerelease: auto
 
+# ── Changelog ─────────────────────────────────────────────────────────────────
 changelog:
   use: github
   sort: asc

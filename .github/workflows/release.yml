@@ -7,13 +7,32 @@ name: release
 #   - .tar.gz / .zip  → linux/darwin/windows, amd64/arm64
 #   - .deb            → linux amd64 + arm64  (dpkg install)
 #   - .rpm            → linux x86_64 + aarch64  (rpm install)
+#   - docker          → ghcr.io/trsreagan3/kbounce linux/amd64 + linux/arm64
+#   - brew            → trsreagan3/homebrew-tap formula
+#   - scoop           → trsreagan3/scoop-bucket manifest
 #
 # NOTE: artifacts are attached to GitHub Releases; they are NOT published
 # to a public APT/RPM repo (that is follow-up post-v1.0 work).
 # Per [[vendor-integration-claim-qualifier]]: "built + smoke-tested in CI;
 # NOT published to public deb/rpm registry."
 #
-# Concurrent agents: this file does not touch main; push only to tag refs.
+# TRIGGER POLICY:
+#   push v* tag  → full release (builds + publishes all artifacts).
+#                  DO NOT push a tag until launch readiness is confirmed.
+#   workflow_dispatch (snapshot=true) → goreleaser build --snapshot --clean
+#                  Builds all cross-platform binaries locally; NO publish.
+#                  Safe to run any time to validate the matrix still builds.
+#   workflow_dispatch (snapshot=false) → full release (same as tag push).
+#                  Use only if you need a manual full release from a branch.
+#
+# PREREQUISITES before the first tagged release:
+#   1. Create https://github.com/trsreagan3/homebrew-tap (public repo)
+#      with a stub Formula/ directory.
+#   2. Create https://github.com/trsreagan3/scoop-bucket (public repo)
+#      with a stub bucket/ directory.
+#   3. Add repo secret HOMEBREW_TAP_TOKEN: PAT with repo scope on homebrew-tap.
+#   4. Add repo secret SCOOP_BUCKET_TOKEN: PAT with repo scope on scoop-bucket.
+#   5. Confirm ghcr.io/trsreagan3/kbounce image visibility on GitHub Packages.
 
 on:
   push:
@@ -21,17 +40,23 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to release (e.g. v1.0.0)"
-        required: true
+      snapshot:
+        description: "Run as snapshot (build only, no publish)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
-  contents: write   # needed to create + upload to GitHub Release
-  packages: read
+  contents: write    # create + upload GitHub Release
+  packages: write    # push to ghcr.io
+  id-token: write    # needed for attestation (future)
 
 jobs:
   goreleaser:
-    name: goreleaser — build deb/rpm/tar/zip + upload to release
+    name: goreleaser — build + release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,13 +64,38 @@ jobs:
         with:
           fetch-depth: 0   # full history so `git describe` works for version stamp
 
+      - name: Set up QEMU (for arm64 docker cross-build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.snapshot == 'false') }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Run GoReleaser
+      - name: Run GoReleaser (snapshot — build only, no publish)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.snapshot == 'true' }}
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run GoReleaser (full release — tag push or manual)
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.snapshot == 'false') }}
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
@@ -53,11 +103,12 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # TAP_GITHUB_TOKEN: a PAT with `contents: write` on the homebrew-tap
-          # repo. Create at https://github.com/settings/tokens and store as
-          # a repo secret named TAP_GITHUB_TOKEN. Required for goreleaser
-          # to open a bump-kbounce-vX.Y.Z PR in trsreagan3/homebrew-tap.
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          # HOMEBREW_TAP_TOKEN: PAT with repo scope on trsreagan3/homebrew-tap.
+          # The tap repo must exist before the first tagged release.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # SCOOP_BUCKET_TOKEN: PAT with repo scope on trsreagan3/scoop-bucket.
+          # The bucket repo must exist before the first tagged release.
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
 
   smoke-test-deb:
     name: smoke-test .deb on ubuntu:22.04
