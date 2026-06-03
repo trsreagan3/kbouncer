@@ -2325,6 +2325,32 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			obs.Enforced = true // mode=block is an explicit enforce opt-in
 			obs.DecisionSource = anomalyDenySource
 			obs.DecisionReason = "anomaly_detection mode=block flagged a behavioral deviation (signal for review, not proof of a problem)"
+			// Persist the anomaly-block DENIAL to SQLite + JSONL so it
+			// joins the Ed25519 hash-chain like every other enforcement
+			// decision. The evaluator already wrote the allow row above;
+			// this writes a SECOND row for the anomaly-tightened deny —
+			// the same pattern profile / task / global denies use: one
+			// row per enforcement outcome.
+			//
+			// activePause is not available in handle(); pass nil. A pause
+			// should prevent enforcement (cooperative mode), but if one
+			// somehow co-occurs the deny row is still more honest than
+			// silence. The JSONL chain verifies over the combined log.
+			parsedForAnomaly := &parser.ParsedRequest{
+				Verb:        obs.ParsedVerb,
+				Group:       obs.ParsedGroup,
+				Version:     obs.ParsedVersion,
+				Resource:    obs.ParsedResource,
+				Namespace:   obs.ParsedNamespace,
+				Name:        obs.ParsedName,
+				Subresource: obs.ParsedSubresource,
+				IsWatch:     obs.IsWatch,
+				IsDryRun:    obs.IsDryRun,
+				Method:      obs.Method,
+				RawPath:     obs.Path,
+			}
+			writeDecision(s.store, obs, nil, agentForAnomaly)
+			emitAuditEvent(evalOpts, agentForAnomaly, obs, parsedForAnomaly, "", nil)
 		}
 		observeAnomaly(action, resource, agentForAnomaly.Name, obs.DecisionVerdict)
 	}

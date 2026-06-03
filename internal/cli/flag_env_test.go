@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -43,5 +45,59 @@ func TestFlagOrEnv_UpstreamCABundle(t *testing.T) {
 		t.Setenv(envUpstreamCABundleVar, "/etc/kube/ca.pem")
 		got := flagOrEnv("/flag/ca.pem", envUpstreamCABundleVar)
 		assert.Equal(t, "/flag/ca.pem", got)
+	})
+}
+
+// TestPrintAnomalyBanner_BlockModeArmed is the Fix-2 regression guard:
+// when mode=block, the startup banner MUST say "enforcement ARMED" and
+// MUST NOT say "does not block" (the old incorrect wording). For
+// alert/disabled modes the neutral/observe wording must be preserved.
+//
+// Pre-fix: the banner always printed "surfaces a neutral signal for review,
+// does not block by default" — even when mode=block was actively denying
+// requests. Operators had no honest indication that enforcement was live.
+// Post-fix: mode=block emits "enforcement ARMED: anomalous requests will
+// be denied (403)"; alert mode emits the neutral observe-only wording.
+func TestPrintAnomalyBanner_BlockModeArmed(t *testing.T) {
+	t.Run("block mode — ARMED banner, no 'does not block' copy", func(t *testing.T) {
+		var buf bytes.Buffer
+		printAnomalyBanner(&buf, "block", "medium")
+		got := buf.String()
+		if !strings.Contains(got, "enforcement ARMED") {
+			t.Errorf("Fix-2 REGRESSION: mode=block banner missing 'enforcement ARMED'; got: %q", got)
+		}
+		if strings.Contains(got, "does not block") {
+			t.Errorf("Fix-2 REGRESSION: mode=block banner still says 'does not block'; got: %q", got)
+		}
+		if strings.Contains(got, "neutral signal for review") {
+			t.Errorf("Fix-2 REGRESSION: mode=block banner still says 'neutral signal for review'; got: %q", got)
+		}
+	})
+
+	t.Run("alert mode — observe-only banner, no ARMED copy", func(t *testing.T) {
+		var buf bytes.Buffer
+		printAnomalyBanner(&buf, "alert", "medium")
+		got := buf.String()
+		if strings.Contains(got, "enforcement ARMED") {
+			t.Errorf("alert banner must not say 'enforcement ARMED'; got: %q", got)
+		}
+		if strings.Contains(got, "will be denied (403)") {
+			t.Errorf("alert banner must not say denials happen; got: %q", got)
+		}
+		if !strings.Contains(got, "does not block") {
+			t.Errorf("alert banner must say 'does not block'; got: %q", got)
+		}
+	})
+
+	t.Run("block+high — ARMED banner + FP warning both present", func(t *testing.T) {
+		var buf bytes.Buffer
+		printAnomalyBanner(&buf, "block", "high")
+		got := buf.String()
+		if !strings.Contains(got, "enforcement ARMED") {
+			t.Errorf("block+high banner missing 'enforcement ARMED'; got: %q", got)
+		}
+		if !strings.Contains(got, "WARNING") {
+			t.Errorf("block+high banner missing high-sensitivity WARNING; got: %q", got)
+		}
 	})
 }

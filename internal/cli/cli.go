@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -786,27 +787,12 @@ Point your kubectl / Helm / agent at it via the standard kubeconfig
 				return fmt.Errorf("anomaly_detection config: %w", aerr)
 			} else if acfg.Enabled {
 				proxy.SetAnomalyDetector(proxy.NewAnomalyDetector(acfg))
-				fmt.Fprintf(os.Stderr,
-					"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — surfaces a neutral signal for review, does not block by default\n",
-					acfg.Mode, acfg.Sensitivity)
-				// Fix 4: high+block FP warning. Operators who choose this
-				// combination must know the 1.5-sigma threshold WILL deny
-				// a brand-new agent's first few benign calls during the
-				// cold-start period and during bursty-but-legitimate
-				// traffic windows. Print at every startup so it is never
-				// invisible. Per [[ibounce-honest-positioning]]: surface
-				// every known operational risk clearly.
-				if acfg.Sensitivity == "high" && acfg.Mode == "block" {
-					fmt.Fprintf(os.Stderr,
-						"WARNING: anomaly detection mode=block + sensitivity=high:\n"+
-							"  The 1.5-sigma threshold will DENY brand-new agents' first benign\n"+
-							"  calls before the baseline warms up (cold-start) and during bursty\n"+
-							"  (but legitimate) traffic. This is expected tighten-only behaviour,\n"+
-							"  not a bug, but expect false-positive denies on first-time traffic.\n"+
-							"  Recommended: start with mode=alert to warm the baseline; switch to\n"+
-							"  block only after reviewing the alert stream. Use medium sensitivity\n"+
-							"  (IAM_JIT_ANOMALY_SENSITIVITY=medium) in block mode to reduce FPs.\n")
-				}
+				// Per [[ibounce-honest-positioning]]: be accurate about what
+				// each mode does — delegate to the testable helper so the
+				// banner text is a single source of truth. Fix-2 gate: when
+				// mode=block the banner must say "enforcement ARMED", not
+				// "does not block".
+				printAnomalyBanner(os.Stderr, acfg.Mode, acfg.Sensitivity)
 			}
 
 			// #324b — wire the watcher's emit callback now that the
@@ -3380,6 +3366,36 @@ verify their install worked without restarting their agent.`,
 		},
 	}
 	return cmd
+}
+
+// printAnomalyBanner writes the startup banner line for the anomaly
+// detector to w. Extracted from the run RunE so tests can assert the
+// banner text without binding a port or starting a proxy.
+//
+// Per [[ibounce-honest-positioning]]: the banner must be accurate about
+// what each mode does. block = enforcement ARMED; alert/other = observe
+// only. This is the Fix-2 gate: mode=block must NOT say "does not block".
+func printAnomalyBanner(w io.Writer, mode, sensitivity string) {
+	if mode == "block" {
+		fmt.Fprintf(w,
+			"anomaly detection: ENABLED (mode=block, sensitivity=%s) — enforcement ARMED: anomalous requests will be denied (403)\n",
+			sensitivity)
+	} else {
+		fmt.Fprintf(w,
+			"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — observation only, surfaces signals for review, does not block\n",
+			mode, sensitivity)
+	}
+	if sensitivity == "high" && mode == "block" {
+		fmt.Fprintf(w,
+			"WARNING: anomaly detection mode=block + sensitivity=high:\n"+
+				"  The 1.5-sigma threshold will DENY brand-new agents' first benign\n"+
+				"  calls before the baseline warms up (cold-start) and during bursty\n"+
+				"  (but legitimate) traffic. This is expected tighten-only behaviour,\n"+
+				"  not a bug, but expect false-positive denies on first-time traffic.\n"+
+				"  Recommended: start with mode=alert to warm the baseline; switch to\n"+
+				"  block only after reviewing the alert stream. Use medium sensitivity\n"+
+				"  (IAM_JIT_ANOMALY_SENSITIVITY=medium) in block mode to reduce FPs.\n")
+	}
 }
 
 // ensure unused imports stay used. zerolog is imported in case a future
