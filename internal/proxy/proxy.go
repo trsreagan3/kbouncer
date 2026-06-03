@@ -625,6 +625,24 @@ type EvalOptions struct {
 	// evaluator owning the counter wiring. nil = silent (the ALLOW
 	// verdict still applies). Mirrors OnDynamicDenyMatch.
 	OnProfileAllowMatch func()
+
+	// AnomalyTighten (#59 / #17) is the PRE-PERSIST tighten hook. When
+	// non-nil, it is consulted on EVERY would-be-ALLOW terminal verdict
+	// — meta-discovery, profile-allow, task-allow, global-allow, and the
+	// default-allow fall-through — IMMEDIATELY BEFORE that terminal's
+	// single writeDecision + emitAuditEvent runs. If it returns true the
+	// caller mutates the observation in place to an ENFORCED
+	// anomaly_block deny, so the existing single persist writes the FINAL
+	// (tightened) verdict — exactly ONE decision row per request, the
+	// deny. Mirrors gbounce's decideAnomaly PRE-DECISION tighten: a
+	// block-mode anomaly records ONLY the deny, never a phantom allow.
+	//
+	// It is NEVER consulted on a deny floor (the evaluator only invokes
+	// it on allow terminals), so it can never loosen a deny and the
+	// deny-path persists are completely unchanged. nil = no-op
+	// (pure-evaluator + test callers + non-anomaly deployments). The
+	// Server wires this to decideAnomalyTighten in handle().
+	AnomalyTighten func(obs *RequestObservation) bool
 }
 
 // SessionHeaderName is the inbound HTTP header an MCP-aware client can
@@ -845,6 +863,7 @@ func EvaluateRequestFull(
 			parsed.Resource)
 		obs.DecisionSource = SourceMetaDiscovery
 		obs.Enforced = false
+		maybeAnomalyTighten(obs, opts)
 		decisionID := writeDecision(st, obs, activePause, agentInfo)
 		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
@@ -903,6 +922,7 @@ func EvaluateRequestFull(
 		obs.DecisionReason = profileAllowReason
 		obs.DecisionSource = SourceProfileAllow
 		obs.Enforced = false
+		maybeAnomalyTighten(obs, opts)
 		decisionID := writeDecision(st, obs, activePause, agentInfo)
 		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
@@ -1000,6 +1020,7 @@ func EvaluateRequestFull(
 				activeTask.TaskID, ta.Rule.Pattern)
 			obs.DecisionSource = SourceTask
 			obs.Enforced = false
+			maybeAnomalyTighten(obs, opts)
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID, agentInfo)
 			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
@@ -1019,6 +1040,7 @@ func EvaluateRequestFull(
 				globalMatch.Rule.Pattern, activeTask.TaskID)
 			obs.DecisionSource = SourceGlobal
 			obs.Enforced = false
+			maybeAnomalyTighten(obs, opts)
 			decisionID := writeDecisionForTask(st, obs, activePause, activeTask.TaskID, agentInfo)
 			emitAuditEvent(opts, agentInfo, obs, parsed, activeTask.TaskID, activePause)
 			maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
@@ -1043,6 +1065,7 @@ func EvaluateRequestFull(
 			"explicit-allow rule (pattern %q)", globalMatch.Rule.Pattern)
 		obs.DecisionSource = SourceGlobal
 		obs.Enforced = false
+		maybeAnomalyTighten(obs, opts)
 		decisionID := writeDecision(st, obs, activePause, agentInfo)
 		emitAuditEvent(opts, agentInfo, obs, parsed, "", activePause)
 		maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
@@ -1061,10 +1084,40 @@ func EvaluateRequestFull(
 	obs.DecisionSource = SourceDefault
 	obs.Enforced = effectiveMode == ModeTransparent && verdict == VerdictDeny
 
+	// Pre-persist anomaly tighten (#59 / #17): only fires on the allow
+	// case (the helper guards on VerdictAllow), so a default-DENY row is
+	// untouched. On a hit the single write below records the deny.
+	maybeAnomalyTighten(obs, opts)
 	decisionID := writeDecision(st, obs, activePause, agentInfo)
 	emitAuditEvent(opts, agentInfo, obs, parsed, activeTaskID(activeTask), activePause)
 	maybeEnqueuePrompt(st, opts, mode, activePause, decisionID, obs, parsed)
 	return obs
+}
+
+// maybeAnomalyTighten applies the opts.AnomalyTighten PRE-PERSIST hook
+// (#59 / #17) to a would-be-ALLOW observation. It is called at every
+// ALLOW terminal in EvaluateRequestFull IMMEDIATELY BEFORE that
+// terminal's single writeDecision + emitAuditEvent, so the persist
+// records the FINAL (possibly tightened) verdict — one row per request.
+//
+// On a hook hit it mutates obs in place to an ENFORCED anomaly_block
+// deny, matching the source/reason/Enforced the gbounce decideAnomaly
+// pre-decision tighten stamps. The hook is only ever invoked here on an
+// allow verdict, so it cannot loosen a deny; deny terminals never call
+// it and are unchanged. nil hook = no-op.
+func maybeAnomalyTighten(obs *RequestObservation, opts EvalOptions) {
+	if opts.AnomalyTighten == nil || obs == nil {
+		return
+	}
+	if obs.DecisionVerdict != VerdictAllow {
+		return
+	}
+	if opts.AnomalyTighten(obs) {
+		obs.DecisionVerdict = VerdictDeny
+		obs.Enforced = true // mode=block is an explicit enforce opt-in
+		obs.DecisionSource = anomalyDenySource
+		obs.DecisionReason = "anomaly_detection mode=block flagged a behavioral deviation (signal for review, not proof of a problem)"
+	}
 }
 
 // activeTaskID returns the active task id when t is non-nil, "" otherwise.
@@ -2295,63 +2348,50 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			s.totalProfileAllows.Add(1)
 		},
 	}
+	// #59 / #17 — PRE-PERSIST anomaly tighten hook. Wired ONLY when a
+	// detector is configured; otherwise left nil so the evaluator's
+	// allow terminals persist unchanged (zero overhead, no behavior
+	// change). On a would-be-allow terminal the evaluator calls this
+	// BEFORE its single writeDecision, so a block-mode anomaly records
+	// EXACTLY ONE row — the deny — with NO phantom allow. Mirrors
+	// gbounce's decideAnomaly pre-decision tighten. The agent identity +
+	// signals are read from the observation the evaluator is about to
+	// persist, so the scored key matches the audit row's agent block.
+	if anomalyDetectorWired() {
+		agentForHook := resolveAgentInfo(evalOpts, r)
+		evalOpts.AnomalyTighten = func(obs *RequestObservation) bool {
+			return decideAnomalyTighten(
+				obs.ParsedVerb, obs.ParsedNamespace, obs.ParsedResource,
+				obs.Method, agentForHook.Name)
+		}
+	}
 	obs := EvaluateRequestFull(
 		r, s.store, s.cfg.Mode, s.cfg.DefaultPolicy,
 		activeProfile, s.cfg.Cluster, evalOpts,
 	)
 
-	// #59 — Phase H anomaly enforcement. Two steps share the live path:
+	// #59 — Phase H anomaly enforcement.
 	//
-	//  1. PRE-DECISION SCORE (tighten-only): on a non-deny floor verdict,
-	//     score the request BEFORE serving so a block-mode anomaly can
-	//     actually DENY. On a tighten we mutate the observation to an
-	//     ENFORCED deny so the transparent-deny branch below serves the
-	//     K8s 403. A deterministic deny is never consulted (never
-	//     loosened). Fail-soft + no-op in alert / detection-only /
-	//     disabled.
+	//  1. PRE-DECISION / PRE-PERSIST SCORE (tighten-only) now happens
+	//     INSIDE EvaluateRequestFull via the evalOpts.AnomalyTighten hook
+	//     wired above: on a would-be-allow terminal the evaluator scores
+	//     BEFORE its single writeDecision + emitAuditEvent, so a
+	//     block-mode anomaly records EXACTLY ONE row (the deny,
+	//     source=anomaly_block) with NO phantom allow. Mirrors gbounce's
+	//     decideAnomaly pre-decision tighten — one row per request. obs
+	//     therefore already carries the FINAL (possibly tightened)
+	//     verdict by the time we reach here; we must NOT write again
+	//     (that would double-record on the append-only chain).
+	//
 	//  2. POST-DECISION OBSERVE (learning): record the FINAL verdict into
-	//     the per-agent baseline + (in alert mode) emit the neutral alert.
-	//     Runs for every request — independent of the audit emitter — so
-	//     the baseline builds even with no SIEM export configured.
-	//
-	// agentForAnomaly mirrors the audit-path agent resolution so the
-	// observe + score use the same per-agent baseline key.
+	//     the per-agent baseline + (in alert mode) emit the neutral
+	//     alert. Runs for every request — independent of the audit
+	//     emitter — so the baseline builds even with no SIEM export
+	//     configured. Reads obs.DecisionVerdict, which is the tightened
+	//     verdict when a block fired.
 	if anomalyDetectorWired() {
 		agentForAnomaly := resolveAgentInfo(evalOpts, r)
 		action, resource := k8sAnomalySignals(obs.ParsedVerb, obs.ParsedNamespace, obs.ParsedResource, obs.Method)
-		if obs.DecisionVerdict != VerdictDeny &&
-			decideAnomalyTighten(obs.ParsedVerb, obs.ParsedNamespace, obs.ParsedResource, obs.Method, agentForAnomaly.Name) {
-			obs.DecisionVerdict = VerdictDeny
-			obs.Enforced = true // mode=block is an explicit enforce opt-in
-			obs.DecisionSource = anomalyDenySource
-			obs.DecisionReason = "anomaly_detection mode=block flagged a behavioral deviation (signal for review, not proof of a problem)"
-			// Persist the anomaly-block DENIAL to SQLite + JSONL so it
-			// joins the Ed25519 hash-chain like every other enforcement
-			// decision. The evaluator already wrote the allow row above;
-			// this writes a SECOND row for the anomaly-tightened deny —
-			// the same pattern profile / task / global denies use: one
-			// row per enforcement outcome.
-			//
-			// activePause is not available in handle(); pass nil. A pause
-			// should prevent enforcement (cooperative mode), but if one
-			// somehow co-occurs the deny row is still more honest than
-			// silence. The JSONL chain verifies over the combined log.
-			parsedForAnomaly := &parser.ParsedRequest{
-				Verb:        obs.ParsedVerb,
-				Group:       obs.ParsedGroup,
-				Version:     obs.ParsedVersion,
-				Resource:    obs.ParsedResource,
-				Namespace:   obs.ParsedNamespace,
-				Name:        obs.ParsedName,
-				Subresource: obs.ParsedSubresource,
-				IsWatch:     obs.IsWatch,
-				IsDryRun:    obs.IsDryRun,
-				Method:      obs.Method,
-				RawPath:     obs.Path,
-			}
-			writeDecision(s.store, obs, nil, agentForAnomaly)
-			emitAuditEvent(evalOpts, agentForAnomaly, obs, parsedForAnomaly, "", nil)
-		}
 		observeAnomaly(action, resource, agentForAnomaly.Name, obs.DecisionVerdict)
 	}
 
