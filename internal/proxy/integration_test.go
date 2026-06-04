@@ -84,6 +84,16 @@ func upstreamFromKubeconfig(t *testing.T, kubeconfigPath string) *upstream.Upstr
 		RootCAs:            pool,
 		InsecureSkipVerify: cfg.Insecure || len(cfg.CAData) == 0,
 	}
+	// Present the kubeconfig's CLIENT cert to the apiserver. kind / k3d /
+	// minikube default to client-cert auth (no bearer token), so without
+	// this the forwarded request arrives as system:anonymous and the
+	// apiserver returns 403 — which previously failed this test. RootCAs
+	// above only trusts the SERVER; this authenticates US to it.
+	if len(cfg.CertData) > 0 && len(cfg.KeyData) > 0 {
+		clientCert, err := tls.X509KeyPair(cfg.CertData, cfg.KeyData)
+		require.NoError(t, err, "load client cert/key from kubeconfig")
+		tlsCfg.Certificates = []tls.Certificate{clientCert}
+	}
 	transport := &http.Transport{
 		TLSClientConfig: tlsCfg,
 		DialContext: (&net.Dialer{

@@ -346,6 +346,30 @@ func buildTLSConfig(restCfg *rest.Config, insecure bool, caBundlePath string, pa
 		tlsCfg.InsecureSkipVerify = true
 	}
 
+	// Present the kubeconfig's CLIENT certificate to the apiserver when one
+	// is configured (client-cert / mTLS auth — the kind / k3d / minikube
+	// default). Without this, the forwarded request arrives as
+	// system:anonymous and the apiserver returns 403. Done BEFORE the CA
+	// branches below so it applies regardless of which CA anchor is chosen.
+	// Bearer-token / in-cluster SA auth is unaffected: those ride the HTTP
+	// Authorization header, which the proxy forwards verbatim.
+	if restCfg != nil {
+		switch {
+		case len(restCfg.TLSClientConfig.CertData) > 0 && len(restCfg.TLSClientConfig.KeyData) > 0:
+			cert, err := tls.X509KeyPair(restCfg.TLSClientConfig.CertData, restCfg.TLSClientConfig.KeyData)
+			if err != nil {
+				return nil, fmt.Errorf("kbounce: load kubeconfig client cert/key (inline): %w", err)
+			}
+			tlsCfg.Certificates = []tls.Certificate{cert}
+		case restCfg.TLSClientConfig.CertFile != "" && restCfg.TLSClientConfig.KeyFile != "":
+			cert, err := tls.LoadX509KeyPair(restCfg.TLSClientConfig.CertFile, restCfg.TLSClientConfig.KeyFile)
+			if err != nil {
+				return nil, fmt.Errorf("kbounce: load kubeconfig client cert/key (file): %w", err)
+			}
+			tlsCfg.Certificates = []tls.Certificate{cert}
+		}
+	}
+
 	// #379 — explicit operator-supplied CA bundle wins over the
 	// kubeconfig CA. Fail loudly on any problem; NEVER fall back to
 	// system roots (silent degradation == verifying against the wrong
